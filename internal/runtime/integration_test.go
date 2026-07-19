@@ -4,6 +4,7 @@ package runtime_test
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os/exec"
 	"strings"
@@ -150,12 +151,46 @@ func TestE2E_StatelessFilterMap(t *testing.T) {
 	// -------------------------------------------------------------------------
 	// 4. Wire the adapter and construct the kafka.Client.
 	// -------------------------------------------------------------------------
-	adapter, err := runtime.NewAdapter(
-		topo,
-		serde,
-		runtime.SinkRoute{"sink": sinkTopic},
-		slog.Default(),
-	)
+	// Build a BuiltTopology using the already-constructed topology DAG and
+	// hand-coded SourceBinding/SinkBinding closures that mirror the serde used
+	// above. The Mapper in step 3 expects key as []byte and value as string, so
+	// DecodeKey passes raw bytes through; DecodeVal JSON-decodes the string.
+	bt := &gstream.BuiltTopology{
+		Topology: topo,
+		Sources: map[string]gstream.SourceBinding{
+			"source": {
+				Topic: srcTopic,
+				DecodeKey: func(raw []byte) (any, error) {
+					return raw, nil // []byte key, consumed as-is by the Mapper
+				},
+				DecodeVal: func(raw []byte) (any, error) {
+					return serde.Deserialize(raw)
+				},
+			},
+		},
+		Sinks: map[string]gstream.SinkBinding{
+			"sink": {
+				Topic: sinkTopic,
+				EncodeKey: func(x any) ([]byte, error) {
+					// Mapper output key is string ("out-" + original key string)
+					v, ok := x.(string)
+					if !ok {
+						return nil, fmt.Errorf("EncodeKey: expected string, got %T", x)
+					}
+					return []byte(v), nil
+				},
+				EncodeVal: func(x any) ([]byte, error) {
+					// Mapper output value is uppercased string
+					v, ok := x.(string)
+					if !ok {
+						return nil, fmt.Errorf("EncodeVal: expected string, got %T", x)
+					}
+					return serde.Serialize(v)
+				},
+			},
+		},
+	}
+	adapter, err := runtime.NewAdapter(bt, slog.Default())
 	if err != nil {
 		t.Fatalf("NewAdapter: %v", err)
 	}
