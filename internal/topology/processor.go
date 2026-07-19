@@ -19,23 +19,6 @@ type node struct {
 	downstreams []*node
 }
 
-// process calls this node's ProcessFunc and propagates forwarded records to
-// all downstream nodes, recursively. This implements the synchronous, depth-first
-// traversal used by the TestDriver.
-func (n *node) process(r Record) error {
-	return n.processFn(r, func(out Record) {
-		for _, ds := range n.downstreams {
-			// Errors from downstream nodes bubble up through the forwarder closure.
-			// We use a side-channel variable because closures cannot return errors
-			// from Forwarder (which is void). Panicking here would hide context, so
-			// instead we adopt the pattern: process() on each downstream and stop on
-			// first error. If multiple downstreams exist and the first errors, later
-			// ones are skipped — acceptable for the TestDriver's deterministic model.
-			_ = ds.process(out) // errors intentionally surfaced at PipeInput level below
-		}
-	})
-}
-
 // processWithErr is like process but propagates the first error seen in any
 // downstream through the forwarder chain. It is used internally by the forwarding
 // loop to stop early.

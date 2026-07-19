@@ -218,6 +218,71 @@ func TestUnknownSinkReturnsError(t *testing.T) {
 	}
 }
 
+// TestPipeInput_ProcessorError_Propagates proves that an error returned by a downstream
+// processor is not swallowed — it surfaces as the return value of PipeInput. This directly
+// exercises the processWithErr traversal path.
+func TestPipeInput_ProcessorError_Propagates(t *testing.T) {
+	b := topology.NewBuilder()
+	src := b.AddSource("src")
+
+	sentinel := fmt.Errorf("processor failure")
+	b.AddProcessor("failing",
+		func(_ topology.Record, _ topology.Forwarder) error { return sentinel },
+		src,
+	)
+	// We still need a sink (Build panics without one), but the error should stop
+	// traversal before reaching it.
+	b.AddSink("sink",
+		b.AddProcessor("after-failing",
+			topology.Filter(func(_, _ any) bool { return true }),
+			"failing",
+		),
+	)
+	topo := b.Build()
+	d := topology.NewTestDriver(topo)
+
+	err := d.PipeInput("src", topology.Record{Key: "k", Value: "v", Timestamp: 1})
+	if err == nil {
+		t.Fatal("PipeInput: expected non-nil error from failing processor, got nil")
+	}
+	if err.Error() != sentinel.Error() {
+		t.Errorf("PipeInput error: got %q, want %q", err, sentinel)
+	}
+}
+
+// TestPipeInput_ProcessorSuccess confirms that a processor returning nil does not surface
+// an error and the record reaches the sink unchanged.
+func TestPipeInput_ProcessorSuccess(t *testing.T) {
+	b := topology.NewBuilder()
+	src := b.AddSource("src")
+	passthrough := b.AddProcessor("passthrough",
+		func(r topology.Record, forward topology.Forwarder) error {
+			forward(r)
+			return nil
+		},
+		src,
+	)
+	b.AddSink("sink", passthrough)
+	topo := b.Build()
+	d := topology.NewTestDriver(topo)
+
+	input := topology.Record{Key: "hello", Value: "world", Timestamp: 42}
+	if err := d.PipeInput("src", input); err != nil {
+		t.Fatalf("PipeInput: unexpected error: %v", err)
+	}
+
+	out, err := d.ReadOutput("sink")
+	if err != nil {
+		t.Fatalf("ReadOutput: %v", err)
+	}
+	if len(out) != 1 {
+		t.Fatalf("expected 1 record at sink, got %d", len(out))
+	}
+	if out[0].Key != input.Key || out[0].Value != input.Value || out[0].Timestamp != input.Timestamp {
+		t.Errorf("sink record mismatch: got %+v, want %+v", out[0], input)
+	}
+}
+
 // TestTimestampPreservedThroughFilter checks that timestamps survive the filter/map pipeline.
 func TestTimestampPreservedThroughFilter(t *testing.T) {
 	topo := buildPipeline(t)

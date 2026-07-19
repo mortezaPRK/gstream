@@ -208,42 +208,57 @@ func TestE2E_StatelessFilterMap(t *testing.T) {
 	defer client.Close()
 
 	// -------------------------------------------------------------------------
-	// 5. Run the pipeline until all 5 input records have been processed.
+	// 5. Run the pipeline until the expected output records land on the sink
+	//    topic, then cancel. Creating the consumer here (before the run) lets it
+	//    catch every record produced during the pipeline run.
 	// -------------------------------------------------------------------------
-	processed := make(chan struct{}, len(inputs))
-	wrappedFn := func(ctx context.Context, in kafka.InRecord) ([]kafka.OutRecord, error) {
-		outs, err := adapter.ProcessFunc()(ctx, in)
-		if err == nil {
-			processed <- struct{}{}
-		}
-		return outs, err
+	sinkConsumer, err := kgo.NewClient(
+		kgo.SeedBrokers(brokers...),
+		kgo.ConsumeTopics(sinkTopic),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+	)
+	if err != nil {
+		t.Fatalf("failed to create sink consumer: %v", err)
 	}
+	defer sinkConsumer.Close()
 
 	runCtx, runCancel := context.WithCancel(ctx)
 	done := make(chan error, 1)
 	go func() {
-		done <- client.Run(runCtx, wrappedFn)
+		done <- client.Run(runCtx, adapter.ProcessFunc())
 	}()
 
-	// Wait for all 5 records to be processed (or timeout).
-	remaining := len(inputs)
-	waitCtx, waitCancel := context.WithTimeout(ctx, 60*time.Second)
-	defer waitCancel()
-	for remaining > 0 {
-		select {
-		case <-processed:
-			remaining--
-		case <-waitCtx.Done():
-			t.Fatalf("timed out waiting for records to be processed; %d remaining", remaining)
-		}
+	// Collect output records (we expect exactly 3).
+	type outRecord struct {
+		key   string
+		value string // raw JSON bytes from output topic
 	}
-	t.Logf("all %d input records processed", len(inputs))
+	var outputRecords []outRecord
 
-	// wrappedFn fires BEFORE gstream's ProduceSync + CommitRecords run for that
-	// batch. Give the run loop a moment to finish producing output records and
-	// committing offsets before we cancel the context, so the sink produce does
-	// not see a "context canceled" error.
-	time.Sleep(3 * time.Second)
+	// Deterministic wait: poll the sink topic until all 3 expected output records
+	// have arrived. This confirms ProduceSync+CommitRecords completed for the
+	// batch — no fixed sleep needed. A 25 s backstop ensures a real failure still
+	// terminates the test instead of hanging forever.
+	readyCtx, readyCancel := context.WithTimeout(ctx, 25*time.Second)
+	defer readyCancel()
+
+	for len(outputRecords) < 3 {
+		fetches := sinkConsumer.PollFetches(readyCtx)
+		if fetches.IsClientClosed() {
+			break
+		}
+		if err := readyCtx.Err(); err != nil {
+			t.Fatalf("timed out waiting for output records in sink topic; got %d, want 3", len(outputRecords))
+		}
+		fetches.EachRecord(func(r *kgo.Record) {
+			outputRecords = append(outputRecords, outRecord{
+				key:   string(r.Key),
+				value: string(r.Value),
+			})
+			t.Logf("sink record: key=%s value=%s", r.Key, r.Value)
+		})
+	}
+	t.Logf("all expected output records arrived in sink topic (%d)", len(outputRecords))
 
 	// Cancel the run loop and wait for it to stop.
 	runCancel()
@@ -257,44 +272,8 @@ func TestE2E_StatelessFilterMap(t *testing.T) {
 	}
 
 	// -------------------------------------------------------------------------
-	// 6. Consume from the output topic and assert correctness.
+	// 6. Assert correctness on the output records collected above.
 	// -------------------------------------------------------------------------
-	sinkConsumer, err := kgo.NewClient(
-		kgo.SeedBrokers(brokers...),
-		kgo.ConsumeTopics(sinkTopic),
-		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
-	)
-	if err != nil {
-		t.Fatalf("failed to create sink consumer: %v", err)
-	}
-	defer sinkConsumer.Close()
-
-	// Collect output records (we expect exactly 3).
-	type outRecord struct {
-		key   string
-		value string // raw JSON bytes from output topic
-	}
-	var outputRecords []outRecord
-
-	collectCtx, collectCancel := context.WithTimeout(ctx, 15*time.Second)
-	defer collectCancel()
-
-	for len(outputRecords) < 3 {
-		fetches := sinkConsumer.PollFetches(collectCtx)
-		if fetches.IsClientClosed() {
-			break
-		}
-		if err := collectCtx.Err(); err != nil {
-			t.Fatalf("timed out collecting sink records; got %d, want 3", len(outputRecords))
-		}
-		fetches.EachRecord(func(r *kgo.Record) {
-			outputRecords = append(outputRecords, outRecord{
-				key:   string(r.Key),
-				value: string(r.Value),
-			})
-			t.Logf("sink record: key=%s value=%s", r.Key, r.Value)
-		})
-	}
 
 	// Assert count: exactly 3 records (hi and ab filtered out).
 	if got, want := len(outputRecords), 3; got != want {

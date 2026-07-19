@@ -96,6 +96,18 @@ func TestRoundTrip_ALO(t *testing.T) {
 	}
 	defer client.Close()
 
+	// Create the sink consumer before starting the run, positioned at offset 0
+	// so it will catch the output record as soon as the pipeline produces it.
+	sinkClient, err := kgo.NewClient(
+		kgo.SeedBrokers(brokers...),
+		kgo.ConsumeTopics(sinkTopic),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+	)
+	if err != nil {
+		t.Fatalf("failed to create sink consumer: %v", err)
+	}
+	defer sinkClient.Close()
+
 	runCtx, runCancel := context.WithCancel(ctx)
 	done := make(chan error, 1)
 	go func() { done <- client.Run(runCtx, processFunc) }()
@@ -110,11 +122,24 @@ func TestRoundTrip_ALO(t *testing.T) {
 		t.Fatal("timed out waiting for record")
 	}
 
-	// processFunc fires BEFORE gstream's ProduceSync + CommitRecords run in the
-	// same batch iteration. Give the run loop a moment to finish producing the
-	// output record and committing offsets before we cancel the context, so the
-	// sink produce does not see a "context canceled" error.
-	time.Sleep(2 * time.Second)
+	// Deterministic wait: poll the sink topic until the output record lands.
+	// This confirms ProduceSync+CommitRecords completed for this batch, making it
+	// safe to cancel. A 25 s backstop ensures a real failure still terminates.
+	readyCtx, readyCancel := context.WithTimeout(ctx, 25*time.Second)
+	defer readyCancel()
+	var sinkRecords []*kgo.Record
+	for len(sinkRecords) == 0 {
+		fs := sinkClient.PollFetches(readyCtx)
+		if fs.IsClientClosed() {
+			break
+		}
+		if err := readyCtx.Err(); err != nil {
+			t.Fatalf("timed out waiting for output record in sink topic")
+		}
+		fs.EachRecord(func(r *kgo.Record) {
+			sinkRecords = append(sinkRecords, r)
+		})
+	}
 
 	runCancel()
 	select {
@@ -126,24 +151,11 @@ func TestRoundTrip_ALO(t *testing.T) {
 		t.Fatal("Run did not stop after context cancellation")
 	}
 
-	// Verify the output was produced to the sink topic.
-	sinkClient, err := kgo.NewClient(
-		kgo.SeedBrokers(brokers...),
-		kgo.ConsumeTopics(sinkTopic),
-		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
-	)
-	if err != nil {
-		t.Fatalf("failed to create sink consumer: %v", err)
-	}
-	defer sinkClient.Close()
-
-	fetchCtx, fetchCancel := context.WithTimeout(ctx, 10*time.Second)
-	defer fetchCancel()
-	fs := sinkClient.PollFetches(fetchCtx)
-	if fs.Empty() {
+	// Assert on the records collected above.
+	if len(sinkRecords) == 0 {
 		t.Fatal("expected at least one record in sink topic")
 	}
-	fs.EachRecord(func(r *kgo.Record) {
+	for _, r := range sinkRecords {
 		fmt.Printf("sink record: key=%s value=%s\n", r.Key, r.Value)
-	})
+	}
 }
