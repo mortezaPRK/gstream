@@ -1,6 +1,7 @@
 package state_test
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"testing"
@@ -547,6 +548,240 @@ func TestMutationCollector_DrainClearsCollector(t *testing.T) {
 	second := c.Drain()
 	if second != nil {
 		t.Fatalf("second Drain: expected nil after reset, got %v", second)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// RangeBytes tests
+// ---------------------------------------------------------------------------
+
+// TestRangeBytes_BasicRange verifies that RangeBytes returns only keys in [lower, upper).
+func TestRangeBytes_BasicRange(t *testing.T) {
+	db, err := state.OpenMemDB()
+	if err != nil {
+		t.Fatalf("OpenMemDB: %v", err)
+	}
+	defer db.Close()
+
+	// Use int64Serde so keys are big-endian and therefore ordered numerically.
+	store := state.NewKeyValueStore("rb-basic", db, int64Serde{}, stringSerde{})
+	defer store.Close()
+
+	for _, k := range []int64{1, 2, 3, 4, 5} {
+		if err := store.Put(k, fmt.Sprintf("v%d", k)); err != nil {
+			t.Fatalf("Put %d: %v", k, err)
+		}
+	}
+
+	// lower = serialized int64(2), upper = serialized int64(4) → expect {2, 3}
+	lower := make([]byte, 8)
+	upper := make([]byte, 8)
+	binary.BigEndian.PutUint64(lower, uint64(2))
+	binary.BigEndian.PutUint64(upper, uint64(4))
+
+	var gotKeys []int64
+	if err := store.RangeBytes(lower, upper, func(key, _ []byte) bool {
+		// strip prefix
+		prefix := append([]byte("rb-basic"), 0x00)
+		raw := key[len(prefix):]
+		k := int64(binary.BigEndian.Uint64(raw))
+		gotKeys = append(gotKeys, k)
+		return true
+	}); err != nil {
+		t.Fatalf("RangeBytes: %v", err)
+	}
+
+	if len(gotKeys) != 2 || gotKeys[0] != 2 || gotKeys[1] != 3 {
+		t.Fatalf("RangeBytes: got %v, want [2 3]", gotKeys)
+	}
+}
+
+// TestRangeBytes_EarlyStop verifies that returning false from fn stops iteration.
+func TestRangeBytes_EarlyStop(t *testing.T) {
+	db, err := state.OpenMemDB()
+	if err != nil {
+		t.Fatalf("OpenMemDB: %v", err)
+	}
+	defer db.Close()
+
+	store := state.NewKeyValueStore("rb-stop", db, int64Serde{}, stringSerde{})
+	defer store.Close()
+
+	for _, k := range []int64{1, 2, 3, 4, 5} {
+		if err := store.Put(k, "x"); err != nil {
+			t.Fatalf("Put %d: %v", k, err)
+		}
+	}
+
+	lower := make([]byte, 8)
+	upper := make([]byte, 8)
+	binary.BigEndian.PutUint64(lower, uint64(1))
+	binary.BigEndian.PutUint64(upper, uint64(6))
+
+	var count int
+	if err := store.RangeBytes(lower, upper, func(_, _ []byte) bool {
+		count++
+		return count < 2
+	}); err != nil {
+		t.Fatalf("RangeBytes: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("expected 2 calls before stop, got %d", count)
+	}
+}
+
+// TestRangeBytes_ClosedStoreError verifies that RangeBytes on a closed store errors.
+func TestRangeBytes_ClosedStoreError(t *testing.T) {
+	db, err := state.OpenMemDB()
+	if err != nil {
+		t.Fatalf("OpenMemDB: %v", err)
+	}
+	defer db.Close()
+
+	store := state.NewKeyValueStore("rb-closed", db, stringSerde{}, stringSerde{})
+	store.Close()
+
+	if err := store.RangeBytes([]byte("a"), []byte("z"), func(_, _ []byte) bool { return true }); err == nil {
+		t.Fatal("expected error on closed store, got nil")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// DeleteRangeBytes tests
+// ---------------------------------------------------------------------------
+
+// TestDeleteRangeBytes_DeletesKeysInRange verifies that after DeleteRangeBytes the
+// targeted keys are gone and keys outside the range remain.
+func TestDeleteRangeBytes_DeletesKeysInRange(t *testing.T) {
+	db, err := state.OpenMemDB()
+	if err != nil {
+		t.Fatalf("OpenMemDB: %v", err)
+	}
+	defer db.Close()
+
+	store := state.NewKeyValueStore("drb-basic", db, int64Serde{}, stringSerde{})
+	defer store.Close()
+
+	for _, k := range []int64{1, 2, 3, 4, 5} {
+		if err := store.Put(k, fmt.Sprintf("v%d", k)); err != nil {
+			t.Fatalf("Put %d: %v", k, err)
+		}
+	}
+
+	// Delete [2, 4) → keys 2, 3 deleted; 1, 4, 5 remain.
+	lower := make([]byte, 8)
+	upper := make([]byte, 8)
+	binary.BigEndian.PutUint64(lower, uint64(2))
+	binary.BigEndian.PutUint64(upper, uint64(4))
+
+	if err := store.DeleteRangeBytes(lower, upper); err != nil {
+		t.Fatalf("DeleteRangeBytes: %v", err)
+	}
+
+	// Keys 2 and 3 must be gone.
+	for _, k := range []int64{2, 3} {
+		_, found, err := store.Get(k)
+		if err != nil {
+			t.Fatalf("Get(%d): %v", k, err)
+		}
+		if found {
+			t.Errorf("key %d still present after DeleteRangeBytes", k)
+		}
+	}
+
+	// Keys 1, 4, 5 must still exist.
+	for _, k := range []int64{1, 4, 5} {
+		_, found, err := store.Get(k)
+		if err != nil {
+			t.Fatalf("Get(%d): %v", k, err)
+		}
+		if !found {
+			t.Errorf("key %d missing but should not have been deleted", k)
+		}
+	}
+}
+
+// TestDeleteRangeBytes_MutationCollector verifies that each deleted key produces
+// one IsDelete tombstone in the MutationCollector, and that the Mutation.Key
+// matches the full Pebble key form used by Put (prefix + serialized-key).
+func TestDeleteRangeBytes_MutationCollector(t *testing.T) {
+	db, err := state.OpenMemDB()
+	if err != nil {
+		t.Fatalf("OpenMemDB: %v", err)
+	}
+	defer db.Close()
+
+	c := &state.MutationCollector{}
+	store := state.NewKeyValueStoreWithChangelog("drb-mut", db, int64Serde{}, stringSerde{}, c)
+	defer store.Close()
+
+	for _, k := range []int64{10, 20, 30} {
+		if err := store.Put(k, "v"); err != nil {
+			t.Fatalf("Put %d: %v", k, err)
+		}
+	}
+	// Drain Put mutations so we start clean.
+	c.Drain()
+
+	// Delete all three keys [10, 31).
+	lower := make([]byte, 8)
+	upper := make([]byte, 8)
+	binary.BigEndian.PutUint64(lower, uint64(10))
+	binary.BigEndian.PutUint64(upper, uint64(31))
+
+	if err := store.DeleteRangeBytes(lower, upper); err != nil {
+		t.Fatalf("DeleteRangeBytes: %v", err)
+	}
+
+	mutations := c.Drain()
+	if len(mutations) != 3 {
+		t.Fatalf("expected 3 tombstone mutations, got %d", len(mutations))
+	}
+
+	// Every mutation must be a deletion.
+	for i, m := range mutations {
+		if !m.IsDelete {
+			t.Errorf("mutation[%d]: expected IsDelete=true", i)
+		}
+		if m.Value != nil {
+			t.Errorf("mutation[%d]: expected nil Value, got %v", i, m.Value)
+		}
+	}
+
+	// Verify Mutation.Key form: full Pebble key = "drb-mut\x00" + serialized int64.
+	prefix := append([]byte("drb-mut"), 0x00)
+	wantKeys := []int64{10, 20, 30}
+	for i, m := range mutations {
+		if !bytes.HasPrefix(m.Key, prefix) {
+			t.Errorf("mutation[%d]: key %x does not start with prefix %x", i, m.Key, prefix)
+			continue
+		}
+		raw := m.Key[len(prefix):]
+		if len(raw) != 8 {
+			t.Errorf("mutation[%d]: key suffix length %d, want 8", i, len(raw))
+			continue
+		}
+		gotK := int64(binary.BigEndian.Uint64(raw))
+		if gotK != wantKeys[i] {
+			t.Errorf("mutation[%d]: key value %d, want %d", i, gotK, wantKeys[i])
+		}
+	}
+}
+
+// TestDeleteRangeBytes_ClosedStoreError verifies that DeleteRangeBytes on a closed
+// store returns an error.
+func TestDeleteRangeBytes_ClosedStoreError(t *testing.T) {
+	db, err := state.OpenMemDB()
+	if err != nil {
+		t.Fatalf("OpenMemDB: %v", err)
+	}
+	defer db.Close()
+
+	store := state.NewKeyValueStore("drb-closed", db, stringSerde{}, stringSerde{})
+	store.Close()
+
+	if err := store.DeleteRangeBytes([]byte("a"), []byte("z")); err == nil {
+		t.Fatal("expected error on closed store, got nil")
 	}
 }
 

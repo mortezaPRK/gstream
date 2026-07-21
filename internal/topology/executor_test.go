@@ -326,3 +326,186 @@ func TestExecutor_DrainSinkClearsBuffer(t *testing.T) {
 		t.Fatalf("second DrainSink (no new records): expected 0, got %d", len(out2))
 	}
 }
+
+// TestProcessorCtx_StreamTime verifies processorCtxImpl stream-time semantics
+// directly via a stateful processor that calls AdvanceStreamTime / StreamTime.
+func TestProcessorCtx_StreamTime(t *testing.T) {
+	t.Run("nil_pointer_safe", func(t *testing.T) {
+		// StreamTime() and AdvanceStreamTime() with a nil streamTime pointer
+		// (as used in NewExecutor paths) must not panic and must return 0.
+		b := topology.NewBuilder()
+		src := b.AddSource("src")
+		var observed int64 = -1
+		proc := topology.StatefulProcessFunc(func(r topology.Record, ctx topology.ProcessorContext) error {
+			ctx.AdvanceStreamTime(r.Timestamp) // must not panic
+			observed = ctx.StreamTime()
+			ctx.Forward(r)
+			return nil
+		})
+		node := b.AddStatefulProcessor("p", proc, nil, src)
+		b.AddSink("sink", node)
+		topo := b.Build()
+
+		// NewExecutor has nil streamTime pointer — AdvanceStreamTime is a no-op.
+		exec := topology.NewExecutor(topo, nil)
+		if err := exec.Process("src", topology.Record{Key: "k", Value: "v", Timestamp: 100}); err != nil {
+			t.Fatalf("Process: %v", err)
+		}
+		// StreamTime() must return 0 when streamTime pointer is nil.
+		if observed != 0 {
+			t.Fatalf("StreamTime with nil pointer: got %d, want 0", observed)
+		}
+	})
+
+	t.Run("advance_monotonic", func(t *testing.T) {
+		// AdvanceStreamTime must be monotonic: lower values are ignored.
+		b := topology.NewBuilder()
+		src := b.AddSource("src")
+		var lastSeen int64
+		proc := topology.StatefulProcessFunc(func(r topology.Record, ctx topology.ProcessorContext) error {
+			ctx.AdvanceStreamTime(r.Timestamp)
+			lastSeen = ctx.StreamTime()
+			ctx.Forward(r)
+			return nil
+		})
+		node := b.AddStatefulProcessor("p", proc, nil, src)
+		b.AddSink("sink", node)
+		topo := b.Build()
+
+		var st int64
+		exec := topology.NewExecutorWithStreamTime(topo, nil, &st)
+
+		// Drive timestamps out of order: 10, 50, 30 — stream-time must be
+		// max-so-far: 10, 50, 50.
+		timestamps := []struct {
+			ts   int64
+			want int64
+		}{
+			{10, 10},
+			{50, 50},
+			{30, 50}, // lower than current max — must not regress
+		}
+		for _, tc := range timestamps {
+			if err := exec.Process("src", topology.Record{Key: "k", Value: "v", Timestamp: tc.ts}); err != nil {
+				t.Fatalf("Process ts=%d: %v", tc.ts, err)
+			}
+			if lastSeen != tc.want {
+				t.Errorf("after ts=%d: StreamTime()=%d, want %d", tc.ts, lastSeen, tc.want)
+			}
+		}
+		// Shared pointer must also reflect the final value.
+		if st != 50 {
+			t.Errorf("shared streamTime pointer: got %d, want 50", st)
+		}
+	})
+}
+
+// TestNewExecutor_Unchanged verifies that NewExecutor (old constructor without
+// stream-time) continues to drive stateless and stateful pipelines correctly.
+// This is the backward-compat regression guard.
+func TestNewExecutor_Unchanged(t *testing.T) {
+	t.Run("stateless", func(t *testing.T) {
+		topo := buildStatelessPipeline(t)
+		exec := topology.NewExecutor(topo, nil)
+		if err := exec.Process("source", topology.Record{Key: "x", Value: "hello", Timestamp: 1}); err != nil {
+			t.Fatalf("Process: %v", err)
+		}
+		out, err := exec.DrainSink("sink")
+		if err != nil {
+			t.Fatalf("DrainSink: %v", err)
+		}
+		if len(out) != 1 {
+			t.Fatalf("expected 1 record, got %d", len(out))
+		}
+		if out[0].Value != "HELLO" {
+			t.Errorf("expected HELLO, got %v", out[0].Value)
+		}
+	})
+
+	t.Run("stateful", func(t *testing.T) {
+		b := topology.NewBuilder()
+		src := b.AddSource("src")
+		counter := topology.StatefulProcessFunc(func(r topology.Record, ctx topology.ProcessorContext) error {
+			m := ctx.Store("c").(map[string]int)
+			m["n"]++
+			ctx.Forward(topology.Record{Key: r.Key, Value: m["n"], Timestamp: r.Timestamp})
+			return nil
+		})
+		proc := b.AddStatefulProcessor("counter", counter, []string{"c"}, src)
+		b.AddSink("sink", proc)
+		topo := b.Build()
+
+		counts := map[string]int{}
+		exec := topology.NewExecutor(topo, map[string]any{"c": counts})
+		for i := 0; i < 3; i++ {
+			if err := exec.Process("src", topology.Record{Key: "k", Value: nil, Timestamp: int64(i)}); err != nil {
+				t.Fatalf("Process[%d]: %v", i, err)
+			}
+		}
+		out, err := exec.DrainSink("sink")
+		if err != nil {
+			t.Fatalf("DrainSink: %v", err)
+		}
+		if len(out) != 3 {
+			t.Fatalf("expected 3 records, got %d", len(out))
+		}
+		for i, rec := range out {
+			if rec.Value != i+1 {
+				t.Errorf("record[%d].Value: got %v, want %d", i, rec.Value, i+1)
+			}
+		}
+	})
+}
+
+// TestExecutorWithStreamTime verifies that NewExecutorWithStreamTime threads the
+// shared *int64 into every processorCtxImpl so that AdvanceStreamTime/StreamTime
+// are observable both within the processor and via the shared pointer.
+func TestExecutorWithStreamTime(t *testing.T) {
+	b := topology.NewBuilder()
+	src := b.AddSource("src")
+
+	// Processor advances stream-time to each record's timestamp and forwards the
+	// current stream-time value as the record's Value so tests can inspect it.
+	proc := topology.StatefulProcessFunc(func(r topology.Record, ctx topology.ProcessorContext) error {
+		ctx.AdvanceStreamTime(r.Timestamp)
+		ctx.Forward(topology.Record{Key: r.Key, Value: ctx.StreamTime(), Timestamp: r.Timestamp})
+		return nil
+	})
+	node := b.AddStatefulProcessor("tracker", proc, nil, src)
+	b.AddSink("sink", node)
+	topo := b.Build()
+
+	var sharedTime int64
+	exec := topology.NewExecutorWithStreamTime(topo, nil, &sharedTime)
+
+	records := []topology.Record{
+		{Key: "a", Value: nil, Timestamp: 100},
+		{Key: "b", Value: nil, Timestamp: 300},
+		{Key: "c", Value: nil, Timestamp: 200}, // lower — must not regress
+		{Key: "d", Value: nil, Timestamp: 400},
+	}
+	wantStreamTimes := []int64{100, 300, 300, 400}
+
+	for i, r := range records {
+		if err := exec.Process("src", r); err != nil {
+			t.Fatalf("Process[%d]: %v", i, err)
+		}
+	}
+
+	out, err := exec.DrainSink("sink")
+	if err != nil {
+		t.Fatalf("DrainSink: %v", err)
+	}
+	if len(out) != len(records) {
+		t.Fatalf("expected %d records, got %d", len(records), len(out))
+	}
+	for i, rec := range out {
+		if rec.Value != wantStreamTimes[i] {
+			t.Errorf("record[%d] streamTime: got %v, want %d", i, rec.Value, wantStreamTimes[i])
+		}
+	}
+	// Shared pointer must reflect the final maximum.
+	if sharedTime != 400 {
+		t.Errorf("shared streamTime pointer: got %d, want 400", sharedTime)
+	}
+}

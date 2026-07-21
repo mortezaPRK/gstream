@@ -56,12 +56,12 @@ const separator byte = 0x00
 // consumers can restore store state exactly. A nil collector disables capture and
 // leaves existing behaviour unchanged.
 type KeyValueStore[K, V any] struct {
-	db         *pebble.DB
-	prefix     []byte // name + separator
-	kSerde     gstream.Serde[K]
-	vSerde     gstream.Serde[V]
-	collector  *MutationCollector // nil = no changelog capture
-	closed     bool
+	db        *pebble.DB
+	prefix    []byte // name + separator
+	kSerde    gstream.Serde[K]
+	vSerde    gstream.Serde[V]
+	collector *MutationCollector // nil = no changelog capture
+	closed    bool
 }
 
 // OpenDB opens a Pebble database at dir with default options.
@@ -280,6 +280,159 @@ func (s *KeyValueStore[K, V]) Range(fn func(K, V) bool) error {
 
 	if err := iter.Error(); err != nil {
 		return fmt.Errorf("state: Range iter error: %w", err)
+	}
+	return nil
+}
+
+// RangeBytes iterates keys in [lower, upper) within this store's prefix, WITHOUT
+// K/V serde — raw bytes. lower and upper are per-store key portions; the store
+// prefix is added internally. fn receives copies of key and value bytes (safe to
+// retain after fn returns). Return false from fn to stop early.
+// Mirrors Range's iterator setup and byte-copy semantics.
+func (s *KeyValueStore[K, V]) RangeBytes(lower, upper []byte, fn func(key, val []byte) bool) error {
+	if err := s.checkOpen(); err != nil {
+		return err
+	}
+
+	lowerBound := make([]byte, len(s.prefix)+len(lower))
+	copy(lowerBound, s.prefix)
+	copy(lowerBound[len(s.prefix):], lower)
+
+	upperBound := make([]byte, len(s.prefix)+len(upper))
+	copy(upperBound, s.prefix)
+	copy(upperBound[len(s.prefix):], upper)
+
+	iterOpts := &pebble.IterOptions{
+		LowerBound: lowerBound,
+		UpperBound: upperBound,
+	}
+
+	iter, err := s.db.NewIter(iterOpts)
+	if err != nil {
+		return fmt.Errorf("state: RangeBytes new iter: %w", err)
+	}
+	defer func() {
+		_ = iter.Close()
+	}()
+
+	for valid := iter.First(); valid; valid = iter.Next() {
+		rawKey := iter.Key()
+		rawVal := iter.Value()
+
+		// Copy both before handing to fn — Pebble reuses its buffers.
+		keyCopy := make([]byte, len(rawKey))
+		copy(keyCopy, rawKey)
+		valCopy := make([]byte, len(rawVal))
+		copy(valCopy, rawVal)
+
+		if !fn(keyCopy, valCopy) {
+			break
+		}
+	}
+
+	if err := iter.Error(); err != nil {
+		return fmt.Errorf("state: RangeBytes iter error: %w", err)
+	}
+	return nil
+}
+
+// DeleteRangeBytes deletes all keys in [lower, upper) within the store prefix.
+// lower and upper are per-store key portions; the store prefix is added internally.
+//
+// It uses iterate-then-delete (NOT pebble.DeleteRange) so that the MutationCollector
+// receives one tombstone per deleted key — pebble.DeleteRange emits no per-key events
+// and would diverge changelog restore.
+//
+// The Mutation.Key appended to the collector is the full Pebble key
+// (prefix + per-store key), matching exactly what Put and Delete append, so
+// changelog and restore remain consistent.
+func (s *KeyValueStore[K, V]) DeleteRangeBytes(lower, upper []byte) error {
+	if err := s.checkOpen(); err != nil {
+		return err
+	}
+
+	// Collect keys to delete first; do not mutate while iterating.
+	var keys [][]byte
+	if err := s.RangeBytes(lower, upper, func(key, _ []byte) bool {
+		keys = append(keys, key) // key is already a copy from RangeBytes
+		return true
+	}); err != nil {
+		return fmt.Errorf("state: DeleteRangeBytes scan: %w", err)
+	}
+
+	for _, fullKey := range keys {
+		if err := s.db.Delete(fullKey, pebble.Sync); err != nil {
+			return fmt.Errorf("state: DeleteRangeBytes delete: %w", err)
+		}
+		if s.collector != nil {
+			// Mutation.Key must be the full Pebble key to match what Put/Delete append.
+			keyCopy := make([]byte, len(fullKey))
+			copy(keyCopy, fullKey)
+			s.collector.Append(Mutation{Key: keyCopy, IsDelete: true})
+		}
+	}
+	return nil
+}
+
+// WindowGet retrieves the raw value bytes for the composite (kBytes, windowStart)
+// key. The composite key is built with WindowCompositeKey so the format is
+// owned in exactly one place; this avoids duplicating the encoding in callers.
+//
+// WindowGet and WindowPut bypass the K/V serdes — they interact with Pebble
+// directly using the store prefix, mirroring the raw-bytes pattern of
+// RangeBytes and DeleteRangeBytes. They are designed for use with
+// KeyValueStore[[]byte,[]byte] where the windowed DSL handles value
+// serialisation outside the store.
+//
+// Returns (nil, false, nil) when the key is not found.
+func (s *KeyValueStore[K, V]) WindowGet(kBytes []byte, windowStart int64) ([]byte, bool, error) {
+	if err := s.checkOpen(); err != nil {
+		return nil, false, err
+	}
+	ck := WindowCompositeKey(kBytes, windowStart)
+	pk := make([]byte, len(s.prefix)+len(ck))
+	copy(pk, s.prefix)
+	copy(pk[len(s.prefix):], ck)
+
+	valBytes, closer, err := s.db.Get(pk)
+	if err != nil {
+		if err == pebble.ErrNotFound {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("state: WindowGet pebble: %w", err)
+	}
+	defer closer.Close()
+
+	// Copy bytes out of Pebble's buffer before the closer is called.
+	result := make([]byte, len(valBytes))
+	copy(result, valBytes)
+	return result, true, nil
+}
+
+// WindowPut stores val under the composite (kBytes, windowStart) key.
+// The composite key is built with WindowCompositeKey; the store prefix is
+// prepended before writing to Pebble. If a MutationCollector is attached, a
+// Mutation is appended after the Pebble write succeeds (matching Put semantics
+// for changelog capture).
+func (s *KeyValueStore[K, V]) WindowPut(kBytes []byte, windowStart int64, val []byte) error {
+	if err := s.checkOpen(); err != nil {
+		return err
+	}
+	ck := WindowCompositeKey(kBytes, windowStart)
+	pk := make([]byte, len(s.prefix)+len(ck))
+	copy(pk, s.prefix)
+	copy(pk[len(s.prefix):], ck)
+
+	if err := s.db.Set(pk, val, pebble.Sync); err != nil {
+		return fmt.Errorf("state: WindowPut pebble: %w", err)
+	}
+
+	if s.collector != nil {
+		keyCopy := make([]byte, len(pk))
+		copy(keyCopy, pk)
+		valCopy := make([]byte, len(val))
+		copy(valCopy, val)
+		s.collector.Append(Mutation{Key: keyCopy, Value: valCopy})
 	}
 	return nil
 }

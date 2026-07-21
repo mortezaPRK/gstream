@@ -15,6 +15,13 @@ type ProcessFunc func(r Record, forward Forwarder) error
 type ProcessorContext interface {
 	Forward(r Record)
 	Store(name string) any // concrete store; caller type-asserts. nil if unregistered.
+	// StreamTime returns the current per-task stream-time: the maximum observed
+	// event timestamp (Unix ms) seen so far across all records processed by this
+	// task. Returns 0 if no record has been processed yet.
+	StreamTime() int64
+	// AdvanceStreamTime advances the stream-time to max(current, ts). No-op when
+	// ts is less than or equal to the current stream-time.
+	AdvanceStreamTime(ts int64)
 }
 
 // StatefulProcessFunc is a processor with state access.
@@ -35,9 +42,12 @@ type node struct {
 // processorCtxImpl implements ProcessorContext. It holds the forward closure and
 // a snapshot of the stores map for the current execution. It is created fresh for
 // each stateful processor invocation and is not shared between invocations.
+// streamTime is a pointer shared across all processorCtxImpl instances within the
+// same task; nil means no stream-time tracking (safe no-op for stateless paths).
 type processorCtxImpl struct {
-	forwardFn func(r Record)
-	stores    map[string]any
+	forwardFn  func(r Record)
+	stores     map[string]any
+	streamTime *int64
 }
 
 func (c *processorCtxImpl) Forward(r Record) { c.forwardFn(r) }
@@ -49,6 +59,26 @@ func (c *processorCtxImpl) Store(name string) any {
 	return c.stores[name] // nil if unregistered
 }
 
+// StreamTime returns the current stream-time value. Returns 0 when streamTime
+// pointer is nil (stateless paths where stream-time tracking is unused).
+func (c *processorCtxImpl) StreamTime() int64 {
+	if c.streamTime == nil {
+		return 0
+	}
+	return *c.streamTime
+}
+
+// AdvanceStreamTime sets stream-time to max(current, ts). No-op when streamTime
+// pointer is nil or ts does not exceed the current value.
+func (c *processorCtxImpl) AdvanceStreamTime(ts int64) {
+	if c.streamTime == nil {
+		return
+	}
+	if ts > *c.streamTime {
+		*c.streamTime = ts
+	}
+}
+
 // processWithCtx drives execution of this node with the given store map, then
 // recursively drives all downstream nodes for each forwarded record.
 //
@@ -58,7 +88,9 @@ func (c *processorCtxImpl) Store(name string) any {
 //
 // When stores is nil all Store() calls return nil; this is the normal path for
 // stateless processors (processFn set, statefulFn nil).
-func (n *node) processWithCtx(r Record, stores map[string]any) (firstErr error) {
+// streamTime is a shared pointer owned by the Executor (or nil for the TestDriver
+// path); the same pointer is threaded into every processorCtxImpl in one traversal.
+func (n *node) processWithCtx(r Record, stores map[string]any, streamTime *int64) (firstErr error) {
 	// Build the shared downstream-forwarding closure that both stateless and
 	// stateful paths use.  It captures firstErr by reference so downstream
 	// errors are accumulated in the outer named return.
@@ -67,7 +99,7 @@ func (n *node) processWithCtx(r Record, stores map[string]any) (firstErr error) 
 			return // stop forwarding once we have an error
 		}
 		for _, ds := range n.downstreams {
-			if err := ds.processWithCtx(out, stores); err != nil {
+			if err := ds.processWithCtx(out, stores, streamTime); err != nil {
 				firstErr = err
 				return
 			}
@@ -76,8 +108,8 @@ func (n *node) processWithCtx(r Record, stores map[string]any) (firstErr error) 
 
 	if n.statefulFn != nil {
 		// Stateful path: build a fresh ProcessorContext backed by the shared
-		// forward closure and the caller-supplied stores map.
-		ctx := &processorCtxImpl{forwardFn: forward, stores: stores}
+		// forward closure, caller-supplied stores map, and shared stream-time pointer.
+		ctx := &processorCtxImpl{forwardFn: forward, stores: stores, streamTime: streamTime}
 		if fnErr := n.statefulFn(r, ctx); fnErr != nil && firstErr == nil {
 			firstErr = fnErr
 		}
@@ -97,7 +129,8 @@ func (n *node) processWithCtx(r Record, stores map[string]any) (firstErr error) 
 // buffers WITHOUT permanently mutating node.processFn on the shared *Topology.
 //
 // onSink must not be nil when the topology contains sink nodes.
-func (n *node) processWithCtxAndHook(r Record, stores map[string]any, onSink func(sinkName string, r Record)) (firstErr error) {
+// streamTime is a shared pointer owned by the Executor; nil is safe (no-op).
+func (n *node) processWithCtxAndHook(r Record, stores map[string]any, streamTime *int64, onSink func(sinkName string, r Record)) (firstErr error) {
 	// Sink nodes are leaf interceptors: hand off to the caller's hook instead
 	// of running the placeholder processFn.
 	if n.isSink {
@@ -110,7 +143,7 @@ func (n *node) processWithCtxAndHook(r Record, stores map[string]any, onSink fun
 			return
 		}
 		for _, ds := range n.downstreams {
-			if err := ds.processWithCtxAndHook(out, stores, onSink); err != nil {
+			if err := ds.processWithCtxAndHook(out, stores, streamTime, onSink); err != nil {
 				firstErr = err
 				return
 			}
@@ -118,7 +151,7 @@ func (n *node) processWithCtxAndHook(r Record, stores map[string]any, onSink fun
 	}
 
 	if n.statefulFn != nil {
-		ctx := &processorCtxImpl{forwardFn: forward, stores: stores}
+		ctx := &processorCtxImpl{forwardFn: forward, stores: stores, streamTime: streamTime}
 		if fnErr := n.statefulFn(r, ctx); fnErr != nil && firstErr == nil {
 			firstErr = fnErr
 		}
@@ -130,12 +163,13 @@ func (n *node) processWithCtxAndHook(r Record, stores map[string]any, onSink fun
 	return
 }
 
-// processWithErr drives the node using processWithCtx with no stores (nil map).
-// This keeps the TestDriver — which calls processWithErr directly — working
-// identically for all stateless topologies. The error semantics (first error wins,
-// stop-on-error, current-node error only if no downstream error) are unchanged.
+// processWithErr drives the node using processWithCtx with no stores (nil map)
+// and no stream-time tracking (nil pointer). This keeps the TestDriver — which
+// calls processWithErr directly — working identically for all stateless topologies.
+// The error semantics (first error wins, stop-on-error, current-node error only if
+// no downstream error) are unchanged.
 func (n *node) processWithErr(r Record) error {
-	return n.processWithCtx(r, nil)
+	return n.processWithCtx(r, nil, nil)
 }
 
 // Filter returns a ProcessFunc that passes the Record downstream only when

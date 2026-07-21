@@ -26,6 +26,7 @@ type StreamBuilder struct {
 	sinks        map[string]SinkBinding
 	repartitions map[string]bool
 	stores       map[string]StoreBinding
+	windowStores map[string]WindowStoreBinding
 }
 
 // NewStreamBuilder creates and returns a new StreamBuilder ready to accept
@@ -37,6 +38,7 @@ func NewStreamBuilder() *StreamBuilder {
 		sinks:        make(map[string]SinkBinding),
 		repartitions: make(map[string]bool),
 		stores:       make(map[string]StoreBinding),
+		windowStores: make(map[string]WindowStoreBinding),
 	}
 }
 
@@ -130,6 +132,19 @@ type StoreBinding struct {
 	DecodeVal func([]byte) (any, error)
 }
 
+// WindowStoreBinding extends StoreBinding with window-specific metadata.
+// Registered by TimeWindowedStream.Aggregate/Count so the runtime (P3-T4) can
+// open the correct byte store and configure the window sweeper with the right
+// retention parameters (MaxSizeMs + GraceMs).
+type WindowStoreBinding struct {
+	StoreBinding
+	// WindowDef is the WindowDefinition used to assign windows.  The runtime
+	// uses WindowDef.MaxSizeMs() together with GraceMs to compute retention.
+	WindowDef WindowDefinition
+	// GraceMs is the late-record grace period in milliseconds.
+	GraceMs int64
+}
+
 // BuiltTopology is the immutable, sealed output of StreamBuilder.Build() (§6.3).
 // It is consumed by the runtime (to spin up tasks) and by the TestDriver
 // (for broker-free testing, §16). After Build() is called the StreamBuilder
@@ -148,6 +163,11 @@ type BuiltTopology struct {
 	// The runtime uses these to open KeyValueStore instances and wire them
 	// into the Executor's stores map before processing begins.
 	StoreBindings map[string]StoreBinding
+
+	// WindowStoreBindings maps window store names to their type-erased serde +
+	// window metadata bindings. The runtime uses these to open the byte store
+	// and configure the window sweeper for each windowed aggregation.
+	WindowStoreBindings map[string]WindowStoreBinding
 }
 
 // Stream registers a typed source node in the topology and returns a
@@ -216,9 +236,10 @@ func (s KStream[K, V]) To(topic, sinkName string, keySerde Serde[K], valSerde Se
 // API changes.
 func (b *StreamBuilder) Build() *BuiltTopology {
 	return &BuiltTopology{
-		Topology:      b.internal.Build(),
-		Sources:       b.sources,
-		Sinks:         b.sinks,
-		StoreBindings: b.stores,
+		Topology:            b.internal.Build(),
+		Sources:             b.sources,
+		Sinks:               b.sinks,
+		StoreBindings:       b.stores,
+		WindowStoreBindings: b.windowStores,
 	}
 }

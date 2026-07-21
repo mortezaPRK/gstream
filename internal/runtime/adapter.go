@@ -112,20 +112,23 @@ func NewAdapterWithConfig(bt *gstream.BuiltTopology, cfg gstream.Config, logger 
 	// Validate that every sink declared in the topology has a binding in bt.Sinks.
 	// Exception: internal ktable-out sinks (no entry in bt.Sinks) are skipped; they
 	// are terminal sinks that the stateful processor never forwards to.
+	// isStateful is true when the topology has any stateful stores (regular or windowed).
+	isStateful := len(bt.StoreBindings) > 0 || len(bt.WindowStoreBindings) > 0
+
 	for _, sinkName := range bt.Topology.SinkNames() {
 		if _, ok := bt.Sinks[sinkName]; !ok {
 			// Check whether it is a known internal sink (no Kafka mapping needed).
 			// Internal sinks are registered in the topology but absent from bt.Sinks.
-			// For now we only skip if StoreBindings is non-empty (stateful topology
-			// has ktable-out-N internal sinks). For stateless topologies all sinks
-			// must have bindings.
-			if len(bt.StoreBindings) == 0 {
+			// For stateless topologies all sinks must have bindings.
+			// For stateful topologies (StoreBindings or WindowStoreBindings non-empty)
+			// we skip internal sinks (e.g. ktable-out-N, windowed-ktable-out-N) silently.
+			if !isStateful {
 				return nil, fmt.Errorf(
 					"runtime.NewAdapter: sink %q has no entry in bt.Sinks (provide a SinkBinding with Topic, EncodeKey, and EncodeVal)",
 					sinkName,
 				)
 			}
-			// Stateful: skip internal sinks (e.g. ktable-out-N) silently.
+			// Stateful: skip internal sinks silently.
 		}
 	}
 
@@ -135,7 +138,7 @@ func NewAdapterWithConfig(bt *gstream.BuiltTopology, cfg gstream.Config, logger 
 		sourceName: sourceName,
 	}
 
-	if len(bt.StoreBindings) > 0 {
+	if isStateful {
 		// Stateful path: create a TaskManager to manage per-partition state.
 		a.taskManager = NewTaskManager(bt, cfg, logger)
 	} else {
