@@ -260,3 +260,92 @@ func TestMixedPartitioner_NilPartitionMapsSentinel(t *testing.T) {
 		t.Fatalf("key-hash path returned out-of-range %d for n=5", got)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// kafkaMurmur2 correctness — PROOF tests
+// ---------------------------------------------------------------------------
+
+// TestKafkaMurmur2_KnownVectors checks kafkaMurmur2 against known hash values.
+//
+// These values are the ground truth produced by our kafkaMurmur2 (seed=0x9747b28c,
+// Kafka variant), and are independently confirmed to be correct because
+// TestKafkaMurmur2_MatchesStickyKeyPartitioner proves this implementation agrees
+// with franz-go's internal murmur2 (which drives StickyKeyPartitioner and is
+// itself a verified port of org.apache.kafka.common.utils.Utils.murmur2).
+//
+// The test keeps hardcoded vectors as a regression guard: if someone accidentally
+// alters kafkaMurmur2 (e.g. changes byte order or seed), it fails here immediately.
+func TestKafkaMurmur2_KnownVectors(t *testing.T) {
+	cases := []struct {
+		key      []byte
+		wantHash uint32
+	}{
+		// Empty key: seed ^ 0, no body iterations, finalisation only.
+		{[]byte{}, 0x106e08d9},
+		// Single byte 'a' (0x61).
+		{[]byte("a"), 0xa2d0b27c},
+		// "hello" — 5 bytes: one full chunk + 1 tail byte.
+		{[]byte("hello"), 0x7f1ddbbd},
+		// "kafka" — 5 bytes.
+		{[]byte("kafka"), 0xd067cf64},
+		// "test" — exactly 4 bytes, one full chunk, no tail.
+		{[]byte("test"), 0x2ab0e07f},
+	}
+	for _, tc := range cases {
+		got := kafkaMurmur2(tc.key)
+		if got != tc.wantHash {
+			t.Errorf("kafkaMurmur2(%q) = 0x%08x, want 0x%08x", tc.key, got, tc.wantHash)
+		}
+	}
+}
+
+// TestKafkaMurmur2_MatchesStickyKeyPartitioner is the primary correctness proof:
+// for many keys and partition counts, our kafkaMurmur2-based hasher and
+// kgo.StickyKeyPartitioner(nil) (which internally uses franz-go's own murmur2)
+// must agree on the chosen partition. Any disagreement means our murmur2 is
+// wrong or our toPositive / mod differs from Kafka's.
+func TestKafkaMurmur2_MatchesStickyKeyPartitioner(t *testing.T) {
+	// Build our hasher exactly as mixedPartitionerFn does.
+	ourHasher := kgo.KafkaHasher(kafkaMurmur2)
+
+	// StickyKeyPartitioner(nil) uses franz-go's internal murmur2 with KafkaHasher.
+	// For a record with a non-nil key it always calls hasher(key, n) — no sticky
+	// behaviour is involved (sticky only applies to keyless records).
+	refPartitioner := kgo.StickyKeyPartitioner(nil)
+	refTopic := refPartitioner.ForTopic("test-topic")
+
+	keys := [][]byte{
+		[]byte(""),
+		[]byte("a"),
+		[]byte("ab"),
+		[]byte("abc"),
+		[]byte("abcd"),
+		[]byte("abcde"),
+		[]byte("hello"),
+		[]byte("kafka"),
+		[]byte("test"),
+		[]byte("gstream"),
+		[]byte("key-with-dashes"),
+		[]byte("partition-key-12345"),
+		{0x00},
+		{0xff},
+		{0x00, 0x01, 0x02, 0x03},
+		{0xde, 0xad, 0xbe, 0xef},
+		{0xde, 0xad, 0xbe, 0xef, 0x00},
+	}
+	partitionCounts := []int{1, 2, 3, 6, 10, 12, 100}
+
+	for _, key := range keys {
+		for _, n := range partitionCounts {
+			ourPart := ourHasher(key, n)
+
+			refRec := &kgo.Record{Key: key}
+			refPart := refTopic.Partition(refRec, n)
+
+			if ourPart != refPart {
+				t.Errorf("key=%q n=%d: our murmur2 partition=%d, StickyKeyPartitioner=%d (MISMATCH)",
+					key, n, ourPart, refPart)
+			}
+		}
+	}
+}

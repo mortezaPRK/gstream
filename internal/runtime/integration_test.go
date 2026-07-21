@@ -261,6 +261,10 @@ func TestE2E_StatelessFilterMap(t *testing.T) {
 	t.Logf("all expected output records arrived in sink topic (%d)", len(outputRecords))
 
 	// Cancel the run loop and wait for it to stop.
+	// NOTE: canceling the run context here may interrupt an in-flight offset
+	// commit, producing a benign "failed to commit offsets ... context canceled"
+	// WARN. Harmless under ALO — uncommitted records are redelivered on the next
+	// run; assertions below account for this.
 	runCancel()
 	select {
 	case err := <-done:

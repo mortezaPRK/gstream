@@ -3,39 +3,79 @@ package kafka
 import (
 	"context"
 	"fmt"
-	"hash/fnv"
 	"log/slog"
 
 	gstream "github.com/mortezaPRK/gstream"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
+// kafkaMurmur2 implements the Kafka-variant of MurmurHash2 (seed 0x9747b28c),
+// matching org.apache.kafka.common.utils.Utils.murmur2 exactly.
+//
+// This is a port of the canonical implementation in franz-go
+// (github.com/twmb/franz-go/pkg/kgo partitioner.go — unexported murmur2) and
+// the upstream Java source:
+//
+//	https://github.com/apache/kafka/blob/d91a94e/clients/src/main/java/org/apache/kafka/common/utils/Utils.java#L383-L421
+//
+// Java bytes are signed; the &0xff masks are implicit here because Go bytes are
+// unsigned, but the four-byte chunk construction uses little-endian order
+// (b[0] + b[1]<<8 + b[2]<<16 + b[3]<<24) which matches the Kafka implementation.
+func kafkaMurmur2(b []byte) uint32 {
+	const (
+		seed uint32 = 0x9747b28c
+		m    uint32 = 0x5bd1e995
+		r           = 24
+	)
+	h := seed ^ uint32(len(b))
+	for len(b) >= 4 {
+		k := uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 | uint32(b[3])<<24
+		b = b[4:]
+		k *= m
+		k ^= k >> r
+		k *= m
+		h *= m
+		h ^= k
+	}
+	switch len(b) {
+	case 3:
+		h ^= uint32(b[2]) << 16
+		fallthrough
+	case 2:
+		h ^= uint32(b[1]) << 8
+		fallthrough
+	case 1:
+		h ^= uint32(b[0])
+		h *= m
+	}
+	h ^= h >> 13
+	h *= m
+	h ^= h >> 15
+	return h
+}
+
 // mixedPartitionerFn is the per-topic partitioning function installed via
 // kgo.BasicConsistentPartitioner (verdict C from P2 spike).
 //
 // Routing rules:
 //   - r.Partition < 0 (sentinel = -1): unpinned sink record; hash Key using
-//     FNV-1a mod n for stable key-affinity. FNV-1a over murmur2 is chosen here
-//     because murmur2 is not exported from franz-go; FNV-1a is stable, zero-
-//     allocation, and provides adequate key distribution for changelog-free sinks.
-//     NOTE: this does NOT reproduce Java Kafka's murmur2 placement; that is
-//     acceptable for P2 sink records (no co-location requirement). Document any
-//     P3+ compatibility need there.
+//     Kafka's murmur2 via kgo.KafkaHasher so gstream sink output co-partitions
+//     with standard Kafka producers and Kafka Streams (toPositive(murmur2(key)) % n).
 //   - r.Partition >= 0: pinned changelog record; return the stored value directly.
 //
 // The sentinel (-1) is set in the produce step when OutRecord.Partition == nil
 // so that all legacy sink OutRecords (zero-value Partition pointer = nil) follow
 // the key-hash path, preserving TestRoundTrip_ALO behaviour without changes.
 func mixedPartitionerFn(_ string) func(*kgo.Record, int) int {
+	hasher := kgo.KafkaHasher(kafkaMurmur2)
 	return func(r *kgo.Record, n int) int {
 		if r.Partition >= 0 {
 			// Pinned: changelog record specifies exact target partition.
 			return int(r.Partition)
 		}
-		// Unpinned: hash key with FNV-1a mod n for key-affinity distribution.
-		h := fnv.New32a()
-		h.Write(r.Key)
-		return int(h.Sum32()) % n
+		// Unpinned: hash key with Kafka murmur2 for co-partitioning with
+		// standard Kafka producers (toPositive(murmur2(key)) % n).
+		return hasher(r.Key, n)
 	}
 }
 

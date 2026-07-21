@@ -12,16 +12,25 @@ import (
 // internal/kafka (P2 verdict C / S2). It is duplicated here intentionally to
 // keep ChangelogProducer self-contained and avoid a state↔kafka import cycle.
 //
-// Routing rules (identical to kafka.mixedPartitionerFn):
+// Routing rules:
 //   - r.Partition >= 0: pinned; return the stored value directly (used by Flush).
-//   - r.Partition < 0 (sentinel -1): unpinned; hash Key with FNV-1a mod n.
+//   - r.Partition < 0 (sentinel -1): unpinned hash path — DEAD CODE in practice.
 //
-// See internal/kafka/client.go — mixedPartitionerFn for the canonical comment.
+// The hash path (Partition < 0) is never reached: Flush always sets
+// records[i].Partition = partition (>= 0) so every changelog record is pinned.
+// This branch is kept for structural symmetry with kafka.mixedPartitionerFn but
+// will never execute under normal operation.
+//
+// NOTE: the hash path here still uses FNV-1a (not Kafka murmur2). Since it is
+// unreachable, alignment is deferred. If a future code path ever produces an
+// unpinned changelog record, align this hash to kafkaMurmur2 at that time.
 func changelogMixedPartitionerFn(_ string) func(*kgo.Record, int) int {
 	return func(r *kgo.Record, n int) int {
 		if r.Partition >= 0 {
 			return int(r.Partition)
 		}
+		// Dead code path: changelog records are always pinned (Partition >= 0).
+		// FNV-1a is left intentionally; see comment above.
 		h := fnv.New32a()
 		h.Write(r.Key)
 		return int(h.Sum32()) % n

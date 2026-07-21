@@ -148,6 +148,10 @@ func TestE2E_StatefulCountRestoreAfterRestart(t *testing.T) {
 	// Cancel run context → Run exits. Then Close() triggers kgo cooperative revoke
 	// → OnPartitionsRevoked → TaskManager.OnRevoked → closeTask
 	// (flush pending mutations + write final checkpoint + close Pebble).
+	// NOTE: canceling the run context here may interrupt an in-flight offset
+	// commit, producing a benign "failed to commit offsets ... context canceled"
+	// WARN. Harmless under ALO — uncommitted records are redelivered on the next
+	// run; assertions below account for this.
 	run1Cancel()
 	select {
 	case err := <-done1:
