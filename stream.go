@@ -25,6 +25,7 @@ type StreamBuilder struct {
 	sources      map[string]SourceBinding
 	sinks        map[string]SinkBinding
 	repartitions map[string]bool
+	stores       map[string]StoreBinding
 }
 
 // NewStreamBuilder creates and returns a new StreamBuilder ready to accept
@@ -35,6 +36,7 @@ func NewStreamBuilder() *StreamBuilder {
 		sources:      make(map[string]SourceBinding),
 		sinks:        make(map[string]SinkBinding),
 		repartitions: make(map[string]bool),
+		stores:       make(map[string]StoreBinding),
 	}
 }
 
@@ -94,6 +96,40 @@ type SinkBinding struct {
 	EncodeVal func(any) ([]byte, error)
 }
 
+// StoreBinding is the type-erased serde pair for a stateful store registered via
+// Count or Aggregate. It is stored in StreamBuilder and copied verbatim into
+// BuiltTopology so the runtime can open, write to, and recover the store without
+// retaining generic type parameters (§6.3, §10).
+//
+// ChangelogTopic carries the bare store name. The runtime derives the full Kafka
+// topic as <AppID>-<StoreName>-changelog; the binding intentionally does not
+// include the AppID prefix because the AppID is a runtime concern, not a topology
+// concern.
+type StoreBinding struct {
+	// StoreName is the logical identifier of the state store.
+	StoreName string
+
+	// ChangelogTopic is the bare store name; the runtime prepends <AppID>- and
+	// appends -changelog to form the actual Kafka topic name.
+	ChangelogTopic string
+
+	// EncodeKey serializes an any value (underlying concrete type K) to bytes for
+	// Pebble and the changelog topic.
+	EncodeKey func(any) ([]byte, error)
+
+	// DecodeKey deserializes bytes from Pebble or the changelog topic back into
+	// an any value whose underlying type is K.
+	DecodeKey func([]byte) (any, error)
+
+	// EncodeVal serializes an any value (underlying concrete accumulator type A)
+	// to bytes for Pebble and the changelog topic.
+	EncodeVal func(any) ([]byte, error)
+
+	// DecodeVal deserializes bytes from Pebble or the changelog topic back into
+	// an any value whose underlying type is the accumulator A.
+	DecodeVal func([]byte) (any, error)
+}
+
 // BuiltTopology is the immutable, sealed output of StreamBuilder.Build() (§6.3).
 // It is consumed by the runtime (to spin up tasks) and by the TestDriver
 // (for broker-free testing, §16). After Build() is called the StreamBuilder
@@ -107,6 +143,11 @@ type BuiltTopology struct {
 
 	// Sinks maps sink node names to their type-erased encode bindings.
 	Sinks map[string]SinkBinding
+
+	// StoreBindings maps store names to their type-erased serde bindings.
+	// The runtime uses these to open KeyValueStore instances and wire them
+	// into the Executor's stores map before processing begins.
+	StoreBindings map[string]StoreBinding
 }
 
 // Stream registers a typed source node in the topology and returns a
@@ -175,8 +216,9 @@ func (s KStream[K, V]) To(topic, sinkName string, keySerde Serde[K], valSerde Se
 // API changes.
 func (b *StreamBuilder) Build() *BuiltTopology {
 	return &BuiltTopology{
-		Topology: b.internal.Build(),
-		Sources:  b.sources,
-		Sinks:    b.sinks,
+		Topology:      b.internal.Build(),
+		Sources:       b.sources,
+		Sinks:         b.sinks,
+		StoreBindings: b.stores,
 	}
 }

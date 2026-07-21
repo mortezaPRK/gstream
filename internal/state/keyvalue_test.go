@@ -438,3 +438,143 @@ func TestRangeEmptyStore(t *testing.T) {
 		t.Fatalf("Range on empty store: expected 0 calls, got %d", count)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// MutationCollector tests
+// ---------------------------------------------------------------------------
+
+// TestMutationCollector_DrainEmpty verifies that Drain on a fresh collector returns nil.
+func TestMutationCollector_DrainEmpty(t *testing.T) {
+	c := &state.MutationCollector{}
+	got := c.Drain()
+	if got != nil {
+		t.Fatalf("Drain on empty collector: expected nil, got %v", got)
+	}
+}
+
+// TestMutationCollector_PutDeleteMutations verifies that Put and Delete on a store with
+// a MutationCollector produce correctly encoded Mutation entries:
+//   - two Put mutations with matching encoded key/value bytes
+//   - one Delete mutation with IsDelete=true and nil Value
+func TestMutationCollector_PutDeleteMutations(t *testing.T) {
+	db, err := state.OpenMemDB()
+	if err != nil {
+		t.Fatalf("OpenMemDB: %v", err)
+	}
+	defer db.Close()
+
+	c := &state.MutationCollector{}
+	store := state.NewKeyValueStoreWithChangelog("mut-store", db, stringSerde{}, stringSerde{}, c)
+	defer store.Close()
+
+	if err := store.Put("alpha", "A"); err != nil {
+		t.Fatalf("Put alpha: %v", err)
+	}
+	if err := store.Put("beta", "B"); err != nil {
+		t.Fatalf("Put beta: %v", err)
+	}
+	if err := store.Delete("alpha"); err != nil {
+		t.Fatalf("Delete alpha: %v", err)
+	}
+
+	mutations := c.Drain()
+	if len(mutations) != 3 {
+		t.Fatalf("expected 3 mutations, got %d", len(mutations))
+	}
+
+	// Mutation 0: Put("alpha","A")
+	m0 := mutations[0]
+	if m0.IsDelete {
+		t.Error("mutation[0]: expected IsDelete=false for Put")
+	}
+	if string(m0.Value) != "A" {
+		t.Errorf("mutation[0]: expected value='A', got %q", m0.Value)
+	}
+	// Key must be the Pebble-encoded key: "mut-store" + 0x00 + "alpha"
+	wantKey0 := append([]byte("mut-store\x00"), []byte("alpha")...)
+	if string(m0.Key) != string(wantKey0) {
+		t.Errorf("mutation[0]: key mismatch: got %q, want %q", m0.Key, wantKey0)
+	}
+
+	// Mutation 1: Put("beta","B")
+	m1 := mutations[1]
+	if m1.IsDelete {
+		t.Error("mutation[1]: expected IsDelete=false for Put")
+	}
+	if string(m1.Value) != "B" {
+		t.Errorf("mutation[1]: expected value='B', got %q", m1.Value)
+	}
+	wantKey1 := append([]byte("mut-store\x00"), []byte("beta")...)
+	if string(m1.Key) != string(wantKey1) {
+		t.Errorf("mutation[1]: key mismatch: got %q, want %q", m1.Key, wantKey1)
+	}
+
+	// Mutation 2: Delete("alpha")
+	m2 := mutations[2]
+	if !m2.IsDelete {
+		t.Error("mutation[2]: expected IsDelete=true for Delete")
+	}
+	if m2.Value != nil {
+		t.Errorf("mutation[2]: expected nil Value for Delete, got %q", m2.Value)
+	}
+	if string(m2.Key) != string(wantKey0) {
+		t.Errorf("mutation[2]: key mismatch: got %q, want %q", m2.Key, wantKey0)
+	}
+}
+
+// TestMutationCollector_DrainClearsCollector verifies that Drain resets the collector
+// so a subsequent Drain returns nil.
+func TestMutationCollector_DrainClearsCollector(t *testing.T) {
+	db, err := state.OpenMemDB()
+	if err != nil {
+		t.Fatalf("OpenMemDB: %v", err)
+	}
+	defer db.Close()
+
+	c := &state.MutationCollector{}
+	store := state.NewKeyValueStoreWithChangelog("drain-store", db, stringSerde{}, stringSerde{}, c)
+	defer store.Close()
+
+	if err := store.Put("k", "v"); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	first := c.Drain()
+	if len(first) != 1 {
+		t.Fatalf("first Drain: expected 1 mutation, got %d", len(first))
+	}
+
+	second := c.Drain()
+	if second != nil {
+		t.Fatalf("second Drain: expected nil after reset, got %v", second)
+	}
+}
+
+// TestKeyValueStore_WithoutCollectorUnchanged verifies that a store created with
+// NewKeyValueStore (no collector) still operates correctly — Put/Get/Delete/Range
+// all work as before. This confirms the nil-collector path does not regress.
+func TestKeyValueStore_WithoutCollectorUnchanged(t *testing.T) {
+	db, err := state.OpenMemDB()
+	if err != nil {
+		t.Fatalf("OpenMemDB: %v", err)
+	}
+	defer db.Close()
+
+	store := state.NewKeyValueStore("no-collector", db, stringSerde{}, stringSerde{})
+	defer store.Close()
+
+	if err := store.Put("x", "1"); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	got, found, err := store.Get("x")
+	if err != nil || !found || got != "1" {
+		t.Fatalf("Get after Put: got=%q found=%v err=%v", got, found, err)
+	}
+	if err := store.Delete("x"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	_, found, err = store.Get("x")
+	if err != nil || found {
+		t.Fatalf("Get after Delete: expected missing, got found=%v err=%v", found, err)
+	}
+}

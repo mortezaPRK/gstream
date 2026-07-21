@@ -101,6 +101,31 @@ func (b *Builder) AddProcessor(name string, fn ProcessFunc, parents ...string) s
 	return name
 }
 
+// AddStatefulProcessor registers a named stateful processor node with the given
+// StatefulProcessFunc and an optional list of store names the processor will
+// access via ProcessorContext.Store. It mirrors AddProcessor but sets node.statefulFn
+// and node.storeNames instead of node.processFn.
+// parents must be names of previously added nodes.
+func (b *Builder) AddStatefulProcessor(name string, fn StatefulProcessFunc, storeNames []string, parents ...string) string {
+	if _, exists := b.nodes[name]; exists {
+		panic(fmt.Sprintf("topology: node %q already exists", name))
+	}
+	if len(parents) == 0 {
+		panic(fmt.Sprintf("topology: processor %q must have at least one parent", name))
+	}
+	n := &node{name: name, statefulFn: fn, storeNames: storeNames}
+	b.nodes[name] = n
+
+	for _, parentName := range parents {
+		p, ok := b.nodes[parentName]
+		if !ok {
+			panic(fmt.Sprintf("topology: parent %q not found for processor %q", parentName, name))
+		}
+		p.downstreams = append(p.downstreams, n)
+	}
+	return name
+}
+
 // AddSink registers a named sink node. Sink nodes have no downstream; records
 // that reach a sink are captured for the runtime / TestDriver to collect.
 // parents must be names of previously added nodes.
@@ -118,6 +143,7 @@ func (b *Builder) AddSink(name string, parents ...string) string {
 	n := &node{
 		name:      name,
 		processFn: sinkPlaceholderFn,
+		isSink:    true,
 	}
 	b.nodes[name] = n
 	b.sinks[name] = n

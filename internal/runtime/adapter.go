@@ -12,7 +12,9 @@ import (
 
 // Adapter bridges the kafka.ProcessFunc protocol and a *gstream.BuiltTopology.
 //
-// On each call to the ProcessFunc returned closure:
+// # Stateless path (bt.StoreBindings is empty)
+//
+// Behaviour is identical to P1:
 //
 //  1. Incoming kafka.InRecord key/value bytes are decoded using the source
 //     SourceBinding's DecodeKey and DecodeVal closures.
@@ -22,24 +24,33 @@ import (
 //     SinkBinding.EncodeKey and SinkBinding.EncodeVal closures, and the results are
 //     returned as []kafka.OutRecord directed at the configured Kafka topics.
 //
-// Using per-sink EncodeKey/EncodeVal closures (captured at To() call site in the DSL)
-// correctly handles type-changing operators such as Map and SelectKey — this is the
-// fix for the P0 Adapter[V] single-serde bug that silently dropped records whose
-// output type differed from V (§8 regression guard, task #8).
+// # Stateful path (bt.StoreBindings is non-empty)
 //
-// Adapter uses topology.TestDriver for synchronous, depth-first DAG traversal, which
-// is the same deterministic execution model used by topology unit tests. For the P1
-// ALO path this is correct: kafka.Client calls ProcessFunc once per record from a
-// single goroutine.
+// A [TaskManager] is created and manages per-partition state. Each InRecord is
+// routed to the Executor owned by its source partition. The lifecycle callbacks
+// (OnAssigned/OnRevoked) and post-batch hook (PostBatch) must be wired into the
+// kafka.Client via [Adapter.LifecycleCallbacks] and [Adapter.PostBatchHook].
 //
-// Adapter is NOT safe for concurrent use. The kafka.Client calls ProcessFunc for each
-// record sequentially within a single goroutine. A future task-per-partition model
-// (P2) will instantiate one Adapter per task.
+// # ALO write order (stateful)
+//
+//	process(record→store+collector) → PostBatch(flush changelog) →
+//	produce sinks → commit source offsets
+//
+// ALO caveat: a crash between flush and commit leaves the changelog ahead of
+// the committed source offset. On restart the batch is redelivered and aggFn
+// is applied again (at-least-once). ExactlyOnce (P5) closes this window.
+//
+// # Thread safety
+//
+// Adapter is NOT safe for concurrent use. kafka.Client calls ProcessFunc for
+// each record sequentially from a single goroutine (P1 contract). A future
+// multi-threaded task model (P4+) will instantiate one Adapter per thread.
 type Adapter struct {
-	driver     *topology.TestDriver
-	bt         *gstream.BuiltTopology
-	logger     *slog.Logger
-	sourceName string // P1: exactly one source
+	driver      *topology.TestDriver // non-nil only in stateless mode
+	taskManager *TaskManager         // non-nil only in stateful mode
+	bt          *gstream.BuiltTopology
+	logger      *slog.Logger
+	sourceName  string // P1: exactly one source
 }
 
 // NewAdapter constructs an Adapter driven by a *gstream.BuiltTopology.
@@ -53,9 +64,25 @@ type Adapter struct {
 //     bt.Sinks (error if missing).
 //   - logger may be nil (falls back to slog.Default()).
 //
+// For stateful topologies (bt.StoreBindings non-empty) a TaskManager is created
+// internally. The caller must wire [Adapter.LifecycleCallbacks] and
+// [Adapter.PostBatchHook] into the kafka.Client before calling Run:
+//
+//	client, _ := kafka.New(cfg, topics, logger,
+//	    kafka.WithLifecycle(adapter.LifecycleCallbacks()),
+//	    kafka.WithPostBatch(adapter.PostBatchHook()),
+//	)
+//
 // The returned Adapter is wired and ready; call ProcessFunc to obtain a
 // kafka.ProcessFunc that can be passed directly to kafka.Client.Run.
 func NewAdapter(bt *gstream.BuiltTopology, logger *slog.Logger) (*Adapter, error) {
+	return NewAdapterWithConfig(bt, gstream.Config{}, logger)
+}
+
+// NewAdapterWithConfig constructs an Adapter with a full gstream.Config (required
+// for the stateful path where cfg supplies StateDir, Brokers, and ApplicationID).
+// For stateless topologies cfg may be the zero value.
+func NewAdapterWithConfig(bt *gstream.BuiltTopology, cfg gstream.Config, logger *slog.Logger) (*Adapter, error) {
 	if bt == nil {
 		return nil, fmt.Errorf("runtime.NewAdapter: bt must not be nil")
 	}
@@ -83,23 +110,61 @@ func NewAdapter(bt *gstream.BuiltTopology, logger *slog.Logger) (*Adapter, error
 	}
 
 	// Validate that every sink declared in the topology has a binding in bt.Sinks.
+	// Exception: internal ktable-out sinks (no entry in bt.Sinks) are skipped; they
+	// are terminal sinks that the stateful processor never forwards to.
 	for _, sinkName := range bt.Topology.SinkNames() {
 		if _, ok := bt.Sinks[sinkName]; !ok {
-			return nil, fmt.Errorf(
-				"runtime.NewAdapter: sink %q has no entry in bt.Sinks (provide a SinkBinding with Topic, EncodeKey, and EncodeVal)",
-				sinkName,
-			)
+			// Check whether it is a known internal sink (no Kafka mapping needed).
+			// Internal sinks are registered in the topology but absent from bt.Sinks.
+			// For now we only skip if StoreBindings is non-empty (stateful topology
+			// has ktable-out-N internal sinks). For stateless topologies all sinks
+			// must have bindings.
+			if len(bt.StoreBindings) == 0 {
+				return nil, fmt.Errorf(
+					"runtime.NewAdapter: sink %q has no entry in bt.Sinks (provide a SinkBinding with Topic, EncodeKey, and EncodeVal)",
+					sinkName,
+				)
+			}
+			// Stateful: skip internal sinks (e.g. ktable-out-N) silently.
 		}
 	}
 
-	driver := topology.NewTestDriver(bt.Topology)
-
-	return &Adapter{
-		driver:     driver,
+	a := &Adapter{
 		bt:         bt,
 		logger:     logger,
 		sourceName: sourceName,
-	}, nil
+	}
+
+	if len(bt.StoreBindings) > 0 {
+		// Stateful path: create a TaskManager to manage per-partition state.
+		a.taskManager = NewTaskManager(bt, cfg, logger)
+	} else {
+		// Stateless path: single shared TestDriver (unchanged from P1).
+		a.driver = topology.NewTestDriver(bt.Topology)
+	}
+
+	return a, nil
+}
+
+// LifecycleCallbacks returns the onAssigned and onRevoked callbacks for wiring
+// into [kafka.WithLifecycle]. Returns (nil, nil) for stateless topologies.
+func (a *Adapter) LifecycleCallbacks() (
+	onAssigned func(ctx context.Context, assigned map[string][]int32) error,
+	onRevoked func(ctx context.Context, revoked map[string][]int32),
+) {
+	if a.taskManager == nil {
+		return nil, nil
+	}
+	return a.taskManager.OnAssigned, a.taskManager.OnRevoked
+}
+
+// PostBatchHook returns the post-batch function for wiring into
+// [kafka.WithPostBatch]. Returns nil for stateless topologies.
+func (a *Adapter) PostBatchHook() func(ctx context.Context) error {
+	if a.taskManager == nil {
+		return nil
+	}
+	return a.taskManager.PostBatch
 }
 
 // ProcessFunc returns a kafka.ProcessFunc that can be passed to kafka.Client.Run.
@@ -151,26 +216,59 @@ func (a *Adapter) process(_ context.Context, in kafka.InRecord) ([]kafka.OutReco
 		Timestamp: in.Timestamp.UnixMilli(),
 	}
 
+	// Step 2b: dispatch to either the stateless shared TestDriver or the per-
+	// partition Executor from the TaskManager.
+	if a.taskManager != nil {
+		return a.processStateful(in.Partition, rec)
+	}
+	return a.processStateless(rec)
+}
+
+// processStateless drives the shared TestDriver (stateless path, unchanged from P1).
+func (a *Adapter) processStateless(rec topology.Record) ([]kafka.OutRecord, error) {
 	if err := a.driver.PipeInput(a.sourceName, rec); err != nil {
-		a.logger.Error("topology processing error",
-			slog.String("topic", in.Topic),
-			slog.Int("partition", int(in.Partition)),
-			slog.Int64("offset", in.Offset),
-			slog.Any("error", err),
-		)
 		return nil, fmt.Errorf("runtime: topology: %w", err)
 	}
+	return a.drainSinks(func(sinkName string) ([]topology.Record, error) {
+		return a.driver.ReadOutput(sinkName)
+	})
+}
 
-	// Step 3: drain all sinks and encode outputs back to bytes.
+// processStateful routes the record to the per-partition Executor (stateful path).
+func (a *Adapter) processStateful(partition int32, rec topology.Record) ([]kafka.OutRecord, error) {
+	exec := a.taskManager.Executor(partition)
+	if exec == nil {
+		return nil, fmt.Errorf("runtime: no task for partition %d (not yet assigned or already revoked)", partition)
+	}
+	if err := exec.Process(a.sourceName, rec); err != nil {
+		return nil, fmt.Errorf("runtime: topology: %w", err)
+	}
+	return a.drainSinks(func(sinkName string) ([]topology.Record, error) {
+		return exec.DrainSink(sinkName)
+	})
+}
+
+// drainSinks collects output records from all sinks using the supplied drain
+// function, encodes them, and returns the resulting []kafka.OutRecord.
+//
+// Internal sinks (absent from bt.Sinks — e.g. ktable-out-N) are skipped
+// silently: they have no Kafka topic mapping and are never forwarded to.
+func (a *Adapter) drainSinks(drainFn func(string) ([]topology.Record, error)) ([]kafka.OutRecord, error) {
 	var outs []kafka.OutRecord
 	for _, sinkName := range a.bt.Topology.SinkNames() {
-		records, err := a.driver.ReadOutput(sinkName)
-		if err != nil {
-			// This should never happen since NewAdapter validated the sink names.
-			return nil, fmt.Errorf("runtime: ReadOutput(%q): %w", sinkName, err)
+		sb, ok := a.bt.Sinks[sinkName]
+		if !ok {
+			// Internal sink (e.g. ktable-out-N); drain the buffer so it doesn't
+			// grow unboundedly, but discard the records — no Kafka topic.
+			_, _ = drainFn(sinkName)
+			continue
 		}
 
-		sb := a.bt.Sinks[sinkName]
+		records, err := drainFn(sinkName)
+		if err != nil {
+			return nil, fmt.Errorf("runtime: drain(%q): %w", sinkName, err)
+		}
+
 		for _, r := range records {
 			kb, err := sb.EncodeKey(r.Key)
 			if err != nil {
@@ -199,6 +297,5 @@ func (a *Adapter) process(_ context.Context, in kafka.InRecord) ([]kafka.OutReco
 			})
 		}
 	}
-
 	return outs, nil
 }

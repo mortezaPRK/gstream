@@ -20,3 +20,15 @@ type Serde[T any] interface {
 	// Deserialize decodes a byte slice previously produced by Serialize back into T.
 	Deserialize([]byte) (T, error)
 }
+
+// BytesSerde is an identity Serde[[]byte] that passes byte slices through
+// unchanged. It is used by the runtime to create raw-bytes KeyValueStore
+// instances for stateful processors that perform their own serialization at
+// the DSL edge (Option A: typed at DSL boundary, bytes through storage).
+type BytesSerde struct{}
+
+// Serialize returns b unchanged.
+func (BytesSerde) Serialize(b []byte) ([]byte, error) { return b, nil }
+
+// Deserialize returns b unchanged.
+func (BytesSerde) Deserialize(b []byte) ([]byte, error) { return b, nil }

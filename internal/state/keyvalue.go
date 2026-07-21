@@ -47,12 +47,21 @@ const separator byte = 0x00
 // throughput at the cost of durability (e.g. during bulk changelog restore) can pass a
 // custom WriteOptions, but the public API intentionally does not expose that knob yet —
 // correctness first (§2 / §5.3).
+//
+// # Changelog capture
+//
+// When a *MutationCollector is attached (via NewKeyValueStoreWithChangelog), every
+// Put and Delete appends a Mutation to the collector after the Pebble write succeeds.
+// Mutation keys/values are the same pre-encoded bytes written to Pebble, so changelog
+// consumers can restore store state exactly. A nil collector disables capture and
+// leaves existing behaviour unchanged.
 type KeyValueStore[K, V any] struct {
-	db     *pebble.DB
-	prefix []byte // name + separator
-	kSerde gstream.Serde[K]
-	vSerde gstream.Serde[V]
-	closed bool
+	db         *pebble.DB
+	prefix     []byte // name + separator
+	kSerde     gstream.Serde[K]
+	vSerde     gstream.Serde[V]
+	collector  *MutationCollector // nil = no changelog capture
+	closed     bool
 }
 
 // OpenDB opens a Pebble database at dir with default options.
@@ -88,12 +97,36 @@ func NewKeyValueStore[K, V any](
 	kSerde gstream.Serde[K],
 	vSerde gstream.Serde[V],
 ) *KeyValueStore[K, V] {
+	return NewKeyValueStoreWithChangelog[K, V](name, db, kSerde, vSerde, nil)
+}
+
+// NewKeyValueStoreWithChangelog creates a KeyValueStore that additionally records
+// every Put and Delete to collector, producing Mutation entries with the same
+// pre-encoded key/value bytes that are written to Pebble. This enables changelog
+// capture for stateful partition recovery (P2+).
+//
+// Passing collector == nil is identical to calling NewKeyValueStore — no mutations
+// are captured and existing behaviour is fully preserved.
+//
+//   - name: logical store identifier; used as a key prefix.
+//   - db: an already-open Pebble database. The store does NOT close it.
+//   - kSerde: serializer/deserializer for keys of type K.
+//   - vSerde: serializer/deserializer for values of type V.
+//   - collector: mutation sink; nil disables changelog capture.
+func NewKeyValueStoreWithChangelog[K, V any](
+	name string,
+	db *pebble.DB,
+	kSerde gstream.Serde[K],
+	vSerde gstream.Serde[V],
+	collector *MutationCollector,
+) *KeyValueStore[K, V] {
 	prefix := append([]byte(name), separator)
 	return &KeyValueStore[K, V]{
-		db:     db,
-		prefix: prefix,
-		kSerde: kSerde,
-		vSerde: vSerde,
+		db:        db,
+		prefix:    prefix,
+		kSerde:    kSerde,
+		vSerde:    vSerde,
+		collector: collector,
 	}
 }
 
@@ -135,6 +168,8 @@ func (s *KeyValueStore[K, V]) Get(k K) (V, bool, error) {
 }
 
 // Put stores the mapping k -> v, overwriting any existing value for k.
+// If a MutationCollector is attached, a Mutation{Key, Value, IsDelete:false}
+// is appended after the Pebble write succeeds.
 func (s *KeyValueStore[K, V]) Put(k K, v V) error {
 	if err := s.checkOpen(); err != nil {
 		return err
@@ -153,11 +188,21 @@ func (s *KeyValueStore[K, V]) Put(k K, v V) error {
 	if err := s.db.Set(pk, pv, pebble.Sync); err != nil {
 		return fmt.Errorf("state: Put pebble: %w", err)
 	}
+
+	if s.collector != nil {
+		// Copy bytes so the Mutation is independent of any Pebble-owned buffer.
+		keyCopy := make([]byte, len(pk))
+		copy(keyCopy, pk)
+		valCopy := make([]byte, len(pv))
+		copy(valCopy, pv)
+		s.collector.Append(Mutation{Key: keyCopy, Value: valCopy})
+	}
 	return nil
 }
 
 // Delete removes the entry for key k. It is not an error to delete a key that
-// does not exist.
+// does not exist. If a MutationCollector is attached, a Mutation{Key, IsDelete:true}
+// is appended after the Pebble write succeeds.
 func (s *KeyValueStore[K, V]) Delete(k K) error {
 	if err := s.checkOpen(); err != nil {
 		return err
@@ -170,6 +215,13 @@ func (s *KeyValueStore[K, V]) Delete(k K) error {
 
 	if err := s.db.Delete(pk, pebble.Sync); err != nil {
 		return fmt.Errorf("state: Delete pebble: %w", err)
+	}
+
+	if s.collector != nil {
+		// Copy bytes so the Mutation is independent of any Pebble-owned buffer.
+		keyCopy := make([]byte, len(pk))
+		copy(keyCopy, pk)
+		s.collector.Append(Mutation{Key: keyCopy, IsDelete: true})
 	}
 	return nil
 }
