@@ -151,19 +151,21 @@ func TestE2E_WindowedCountRestoreAfterRestart(t *testing.T) {
 	}
 	t.Logf("created topics: %s, %s", srcTopic, changelogTopic)
 
-	cfg := gstream.Config{
-		ApplicationID: appID,
-		Brokers:       brokers,
-		StateDir:      stateDir,
+	cfg, err := gstream.Configure(
+		gstream.WithName(appID),
+		gstream.WithBrokers(brokers...),
+		gstream.WithStateDir(stateDir),
+	)
+	if err != nil {
+		t.Fatalf("Configure: %v", err)
 	}
-	cfg.ApplyDefaults()
 
 	// =========================================================================
 	// PHASE 1: materialize windowed counts
 	// =========================================================================
 
 	bt1 := buildWindowedCountTopology(srcTopic, storeName)
-	adapter1, err := runtime.NewAdapterWithConfig(bt1, cfg, slog.Default())
+	adapter1, err := runtime.NewAdapter(bt1, cfg, slog.Default())
 	if err != nil {
 		t.Fatalf("NewAdapterWithConfig p1: %v", err)
 	}
@@ -258,7 +260,7 @@ func TestE2E_WindowedCountRestoreAfterRestart(t *testing.T) {
 	t.Logf("phase-2: deleted partition dir %s", partitionDir)
 
 	bt2 := buildWindowedCountTopology(srcTopic, storeName)
-	adapter2, err := runtime.NewAdapterWithConfig(bt2, cfg, slog.Default())
+	adapter2, err := runtime.NewAdapter(bt2, cfg, slog.Default())
 	if err != nil {
 		t.Fatalf("NewAdapterWithConfig p2: %v", err)
 	}

@@ -78,11 +78,13 @@ func TestRoundTrip_ALO(t *testing.T) {
 	}
 	admin.Close()
 
-	cfg := gstream.Config{
-		ApplicationID: appID,
-		Brokers:       brokers,
+	cfg, err := gstream.Configure(
+		gstream.WithName(appID),
+		gstream.WithBrokers(brokers...),
+	)
+	if err != nil {
+		t.Fatalf("Configure: %v", err)
 	}
-	cfg.ApplyDefaults()
 
 	received := make(chan InRecord, 10)
 	processFunc := ProcessFunc(func(_ context.Context, in InRecord) ([]OutRecord, error) {

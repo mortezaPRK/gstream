@@ -190,16 +190,18 @@ func TestE2E_StatelessFilterMap(t *testing.T) {
 			},
 		},
 	}
-	adapter, err := runtime.NewAdapter(bt, slog.Default())
+	cfg, err := gstream.Configure(
+		gstream.WithName(appID),
+		gstream.WithBrokers(brokers...),
+	)
+	if err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+
+	adapter, err := runtime.NewAdapter(bt, cfg, slog.Default())
 	if err != nil {
 		t.Fatalf("NewAdapter: %v", err)
 	}
-
-	cfg := gstream.Config{
-		ApplicationID: appID,
-		Brokers:       brokers,
-	}
-	cfg.ApplyDefaults()
 
 	client, err := kafka.New(cfg, []string{srcTopic}, slog.Default())
 	if err != nil {

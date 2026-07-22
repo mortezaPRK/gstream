@@ -4,6 +4,7 @@ package runtime
 // unexported functions like sweepWindowStore directly, per the P3-T4 task guidance.
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -37,10 +38,11 @@ func buildWindowedTopology(t *testing.T) *gstream.BuiltTopology {
 // TestSweepWindowStore_DeletesExpiredAndEmitsTombstone is the primary P3-T4 unit test.
 //
 // It exercises sweepWindowStore (without a broker) and verifies:
-//  (a) Window counts are correct after processing records.
-//  (b) After stream-time advances past a window's expiry, sweep DELETES that
-//      window's key from the store AND appends a tombstone to the collector.
-//  (c) Stream-time is persisted and readable via WriteStreamTime/ReadStreamTime.
+//
+//	(a) Window counts are correct after processing records.
+//	(b) After stream-time advances past a window's expiry, sweep DELETES that
+//	    window's key from the store AND appends a tombstone to the collector.
+//	(c) Stream-time is persisted and readable via WriteStreamTime/ReadStreamTime.
 func TestSweepWindowStore_DeletesExpiredAndEmitsTombstone(t *testing.T) {
 	t.Parallel()
 
@@ -80,7 +82,7 @@ func TestSweepWindowStore_DeletesExpiredAndEmitsTombstone(t *testing.T) {
 			t.Fatalf("serialize key: %v", err)
 		}
 		_ = kbytes // key is used inside the processor via the topology record
-		if err := exec.Process("source", topology.Record{
+		if err := exec.Process(context.Background(), "source", topology.Record{
 			Key:       key,
 			Value:     key,
 			Timestamp: tsMs,
@@ -164,11 +166,8 @@ func TestSweepWindowStore_DeletesExpiredAndEmitsTombstone(t *testing.T) {
 	if len(tombstones) != 1 {
 		t.Fatalf("expected 1 tombstone mutation, got %d", len(tombstones))
 	}
-	if !tombstones[0].IsDelete {
-		t.Errorf("expected tombstone mutation with IsDelete=true, got IsDelete=false")
-	}
-	if tombstones[0].Value != nil {
-		t.Errorf("expected tombstone mutation with nil Value, got %v", tombstones[0].Value)
+	if _, ok := tombstones[0].(state.Delete); !ok {
+		t.Errorf("expected state.Delete tombstone, got %T", tombstones[0])
 	}
 
 	// (c) Persist stream-time and verify readback.
@@ -218,7 +217,14 @@ func TestSweepWindowStore_AmortizationSkipsEarlyCall(t *testing.T) {
 	}
 	_ = collector.Drain() // clear the put mutation
 
-	tm := NewTaskManager(bt, gstream.Config{ApplicationID: "test"}, nil)
+	cfg, err := gstream.Configure(
+		gstream.WithName("test"),
+		gstream.WithBrokers("localhost:9092"),
+	)
+	if err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	tm := NewTaskManager(bt, cfg, nil)
 
 	// Set up a fake task where lastSweepTime == streamTime (no advancement).
 	fakeTask := &task{
@@ -277,7 +283,7 @@ func TestWindowStoreWiring_ExecutorProcessesAndSweep(t *testing.T) {
 
 	// Feed two records into window [0, 10000).
 	for _, ts := range []int64{1000, 3000} {
-		if err := exec.Process("source", topology.Record{
+		if err := exec.Process(context.Background(), "source", topology.Record{
 			Key: "bar", Value: "bar", Timestamp: ts,
 		}); err != nil {
 			t.Fatalf("Process(ts=%d): %v", ts, err)
@@ -286,7 +292,7 @@ func TestWindowStoreWiring_ExecutorProcessesAndSweep(t *testing.T) {
 
 	// Advance stream-time past expiry for window [0,10000): need streamTime > 10000.
 	// Feed a record with ts=25000.
-	if err := exec.Process("source", topology.Record{
+	if err := exec.Process(context.Background(), "source", topology.Record{
 		Key: "bar", Value: "bar", Timestamp: 25000,
 	}); err != nil {
 		t.Fatalf("Process(ts=25000): %v", err)
@@ -348,7 +354,7 @@ func TestWindowStoreWiring_ExecutorProcessesAndSweep(t *testing.T) {
 	if len(muts) != 1 {
 		t.Fatalf("expected 1 tombstone, got %d", len(muts))
 	}
-	if !muts[0].IsDelete {
-		t.Errorf("expected IsDelete=true on tombstone")
+	if _, ok := muts[0].(state.Delete); !ok {
+		t.Errorf("expected state.Delete tombstone, got %T", muts[0])
 	}
 }

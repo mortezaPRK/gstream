@@ -56,13 +56,15 @@ func TestProcessBatch_EmptyInput(t *testing.T) {
 // TestProcessBatch_ErrorOnSecondRecord is the regression test for the ALO bug.
 //
 // OLD behaviour (before extracting processBatch / fixing Run):
-//   The record loop only did `break` on error, then execution fell through to
-//   Step 2 (produce) and Step 3 (commit).  The first record's output would be
-//   produced and ALL offsets committed, silently dropping the failed record.
+//
+//	The record loop only did `break` on error, then execution fell through to
+//	Step 2 (produce) and Step 3 (commit).  The first record's output would be
+//	produced and ALL offsets committed, silently dropping the failed record.
 //
 // NEW behaviour (processBatch):
-//   Returns ok=false and nil outputs on any process error. The caller (Run) skips
-//   both produce and commit, so the whole batch is redelivered — at-least-once.
+//
+//	Returns ok=false and nil outputs on any process error. The caller (Run) skips
+//	both produce and commit, so the whole batch is redelivered — at-least-once.
 func TestProcessBatch_ErrorOnSecondRecord(t *testing.T) {
 	boom := errors.New("boom")
 	records := []InRecord{

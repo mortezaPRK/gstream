@@ -1,11 +1,11 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help build vet test tidy fmt lint ci
+.PHONY: help build vet test tidy fmt lint integration-test verify-modules ci
 
 ## help: Show this help message (default target).
 help:
 	@echo "Available targets:"
-	@grep -E '^## [a-z]' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ": "}; {name=$$1; sub(/^## /, "", name); printf "  %-18s %s\n", name, $$2}'
+	@grep -E '^## [a-z]' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ": "}; {name=$$1; sub(/^## /, "", name); printf "  %-20s %s\n", name, $$2}'
 
 ## build: Compile all packages (go build ./...).
 build:
@@ -27,13 +27,18 @@ tidy:
 fmt:
 	gofmt -l -w .
 
-## lint: Run golangci-lint if available, otherwise skip.
+## lint: Run golangci-lint.
 lint:
-	@if command -v golangci-lint > /dev/null 2>&1; then \
-		golangci-lint run; \
-	else \
-		echo "golangci-lint not found — skipping lint (install from https://golangci-lint.run)"; \
-	fi
+	golangci-lint run
 
-## ci: Run vet, test, and build (full CI gate).
-ci: vet test build
+## integration-test: Run integration tests (requires Docker/Podman).
+integration-test:
+	TESTCONTAINERS_RYUK_DISABLED=true go test -tags integration ./...
+
+## verify-modules: Build each module standalone (GOWORK=off) to catch per-module go.sum gaps.
+verify-modules:
+	GOWORK=off go build ./...
+	cd serde/proto && GOWORK=off go build ./...
+
+## ci: Run vet, test, build, and verify-modules (full CI gate).
+ci: vet test build verify-modules

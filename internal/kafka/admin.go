@@ -94,8 +94,7 @@ func fetchTopicMetadata(ctx context.Context, cl *kgo.Client, specs []TopicSpec) 
 	req.AllowAutoTopicCreation = false
 	for _, spec := range specs {
 		t := kmsg.NewMetadataRequestTopic()
-		name := spec.Name // copy to take address of loop variable
-		t.Topic = &name
+		t.Topic = &spec.Name
 		req.Topics = append(req.Topics, t)
 	}
 
@@ -125,8 +124,7 @@ func fetchTopicMetadata(ctx context.Context, cl *kgo.Client, specs []TopicSpec) 
 
 // createTopicSpecs issues a single CreateTopics request for the supplied specs.
 // TopicAlreadyExists is treated as success. Authorization failures are surfaced
-// as a descriptive error listing the affected topics and their expected configs
-// (§14).
+// as a descriptive error listing the affected topics and their expected configs.
 func createTopicSpecs(ctx context.Context, cl *kgo.Client, specs []TopicSpec) error {
 	req := kmsg.NewPtrCreateTopicsRequest()
 	for _, spec := range specs {
@@ -137,8 +135,7 @@ func createTopicSpecs(ctx context.Context, cl *kgo.Client, specs []TopicSpec) er
 		for k, v := range spec.Configs {
 			cfg := kmsg.NewCreateTopicsRequestTopicConfig()
 			cfg.Name = k
-			val := v // copy to take address of loop variable
-			cfg.Value = &val
+			cfg.Value = &v
 			t.Configs = append(t.Configs, cfg)
 		}
 		req.Topics = append(req.Topics, t)

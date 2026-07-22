@@ -102,12 +102,14 @@ func TestE2E_StatefulCountRestoreAfterRestart(t *testing.T) {
 	}
 	t.Logf("created topics: %s, %s", srcTopic, changelogTopic)
 
-	cfg := gstream.Config{
-		ApplicationID: appID,
-		Brokers:       brokers,
-		StateDir:      stateDir,
+	cfg, err := gstream.Configure(
+		gstream.WithName(appID),
+		gstream.WithBrokers(brokers...),
+		gstream.WithStateDir(stateDir),
+	)
+	if err != nil {
+		t.Fatalf("Configure: %v", err)
 	}
-	cfg.ApplyDefaults()
 
 	// =========================================================================
 	// PHASE 1: materialize
@@ -117,7 +119,7 @@ func TestE2E_StatefulCountRestoreAfterRestart(t *testing.T) {
 	bt1 := buildCountTopology(srcTopic, storeName)
 
 	// 5. Adapter + client.
-	adapter1, err := runtime.NewAdapterWithConfig(bt1, cfg, slog.Default())
+	adapter1, err := runtime.NewAdapter(bt1, cfg, slog.Default())
 	if err != nil {
 		t.Fatalf("NewAdapterWithConfig p1: %v", err)
 	}
@@ -182,7 +184,7 @@ func TestE2E_StatefulCountRestoreAfterRestart(t *testing.T) {
 
 	// 11. New adapter + client — same AppID, same stateDir, same brokers.
 	bt2 := buildCountTopology(srcTopic, storeName)
-	adapter2, err := runtime.NewAdapterWithConfig(bt2, cfg, slog.Default())
+	adapter2, err := runtime.NewAdapter(bt2, cfg, slog.Default())
 	if err != nil {
 		t.Fatalf("NewAdapterWithConfig p2: %v", err)
 	}
