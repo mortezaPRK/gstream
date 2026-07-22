@@ -43,7 +43,7 @@ func TestMultiOperatorPipeline(t *testing.T) {
 		return k + "!", len(v)
 	})
 
-	final := mapped.MapValues[string](func(v int) string {
+	final := mapped.MapValues[string](func(_ string, v int) string {
 		return fmt.Sprintf("%d chars", v)
 	})
 
@@ -186,7 +186,7 @@ func TestMapValues_ChangesValuePreservesKeyAndTimestamp(t *testing.T) {
 	b := NewStreamBuilder()
 	src := Stream[string, string](b, "t", "src", JSONSerde[string]{}, JSONSerde[string]{})
 	// string → int (length)
-	src.MapValues[int](func(v string) int { return len(v) }).
+	src.MapValues[int](func(_ string, v string) int { return len(v) }).
 		To("t", "sink", JSONSerde[string]{}, JSONSerde[int]{})
 	driver := topology.NewTestDriver(b.Build().Topology)
 
@@ -217,7 +217,7 @@ func TestMapValues_TypeMismatch_ReturnsError(t *testing.T) {
 
 	b := NewStreamBuilder()
 	src := Stream[string, string](b, "t", "src", JSONSerde[string]{}, JSONSerde[string]{})
-	src.MapValues[int](func(v string) int { return len(v) }).
+	src.MapValues[int](func(_ string, v string) int { return len(v) }).
 		To("t", "sink", JSONSerde[string]{}, JSONSerde[int]{})
 	driver := topology.NewTestDriver(b.Build().Topology)
 
@@ -452,7 +452,7 @@ func TestRepartitionMarkers_MapAndSelectKeyBothMark(t *testing.T) {
 
 	// Filter and MapValues should NOT mark repartitions.
 	afterFilter := src.Filter(func(k, v string) bool { return true })
-	afterMV := afterFilter.MapValues[int](func(v string) int { return len(v) })
+	afterMV := afterFilter.MapValues[int](func(_ string, v string) int { return len(v) })
 
 	// Map and SelectKey SHOULD mark repartitions.
 	afterMap := afterMV.Map[string, string](func(k string, v int) (string, string) {

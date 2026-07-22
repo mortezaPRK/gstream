@@ -454,9 +454,9 @@ func TestMutationCollector_DrainEmpty(t *testing.T) {
 }
 
 // TestMutationCollector_PutDeleteMutations verifies that Put and Delete on a store with
-// a MutationCollector produce correctly encoded Mutation entries:
-//   - two Put mutations with matching encoded key/value bytes
-//   - one Delete mutation with IsDelete=true and nil Value
+// a MutationCollector produce correctly typed Mutation values:
+//   - two state.Put mutations with matching encoded key/value bytes
+//   - one state.Delete mutation with a nil Value (tombstone)
 func TestMutationCollector_PutDeleteMutations(t *testing.T) {
 	db, err := state.OpenMemDB()
 	if err != nil {
@@ -484,42 +484,42 @@ func TestMutationCollector_PutDeleteMutations(t *testing.T) {
 	}
 
 	// Mutation 0: Put("alpha","A")
-	m0 := mutations[0]
-	if m0.IsDelete {
-		t.Error("mutation[0]: expected IsDelete=false for Put")
-	}
-	if string(m0.Value) != "A" {
-		t.Errorf("mutation[0]: expected value='A', got %q", m0.Value)
-	}
-	// Key must be the Pebble-encoded key: "mut-store" + 0x00 + "alpha"
 	wantKey0 := append([]byte("mut-store\x00"), []byte("alpha")...)
-	if string(m0.Key) != string(wantKey0) {
-		t.Errorf("mutation[0]: key mismatch: got %q, want %q", m0.Key, wantKey0)
+	switch m0 := mutations[0].(type) {
+	case state.Put:
+		if string(m0.Value) != "A" {
+			t.Errorf("mutation[0]: expected value='A', got %q", m0.Value)
+		}
+		// Key must be the Pebble-encoded key: "mut-store" + 0x00 + "alpha"
+		if string(m0.Key) != string(wantKey0) {
+			t.Errorf("mutation[0]: key mismatch: got %q, want %q", m0.Key, wantKey0)
+		}
+	default:
+		t.Errorf("mutation[0]: expected state.Put, got %T", mutations[0])
 	}
 
 	// Mutation 1: Put("beta","B")
-	m1 := mutations[1]
-	if m1.IsDelete {
-		t.Error("mutation[1]: expected IsDelete=false for Put")
-	}
-	if string(m1.Value) != "B" {
-		t.Errorf("mutation[1]: expected value='B', got %q", m1.Value)
-	}
 	wantKey1 := append([]byte("mut-store\x00"), []byte("beta")...)
-	if string(m1.Key) != string(wantKey1) {
-		t.Errorf("mutation[1]: key mismatch: got %q, want %q", m1.Key, wantKey1)
+	switch m1 := mutations[1].(type) {
+	case state.Put:
+		if string(m1.Value) != "B" {
+			t.Errorf("mutation[1]: expected value='B', got %q", m1.Value)
+		}
+		if string(m1.Key) != string(wantKey1) {
+			t.Errorf("mutation[1]: key mismatch: got %q, want %q", m1.Key, wantKey1)
+		}
+	default:
+		t.Errorf("mutation[1]: expected state.Put, got %T", mutations[1])
 	}
 
 	// Mutation 2: Delete("alpha")
-	m2 := mutations[2]
-	if !m2.IsDelete {
-		t.Error("mutation[2]: expected IsDelete=true for Delete")
-	}
-	if m2.Value != nil {
-		t.Errorf("mutation[2]: expected nil Value for Delete, got %q", m2.Value)
-	}
-	if string(m2.Key) != string(wantKey0) {
-		t.Errorf("mutation[2]: key mismatch: got %q, want %q", m2.Key, wantKey0)
+	switch m2 := mutations[2].(type) {
+	case state.Delete:
+		if string(m2.Key) != string(wantKey0) {
+			t.Errorf("mutation[2]: key mismatch: got %q, want %q", m2.Key, wantKey0)
+		}
+	default:
+		t.Errorf("mutation[2]: expected state.Delete, got %T", mutations[2])
 	}
 }
 
@@ -738,25 +738,21 @@ func TestDeleteRangeBytes_MutationCollector(t *testing.T) {
 		t.Fatalf("expected 3 tombstone mutations, got %d", len(mutations))
 	}
 
-	// Every mutation must be a deletion.
-	for i, m := range mutations {
-		if !m.IsDelete {
-			t.Errorf("mutation[%d]: expected IsDelete=true", i)
-		}
-		if m.Value != nil {
-			t.Errorf("mutation[%d]: expected nil Value, got %v", i, m.Value)
-		}
-	}
-
-	// Verify Mutation.Key form: full Pebble key = "drb-mut\x00" + serialized int64.
+	// Every mutation must be a state.Delete (tombstone).
 	prefix := append([]byte("drb-mut"), 0x00)
 	wantKeys := []int64{10, 20, 30}
 	for i, m := range mutations {
-		if !bytes.HasPrefix(m.Key, prefix) {
-			t.Errorf("mutation[%d]: key %x does not start with prefix %x", i, m.Key, prefix)
+		del, ok := m.(state.Delete)
+		if !ok {
+			t.Errorf("mutation[%d]: expected state.Delete, got %T", i, m)
 			continue
 		}
-		raw := m.Key[len(prefix):]
+		// Verify Delete.Key form: full Pebble key = "drb-mut\x00" + serialized int64.
+		if !bytes.HasPrefix(del.Key, prefix) {
+			t.Errorf("mutation[%d]: key %x does not start with prefix %x", i, del.Key, prefix)
+			continue
+		}
+		raw := del.Key[len(prefix):]
 		if len(raw) != 8 {
 			t.Errorf("mutation[%d]: key suffix length %d, want 8", i, len(raw))
 			continue
@@ -811,5 +807,108 @@ func TestKeyValueStore_WithoutCollectorUnchanged(t *testing.T) {
 	_, found, err = store.Get("x")
 	if err != nil || found {
 		t.Fatalf("Get after Delete: expected missing, got found=%v err=%v", found, err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Iter / IterBytes tests
+// ---------------------------------------------------------------------------
+
+// TestIter verifies that Iter yields all key-value pairs and that early
+// termination via a range-loop break stops iteration correctly.
+func TestIter(t *testing.T) {
+	db, err := state.OpenMemDB()
+	if err != nil {
+		t.Fatalf("OpenMemDB: %v", err)
+	}
+	defer db.Close()
+
+	store := state.NewKeyValueStore("iter-store", db, int64Serde{}, stringSerde{})
+	defer store.Close()
+
+	// Insert 3 key-value pairs.
+	pairs := [][2]interface{}{{int64(1), "a"}, {int64(2), "b"}, {int64(3), "c"}}
+	for _, p := range pairs {
+		if err := store.Put(p[0].(int64), p[1].(string)); err != nil {
+			t.Fatalf("Put %v: %v", p[0], err)
+		}
+	}
+
+	// Collect all via Iter.
+	var gotKeys []int64
+	var gotVals []string
+	for k, v := range store.Iter() {
+		gotKeys = append(gotKeys, k)
+		gotVals = append(gotVals, v)
+	}
+	if len(gotKeys) != 3 {
+		t.Fatalf("Iter: expected 3 pairs, got %d", len(gotKeys))
+	}
+	expected := []int64{1, 2, 3}
+	for i, k := range gotKeys {
+		if k != expected[i] {
+			t.Errorf("Iter[%d]: got key %d, want %d", i, k, expected[i])
+		}
+	}
+
+	// Early-stop: break after first element.
+	var earlyCount int
+	for range store.Iter() {
+		earlyCount++
+		break
+	}
+	if earlyCount != 1 {
+		t.Fatalf("Iter early-stop: expected 1 iteration, got %d", earlyCount)
+	}
+}
+
+// TestIterBytes verifies that IterBytes yields raw key/value pairs in [lower, upper)
+// and that early termination via break stops iteration correctly.
+func TestIterBytes(t *testing.T) {
+	db, err := state.OpenMemDB()
+	if err != nil {
+		t.Fatalf("OpenMemDB: %v", err)
+	}
+	defer db.Close()
+
+	store := state.NewKeyValueStore("iterbytes-store", db, int64Serde{}, stringSerde{})
+	defer store.Close()
+
+	for _, k := range []int64{1, 2, 3, 4, 5} {
+		if err := store.Put(k, fmt.Sprintf("v%d", k)); err != nil {
+			t.Fatalf("Put %d: %v", k, err)
+		}
+	}
+
+	// lower = serialized int64(2), upper = serialized int64(5) → expect keys 2, 3, 4.
+	lower := make([]byte, 8)
+	upper := make([]byte, 8)
+	binary.BigEndian.PutUint64(lower, uint64(2))
+	binary.BigEndian.PutUint64(upper, uint64(5))
+
+	var gotKeys []int64
+	prefix := append([]byte("iterbytes-store"), 0x00)
+	for k, _ := range store.IterBytes(lower, upper) {
+		raw := k[len(prefix):]
+		gotKeys = append(gotKeys, int64(binary.BigEndian.Uint64(raw)))
+	}
+	if len(gotKeys) != 3 {
+		t.Fatalf("IterBytes: expected 3 keys, got %v", gotKeys)
+	}
+	wantKeys := []int64{2, 3, 4}
+	for i, k := range gotKeys {
+		if k != wantKeys[i] {
+			t.Errorf("IterBytes[%d]: got %d, want %d", i, k, wantKeys[i])
+		}
+	}
+
+	// Early-stop: break after first element.
+	var earlyCount int
+	for range store.IterBytes(lower, upper) {
+		earlyCount++
+		break
+	}
+	if earlyCount != 1 {
+		t.Fatalf("IterBytes early-stop: expected 1 iteration, got %d", earlyCount)
 	}
 }

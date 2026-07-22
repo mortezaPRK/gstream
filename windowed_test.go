@@ -5,6 +5,7 @@
 package gstream_test
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -72,7 +73,7 @@ func TestWindowedCount_OutOfOrderAndGrace(t *testing.T) {
 	type rec struct{ ts int64 }
 	recs := []rec{{5000}, {15000}, {25000}, {12000}, {3000}}
 	for _, r := range recs {
-		if err := exec.Process("src", topology.Record{Key: "k", Value: "v", Timestamp: r.ts}); err != nil {
+		if err := exec.Process(context.Background(), "src", topology.Record{Key: "k", Value: "v", Timestamp: r.ts}); err != nil {
 			t.Fatalf("Process ts=%d: %v", r.ts, err)
 		}
 	}
@@ -146,12 +147,12 @@ func TestWindowedCount_AllLate(t *testing.T) {
 		map[string]any{"wc2": byteStore}, &streamTime)
 
 	// Advance stream-time with a high-ts record first.
-	if err := exec.Process("src", topology.Record{Key: "k", Value: "v", Timestamp: 50000}); err != nil {
+	if err := exec.Process(context.Background(), "src", topology.Record{Key: "k", Value: "v", Timestamp: 50000}); err != nil {
 		t.Fatalf("Process ts=50000: %v", err)
 	}
 
 	// Now send a record at ts=1000; lateBoundary = 50000-10000-0=40000; 1000<40000 → DROPPED.
-	if err := exec.Process("src", topology.Record{Key: "k", Value: "v", Timestamp: 1000}); err != nil {
+	if err := exec.Process(context.Background(), "src", topology.Record{Key: "k", Value: "v", Timestamp: 1000}); err != nil {
 		t.Fatalf("Process ts=1000: %v", err)
 	}
 

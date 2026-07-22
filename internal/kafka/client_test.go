@@ -5,16 +5,19 @@ import (
 	"time"
 
 	gstream "github.com/mortezaPRK/gstream"
+	"github.com/mortezaPRK/gstream/xtypes"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
 // validConfig returns a minimal valid gstream.Config for use in unit tests.
 func validConfig() gstream.Config {
-	cfg := gstream.Config{
-		ApplicationID: "test-app",
-		Brokers:       []string{"localhost:9092"},
+	cfg, err := gstream.Configure(
+		gstream.WithName("test-app"),
+		gstream.WithBrokers("localhost:9092"),
+	)
+	if err != nil {
+		panic("validConfig: " + err.Error())
 	}
-	cfg.ApplyDefaults()
 	return cfg
 }
 
@@ -75,33 +78,39 @@ func TestNew_RejectsZeroCommitInterval(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestApplyDefaults_FillsCommitInterval(t *testing.T) {
-	cfg := gstream.Config{
-		ApplicationID: "app",
-		Brokers:       []string{"b:9092"},
+	cfg, err := gstream.Configure(
+		gstream.WithName("app"),
+		gstream.WithBrokers("b:9092"),
+	)
+	if err != nil {
+		t.Fatal(err)
 	}
-	cfg.ApplyDefaults()
 	if cfg.CommitInterval != 100*time.Millisecond {
 		t.Fatalf("expected CommitInterval=100ms, got %s", cfg.CommitInterval)
 	}
 }
 
 func TestApplyDefaults_FillsNumTaskThreads(t *testing.T) {
-	cfg := gstream.Config{
-		ApplicationID: "app",
-		Brokers:       []string{"b:9092"},
+	cfg, err := gstream.Configure(
+		gstream.WithName("app"),
+		gstream.WithBrokers("b:9092"),
+	)
+	if err != nil {
+		t.Fatal(err)
 	}
-	cfg.ApplyDefaults()
 	if cfg.NumTaskThreads <= 0 {
 		t.Fatalf("expected NumTaskThreads > 0, got %d", cfg.NumTaskThreads)
 	}
 }
 
 func TestApplyDefaults_DefaultGuaranteeIsALO(t *testing.T) {
-	cfg := gstream.Config{
-		ApplicationID: "app",
-		Brokers:       []string{"b:9092"},
+	cfg, err := gstream.Configure(
+		gstream.WithName("app"),
+		gstream.WithBrokers("b:9092"),
+	)
+	if err != nil {
+		t.Fatal(err)
 	}
-	cfg.ApplyDefaults()
 	if cfg.Guarantee != gstream.AtLeastOnce {
 		t.Fatalf("expected default Guarantee=AtLeastOnce, got %v", cfg.Guarantee)
 	}
@@ -138,26 +147,24 @@ func TestOutRecord_Fields(t *testing.T) {
 }
 
 // TestOutRecord_NilPartitionIsUnpinned verifies that the zero-value OutRecord
-// (no Partition set) has a nil Partition pointer, meaning it follows the
-// key-hash path, not the pinned path. This is the backward-compat guarantee
-// for all existing sink OutRecords constructed before P2.
+// (no Partition set) has IsValid=false, meaning it follows the key-hash path,
+// not the pinned path.
 func TestOutRecord_NilPartitionIsUnpinned(t *testing.T) {
 	r := OutRecord{Topic: "sink", Key: []byte("k"), Value: []byte("v")}
-	if r.Partition != nil {
-		t.Fatalf("expected zero-value OutRecord.Partition to be nil (unpinned), got %v", r.Partition)
+	if r.Partition.IsValid {
+		t.Fatalf("expected zero-value OutRecord.Partition to be unset (IsValid=false), got %v", r.Partition)
 	}
 }
 
-// TestOutRecord_PinnedPartition verifies that a non-nil Partition value (including
+// TestOutRecord_PinnedPartition verifies that a pinned Partition (including
 // partition 0, which is a valid pinned target) is preserved through the field.
 func TestOutRecord_PinnedPartition(t *testing.T) {
-	pin := int32(0)
-	r := OutRecord{Topic: "changelog", Key: []byte("k"), Value: []byte("v"), Partition: &pin}
-	if r.Partition == nil {
-		t.Fatal("expected non-nil Partition for pinned record")
+	r := OutRecord{Topic: "changelog", Key: []byte("k"), Value: []byte("v"), Partition: xtypes.NilOf(int32(0))}
+	if !r.Partition.IsValid {
+		t.Fatal("expected IsValid=true for pinned record")
 	}
-	if *r.Partition != 0 {
-		t.Fatalf("expected Partition=0, got %d", *r.Partition)
+	if r.Partition.Value != 0 {
+		t.Fatalf("expected Partition.Value=0, got %d", r.Partition.Value)
 	}
 }
 
@@ -239,19 +246,19 @@ func TestMixedPartitioner_UnpinnedIsStable(t *testing.T) {
 }
 
 // TestMixedPartitioner_NilPartitionMapsSentinel verifies that an OutRecord with
-// nil Partition (zero-value / sink) maps to kgo.Record.Partition=-1, which routes
-// through the key-hash path in the mixed partitioner.
+// IsValid=false Partition (zero-value / sink) maps to kgo.Record.Partition=-1,
+// which routes through the key-hash path in the mixed partitioner.
 func TestMixedPartitioner_NilPartitionMapsSentinel(t *testing.T) {
-	// Simulate the produce-step mapping for a nil-Partition OutRecord.
+	// Simulate the produce-step mapping for an unset-Partition OutRecord.
 	out := OutRecord{Topic: "sink", Key: []byte("k"), Value: []byte("v")}
 	kr := &kgo.Record{Topic: out.Topic, Key: out.Key, Value: out.Value}
-	if out.Partition == nil {
+	if !out.Partition.IsValid {
 		kr.Partition = -1
 	} else {
-		kr.Partition = *out.Partition
+		kr.Partition = out.Partition.Value
 	}
 	if kr.Partition != -1 {
-		t.Fatalf("nil OutRecord.Partition should map to kgo sentinel -1, got %d", kr.Partition)
+		t.Fatalf("unset OutRecord.Partition should map to kgo sentinel -1, got %d", kr.Partition)
 	}
 	// Confirm the mixed partitioner routes this to a key-hash (not a pinned path).
 	fn := mixedPartitionerFn("sink")

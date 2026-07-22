@@ -1,6 +1,10 @@
 package kafka
 
-import "time"
+import (
+	"time"
+
+	"github.com/mortezaPRK/gstream/xtypes"
+)
 
 // InRecord is the internal representation of a record consumed from Kafka.
 // It holds only the fields the processing layer needs; kgo.Record is not exposed.
@@ -15,21 +19,18 @@ type InRecord struct {
 
 // OutRecord is the internal representation of a record to be produced to Kafka.
 // The caller supplies Topic, Key, Value, and optionally Partition.
-// Timestamp is always set by the Kafka broker (broker-side default).
 //
 // # Partition semantics
 //
-//   - nil (zero value): unpinned — the producer hashes Key using Kafka-compatible
-//     murmur2 to select a partition. This is the correct value for sink records.
-//     All existing OutRecords constructed without a Partition field automatically
-//     follow this path because the Go zero value for a pointer is nil.
+//   - IsValid=false (zero value): unpinned — the producer hashes Key using
+//     Kafka-compatible murmur2. This is the correct value for sink records.
 //
-//   - non-nil: pinned — the record is routed to exactly *Partition, including
-//     partition 0. Used by changelog writes (P2+) that must co-locate state
+//   - IsValid=true: pinned — the record is routed to exactly Partition.Value,
+//     including partition 0. Used by changelog writes that must co-locate state
 //     mutations with the source input partition.
 type OutRecord struct {
 	Topic     string
 	Key       []byte
 	Value     []byte
-	Partition *int32 // nil = key-hash (sink); non-nil = pinned partition (changelog)
+	Partition xtypes.Nil[int32] // IsValid=false = key-hash (sink); IsValid=true = pinned partition = Value
 }

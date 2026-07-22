@@ -2,20 +2,33 @@ package state
 
 import "sync"
 
-// Mutation is a single captured state change — a Put or Delete — expressed as
-// pre-encoded bytes that match the Pebble key/value layout used by KeyValueStore.
+// Mutation is the sealed union for state-change operations recorded by a
+// KeyValueStore. The only concrete implementations are Put and Delete.
 //
-// Key is always the full Pebble key (store prefix + separator + serialized key),
-// exactly as written to Pebble, so changelog consumers can reconstruct the store
-// state without needing to know the serialization format.
-//
-// For a Put, Value holds the serialized value bytes. For a Delete, Value is nil
-// and IsDelete is true.
-type Mutation struct {
-	Key      []byte // full Pebble key: <store-name> 0x00 <encoded-key>
-	Value    []byte // serialized value bytes; nil for deletions
-	IsDelete bool   // true = Delete; false = Put
+// The interface has an unexported method so that callers outside this package
+// cannot implement it, approximating a sealed union in Go.
+type Mutation interface {
+	isMutation()
 }
+
+// Put records a key-value insertion or update.
+// Key is the full Pebble key (store prefix + separator + serialised key),
+// exactly as written to Pebble.
+// Value is the serialised value bytes.
+type Put struct {
+	Key   []byte // full Pebble key: <store-name> 0x00 <encoded-key>
+	Value []byte // serialised value bytes
+}
+
+// Delete records a key deletion (tombstone).
+// Key is the full Pebble key (store prefix + separator + serialised key),
+// exactly as written to Pebble.
+type Delete struct {
+	Key []byte // full Pebble key: <store-name> 0x00 <encoded-key>
+}
+
+func (Put) isMutation()    {}
+func (Delete) isMutation() {}
 
 // MutationCollector accumulates Mutations produced by a KeyValueStore during
 // processing of a single input record. At the end of processing, the runtime

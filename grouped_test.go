@@ -15,6 +15,7 @@
 package gstream_test
 
 import (
+	"context"
 	"testing"
 
 	"github.com/mortezaPRK/gstream"
@@ -75,7 +76,7 @@ func TestGroupByKey_Count(t *testing.T) {
 	inputs := []string{"a", "b", "a", "a"}
 	for _, key := range inputs {
 		rec := topology.Record{Key: key, Value: key, Timestamp: 1}
-		if err := exec.Process("src", rec); err != nil {
+		if err := exec.Process(context.Background(), "src", rec); err != nil {
 			t.Fatalf("Process key=%q: %v", key, err)
 		}
 	}
@@ -144,7 +145,7 @@ func TestCount_NoBufferLeak(t *testing.T) {
 
 	// Drive 1000 records through the Count-only topology.
 	for i := 0; i < 1000; i++ {
-		if err := exec.Process("src", topology.Record{Key: "k", Value: "v", Timestamp: int64(i)}); err != nil {
+		if err := exec.Process(context.Background(), "src", topology.Record{Key: "k", Value: "v", Timestamp: int64(i)}); err != nil {
 			t.Fatalf("Process[%d]: %v", i, err)
 		}
 	}
@@ -228,7 +229,7 @@ func TestGroupByKey_Aggregate(t *testing.T) {
 	type kv struct{ key, val string }
 	inputs := []kv{{"a", "hi"}, {"b", "world"}, {"a", "go"}}
 	for _, pair := range inputs {
-		if err := exec.Process("src", topology.Record{Key: pair.key, Value: pair.val, Timestamp: 1}); err != nil {
+		if err := exec.Process(context.Background(), "src", topology.Record{Key: pair.key, Value: pair.val, Timestamp: 1}); err != nil {
 			t.Fatalf("Process key=%q val=%q: %v", pair.key, pair.val, err)
 		}
 	}
@@ -333,7 +334,7 @@ func TestAggregate_ByteStoreAssertionSucceeds(t *testing.T) {
 
 	// This must NOT return a "store type mismatch" error.
 	rec := topology.Record{Key: "x", Value: "y", Timestamp: 1}
-	if err := exec.Process("src", rec); err != nil {
+	if err := exec.Process(context.Background(), "src", rec); err != nil {
 		t.Fatalf("Process: unexpected error (P2-S7fix regression): %v", err)
 	}
 }

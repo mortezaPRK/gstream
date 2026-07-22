@@ -13,7 +13,6 @@ import (
 // 0x00 bytes. The result is used as the "per-store key portion" passed to
 // RangeBytes / DeleteRangeBytes (the store prefix is added by those methods).
 func WindowCompositeKey(kBytes []byte, windowStart int64) []byte {
-	// 4 bytes for uint32 length + len(kBytes) + 8 bytes for int64 timestamp
 	out := make([]byte, 4+len(kBytes)+8)
 	binary.BigEndian.PutUint32(out[0:4], uint32(len(kBytes)))
 	copy(out[4:], kBytes)
@@ -53,7 +52,6 @@ func DecodeWindowCompositeKey(raw []byte) (kBytes []byte, windowStart int64, err
 // 0x00_00_00_00_00_00_00_00. A MinInt64 lower bound would therefore return zero
 // records. int64(0) is the correct floor for Unix-ms window starts.
 func WindowKeyLowerBound(kBytes []byte) []byte {
-	// timestamp = int64(0) → 8 zero bytes; WindowCompositeKey with windowStart=0
 	return WindowCompositeKey(kBytes, 0)
 }
 
@@ -62,7 +60,6 @@ func WindowKeyLowerBound(kBytes []byte) []byte {
 // i.e. the key WITHOUT the timestamp suffix. This is tighter than appending
 // MaxInt64 and reuses the already-tested prefixUpperBound logic.
 func WindowKeyUpperBound(kBytes []byte) []byte {
-	// Build the prefix portion: uint32(len) ‖ kBytes
 	prefix := make([]byte, 4+len(kBytes))
 	binary.BigEndian.PutUint32(prefix[0:4], uint32(len(kBytes)))
 	copy(prefix[4:], kBytes)

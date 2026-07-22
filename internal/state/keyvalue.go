@@ -3,6 +3,7 @@ package state
 import (
 	"bytes"
 	"fmt"
+	"iter"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/vfs"
@@ -44,9 +45,8 @@ const separator byte = 0x00
 //
 // Writes use pebble.Sync (fsync after every write). This is the correct default for a
 // state store that must be durable for local crash recovery. Callers that want higher
-// throughput at the cost of durability (e.g. during bulk changelog restore) can pass a
-// custom WriteOptions, but the public API intentionally does not expose that knob yet —
-// correctness first (§2 / §5.3).
+// throughput at the cost of durability can pass custom WriteOptions, but the public
+// API intentionally does not expose that knob yet — correctness first.
 //
 // # Changelog capture
 //
@@ -103,7 +103,7 @@ func NewKeyValueStore[K, V any](
 // NewKeyValueStoreWithChangelog creates a KeyValueStore that additionally records
 // every Put and Delete to collector, producing Mutation entries with the same
 // pre-encoded key/value bytes that are written to Pebble. This enables changelog
-// capture for stateful partition recovery (P2+).
+// capture for stateful partition recovery.
 //
 // Passing collector == nil is identical to calling NewKeyValueStore — no mutations
 // are captured and existing behaviour is fully preserved.
@@ -168,7 +168,7 @@ func (s *KeyValueStore[K, V]) Get(k K) (V, bool, error) {
 }
 
 // Put stores the mapping k -> v, overwriting any existing value for k.
-// If a MutationCollector is attached, a Mutation{Key, Value, IsDelete:false}
+// If a MutationCollector is attached, a Put{Key, Value} mutation
 // is appended after the Pebble write succeeds.
 func (s *KeyValueStore[K, V]) Put(k K, v V) error {
 	if err := s.checkOpen(); err != nil {
@@ -190,18 +190,17 @@ func (s *KeyValueStore[K, V]) Put(k K, v V) error {
 	}
 
 	if s.collector != nil {
-		// Copy bytes so the Mutation is independent of any Pebble-owned buffer.
 		keyCopy := make([]byte, len(pk))
 		copy(keyCopy, pk)
 		valCopy := make([]byte, len(pv))
 		copy(valCopy, pv)
-		s.collector.Append(Mutation{Key: keyCopy, Value: valCopy})
+		s.collector.Append(Put{Key: keyCopy, Value: valCopy})
 	}
 	return nil
 }
 
 // Delete removes the entry for key k. It is not an error to delete a key that
-// does not exist. If a MutationCollector is attached, a Mutation{Key, IsDelete:true}
+// does not exist. If a MutationCollector is attached, a Delete{Key} mutation
 // is appended after the Pebble write succeeds.
 func (s *KeyValueStore[K, V]) Delete(k K) error {
 	if err := s.checkOpen(); err != nil {
@@ -218,10 +217,9 @@ func (s *KeyValueStore[K, V]) Delete(k K) error {
 	}
 
 	if s.collector != nil {
-		// Copy bytes so the Mutation is independent of any Pebble-owned buffer.
 		keyCopy := make([]byte, len(pk))
 		copy(keyCopy, pk)
-		s.collector.Append(Mutation{Key: keyCopy, IsDelete: true})
+		s.collector.Append(Delete{Key: keyCopy})
 	}
 	return nil
 }
@@ -365,10 +363,10 @@ func (s *KeyValueStore[K, V]) DeleteRangeBytes(lower, upper []byte) error {
 			return fmt.Errorf("state: DeleteRangeBytes delete: %w", err)
 		}
 		if s.collector != nil {
-			// Mutation.Key must be the full Pebble key to match what Put/Delete append.
+			// Delete.Key must be the full Pebble key to match what Put/Delete append.
 			keyCopy := make([]byte, len(fullKey))
 			copy(keyCopy, fullKey)
-			s.collector.Append(Mutation{Key: keyCopy, IsDelete: true})
+			s.collector.Append(Delete{Key: keyCopy})
 		}
 	}
 	return nil
@@ -432,9 +430,26 @@ func (s *KeyValueStore[K, V]) WindowPut(kBytes []byte, windowStart int64, val []
 		copy(keyCopy, pk)
 		valCopy := make([]byte, len(val))
 		copy(valCopy, val)
-		s.collector.Append(Mutation{Key: keyCopy, Value: valCopy})
+		s.collector.Append(Put{Key: keyCopy, Value: valCopy})
 	}
 	return nil
+}
+
+// Iter returns an iter.Seq2 iterator over all key-value pairs in ascending order.
+// It wraps Range; early-termination from yield propagates to Range's fn.
+func (s *KeyValueStore[K, V]) Iter() iter.Seq2[K, V] {
+	return func(yield func(K, V) bool) {
+		_ = s.Range(func(k K, v V) bool { return yield(k, v) })
+	}
+}
+
+// IterBytes returns an iter.Seq2 iterator over raw key/value bytes in [lower, upper).
+// lower and upper are per-store key portions; the store prefix is added internally.
+// It wraps RangeBytes; early-termination from yield propagates to RangeBytes's fn.
+func (s *KeyValueStore[K, V]) IterBytes(lower, upper []byte) iter.Seq2[[]byte, []byte] {
+	return func(yield func([]byte, []byte) bool) {
+		_ = s.RangeBytes(lower, upper, func(k, v []byte) bool { return yield(k, v) })
+	}
 }
 
 // encodeKey serializes k and prepends the store prefix.

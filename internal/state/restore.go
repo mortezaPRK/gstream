@@ -55,23 +55,17 @@ func RestoreFromChangelog(
 		return 0, fmt.Errorf("state.RestoreFromChangelog: storeName must not be empty")
 	}
 
-	// Step 1: Fetch the high-watermark for (changelogTopic, partition).
-	// We use a dedicated short-lived kgo.Client for this admin-style request.
 	hw, err := fetchHighWatermark(ctx, brokers, changelogTopic, partition)
 	if err != nil {
 		return 0, fmt.Errorf("state.RestoreFromChangelog: fetch high-watermark: %w", err)
 	}
 
-	// Step 2: If HW==0 (empty changelog) or startOffset>=HW, nothing to restore.
 	startOffset := checkpointOffset + 1
 	if hw == 0 || startOffset >= hw {
 		// Nothing to restore; leave state and checkpoint untouched.
 		return hw, nil
 	}
 
-	// Step 3: Non-group consumer starting at startOffset. Read records until we
-	// have consumed up to offset HW-1 (inclusive). This is deterministic: HW is
-	// the next-to-be-written offset, so the last existing record is at offset HW-1.
 	consumer, err := kgo.NewClient(
 		kgo.SeedBrokers(brokers...),
 		kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{
@@ -85,14 +79,8 @@ func RestoreFromChangelog(
 	}
 	defer consumer.Close()
 
-	// Step 4: Accumulate all records into a single Pebble batch.
-	// We apply all mutations and the checkpoint in one atomic Sync commit.
 	batch := db.NewBatch()
-	defer func() {
-		// Close the batch if we return without committing (error path).
-		// Batch.Close on an already-committed batch is a no-op.
-		batch.Close()
-	}()
+	defer batch.Close() // no-op if already committed
 
 	lastAppliedOffset := int64(-1)
 	targetLastOffset := hw - 1 // last record offset we need to consume
@@ -118,13 +106,9 @@ func RestoreFromChangelog(
 			if done {
 				return
 			}
-			// Apply this record to the batch.
 			// Tombstone detection: ChangelogProducer.Flush sets Value=nil for
-			// IsDelete mutations (S4, line ~80: "Value: m.Value" where m.Value
-			// is nil when IsDelete=true). A Kafka consumer receives nil/empty
-			// slice for a tombstone.
+			// Delete mutations; a Kafka consumer receives nil/empty for a tombstone.
 			if len(r.Value) == 0 {
-				// Delete: tombstone record.
 				if batchErr := batch.Delete(r.Key, nil); batchErr != nil {
 					// Capture the error via the outer err variable and signal done.
 					err = fmt.Errorf("state.RestoreFromChangelog: batch.Delete offset %d: %w",
@@ -133,7 +117,6 @@ func RestoreFromChangelog(
 					return
 				}
 			} else {
-				// Put: regular value record.
 				if batchErr := batch.Set(r.Key, r.Value, nil); batchErr != nil {
 					err = fmt.Errorf("state.RestoreFromChangelog: batch.Set offset %d: %w",
 						r.Offset, batchErr)
@@ -142,8 +125,6 @@ func RestoreFromChangelog(
 				}
 			}
 			lastAppliedOffset = r.Offset
-
-			// Stop after consuming HW-1 (the last existing record).
 			if r.Offset >= targetLastOffset {
 				done = true
 			}
@@ -157,33 +138,25 @@ func RestoreFromChangelog(
 		}
 	}
 
-	// If we consumed nothing at all (consumer returned before any record), treat
-	// as a no-op. This shouldn't happen given startOffset < hw, but be defensive.
 	if lastAppliedOffset < 0 {
 		return hw, nil
 	}
 
-	// Step 5: Write the checkpoint into the same batch at the last applied offset
-	// so that state + checkpoint are updated atomically.
+	// Write the checkpoint into the same batch so state + checkpoint are updated atomically.
 	if err := WriteCheckpoint(batch, storeName, lastAppliedOffset); err != nil {
 		return 0, fmt.Errorf("state.RestoreFromChangelog: write checkpoint into batch: %w", err)
 	}
 
-	// Commit the batch with pebble.Sync for durability.
 	if err := batch.Commit(pebble.Sync); err != nil {
 		return 0, fmt.Errorf("state.RestoreFromChangelog: commit batch: %w", err)
 	}
 
-	// Return hw (the Kafka end-offset / next-to-be-written offset).
 	return hw, nil
 }
 
-// fetchHighWatermark fetches the Kafka high-watermark (end offset) for the
-// given (topic, partition) using ListOffsets with Timestamp=-1 (latest).
-// It creates a short-lived kgo.Client and closes it after the request.
-//
-// The high-watermark is the next offset to be written; the last existing
-// record (if any) is at offset HW-1.
+// fetchHighWatermark fetches the Kafka high-watermark (end offset) for the given
+// (topic, partition) using ListOffsets with Timestamp=-1. HW is the next offset to
+// be written; the last existing record (if any) is at offset HW-1.
 func fetchHighWatermark(ctx context.Context, brokers []string, topic string, partition int32) (int64, error) {
 	cl, err := kgo.NewClient(kgo.SeedBrokers(brokers...))
 	if err != nil {
@@ -191,13 +164,12 @@ func fetchHighWatermark(ctx context.Context, brokers []string, topic string, par
 	}
 	defer cl.Close()
 
-	// Build a ListOffsetsRequest for Timestamp=-1 (latest / high-watermark).
 	req := kmsg.NewPtrListOffsetsRequest()
-	req.ReplicaID = -1 // consumer replica ID
+	req.ReplicaID = -1
 
 	topicPartition := kmsg.NewListOffsetsRequestTopicPartition()
 	topicPartition.Partition = partition
-	topicPartition.Timestamp = -1 // -1 = latest (high-watermark)
+	topicPartition.Timestamp = -1 // latest (high-watermark)
 
 	rt := kmsg.NewListOffsetsRequestTopic()
 	rt.Topic = topic
@@ -209,7 +181,6 @@ func fetchHighWatermark(ctx context.Context, brokers []string, topic string, par
 		return 0, fmt.Errorf("fetchHighWatermark: ListOffsets request: %w", err)
 	}
 
-	// Parse the response.
 	for _, topicResp := range resp.Topics {
 		if topicResp.Topic != topic {
 			continue
@@ -222,8 +193,6 @@ func fetchHighWatermark(ctx context.Context, brokers []string, topic string, par
 				return 0, fmt.Errorf("fetchHighWatermark: topic %q partition %d: %w",
 					topic, partition, kerErr)
 			}
-			// Offset from ListOffsets(Timestamp=-1) is the high-watermark
-			// (next offset to be written); -1 means the partition is empty.
 			if partResp.Offset < 0 {
 				return 0, nil
 			}

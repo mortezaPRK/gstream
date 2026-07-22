@@ -16,11 +16,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
-// TestMain sets testcontainers configuration that must be in place before any
-// container is started. Mirrors the kafka package's TestMain for the same
-// reasons (RYUK disabled for Podman compatibility).
 func TestMain(m *testing.M) {
-	os.Setenv("TESTCONTAINERS_RYUK_DISABLED", "true")
 	os.Exit(m.Run())
 }
 
@@ -74,11 +70,11 @@ func TestChangelogProducer_Flush(t *testing.T) {
 	// Flush 3 mutations pinned to partition 0:
 	//   mut0: Put  key="k1" value="v1"
 	//   mut1: Put  key="k2" value="v2"
-	//   mut2: Del  key="k3" value=nil  (tombstone: IsDelete=true)
+	//   mut2: Delete key="k3" (tombstone: nil value)
 	muts := []Mutation{
-		{Key: []byte("k1"), Value: []byte("v1"), IsDelete: false},
-		{Key: []byte("k2"), Value: []byte("v2"), IsDelete: false},
-		{Key: []byte("k3"), Value: nil, IsDelete: true},
+		Put{Key: []byte("k1"), Value: []byte("v1")},
+		Put{Key: []byte("k2"), Value: []byte("v2")},
+		Delete{Key: []byte("k3")},
 	}
 	if err := producer.Flush(ctx, 0, muts); err != nil {
 		t.Fatalf("Flush: %v", err)

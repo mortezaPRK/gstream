@@ -9,18 +9,8 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
-// kafkaMurmur2 implements the Kafka-variant of MurmurHash2 (seed 0x9747b28c),
-// matching org.apache.kafka.common.utils.Utils.murmur2 exactly.
-//
-// This is a port of the canonical implementation in franz-go
-// (github.com/twmb/franz-go/pkg/kgo partitioner.go — unexported murmur2) and
-// the upstream Java source:
-//
-//	https://github.com/apache/kafka/blob/d91a94e/clients/src/main/java/org/apache/kafka/common/utils/Utils.java#L383-L421
-//
-// Java bytes are signed; the &0xff masks are implicit here because Go bytes are
-// unsigned, but the four-byte chunk construction uses little-endian order
-// (b[0] + b[1]<<8 + b[2]<<16 + b[3]<<24) which matches the Kafka implementation.
+// kafkaMurmur2 replicates Kafka's default partitioner hash (franz-go's murmur2
+// is unexported). Correctness is pinned by TestKafkaMurmur2_MatchesStickyKeyPartitioner.
 func kafkaMurmur2(b []byte) uint32 {
 	const (
 		seed uint32 = 0x9747b28c
@@ -55,17 +45,16 @@ func kafkaMurmur2(b []byte) uint32 {
 }
 
 // mixedPartitionerFn is the per-topic partitioning function installed via
-// kgo.BasicConsistentPartitioner (verdict C from P2 spike).
+// kgo.BasicConsistentPartitioner.
 //
 // Routing rules:
 //   - r.Partition < 0 (sentinel = -1): unpinned sink record; hash Key using
 //     Kafka's murmur2 via kgo.KafkaHasher so gstream sink output co-partitions
-//     with standard Kafka producers and Kafka Streams (toPositive(murmur2(key)) % n).
+//     with standard Kafka producers (toPositive(murmur2(key)) % n).
 //   - r.Partition >= 0: pinned changelog record; return the stored value directly.
 //
-// The sentinel (-1) is set in the produce step when OutRecord.Partition == nil
-// so that all legacy sink OutRecords (zero-value Partition pointer = nil) follow
-// the key-hash path, preserving TestRoundTrip_ALO behaviour without changes.
+// The sentinel (-1) is set in the produce step when OutRecord.Partition.IsValid==false
+// so that all sink OutRecords follow the key-hash path.
 func mixedPartitionerFn(_ string) func(*kgo.Record, int) int {
 	hasher := kgo.KafkaHasher(kafkaMurmur2)
 	return func(r *kgo.Record, n int) int {
@@ -107,7 +96,7 @@ type ClientOption func(*clientOptions)
 // WithLifecycle registers callbacks for partition assignment and revocation
 // rebalance events. Both callbacks are called synchronously inside the kgo
 // rebalance handler (cooperative-sticky fires onAssigned after SyncGroup; fetches
-// do not flow until the callback returns — R6 verdict A).
+// do not flow until the callback returns).
 //
 //   - onAssigned is called with the newly assigned (topic→[]partition) map. A
 //     non-nil error is logged but does not abort the rebalance; the callback is
@@ -126,14 +115,12 @@ func WithLifecycle(
 	}
 }
 
-// WithPostBatch registers a hook called after processBatch succeeds and BEFORE
-// produce+commit. This is the changelog-flush point in the ALO write order:
+// WithPostBatch registers a hook called after processing and BEFORE produce+commit.
+// This is the changelog-flush point in the ALO write order:
 //
-//	process → postBatch(flush changelog) → produce sinks → commit offsets → checkpoint
+//	process → postBatch(flush changelog) → produce sinks → commit offsets
 //
-// If the hook returns a non-nil error, the batch is aborted (no produce, no
-// commit) — the same ALO discipline as a process error.
-//
+// A non-nil error aborts the batch (same ALO discipline as a process error).
 // If WithPostBatch is not supplied no hook is called.
 func WithPostBatch(fn func(ctx context.Context) error) ClientOption {
 	return func(o *clientOptions) {
@@ -142,14 +129,9 @@ func WithPostBatch(fn func(ctx context.Context) error) ClientOption {
 }
 
 // New constructs a Client from a validated gstream.Config. topics is the list of
-// source topics to consume. ApplyDefaults must have been called on cfg before New;
-// Validate is called internally and returns an error on an invalid config.
+// source topics to consume. Validate is called internally.
 //
-// opts is optional; callers that do not need lifecycle hooks or post-batch hooks
-// can omit it entirely — the existing call signature New(cfg, topics, logger) is
-// preserved and all behaviour is unchanged.
-//
-// TODO(EOS/P5): For ExactlyOnce, replace kgo.NewClient with kgo.NewGroupTransactSession,
+// TODO(EOS): For ExactlyOnce, replace kgo.NewClient with kgo.NewGroupTransactSession,
 // add kgo.TransactionalID("gstream-"+cfg.ApplicationID), and set
 // kgo.FetchIsolationLevel(kgo.ReadCommitted()). The ALO commit path in Run must then
 // be replaced by sess.Begin()/sess.End(ctx, kgo.TryCommit).
@@ -164,7 +146,6 @@ func New(cfg gstream.Config, topics []string, logger *slog.Logger, opts ...Clien
 		logger = slog.Default()
 	}
 
-	// Apply functional options.
 	co := &clientOptions{}
 	for _, o := range opts {
 		o(co)
@@ -178,24 +159,8 @@ func New(cfg gstream.Config, topics []string, logger *slog.Logger, opts ...Clien
 	return &Client{kc: kc, cfg: cfg, logger: logger, postBatch: co.postBatch}, nil
 }
 
-// buildOpts translates a gstream.Config into kgo.Opt slice. This is a pure helper
-// kept separate so unit tests can reason about option construction independently.
-//
-// co carries optional lifecycle and post-batch hooks supplied via ClientOption.
-// When co.onAssigned / co.onRevoked are nil, the callbacks fall back to the
-// log-only stubs that were present before P2 wiring — no behaviour change for
-// callers that do not pass WithLifecycle.
-//
-// Options set:
-//  1. kgo.SeedBrokers(cfg.Brokers...)         — bootstrap addresses
-//  2. kgo.ConsumerGroup(cfg.ApplicationID)    — group id = ApplicationID
-//  3. kgo.ConsumeTopics(topics...)            — source topics
-//  4. kgo.Balancers(kgo.CooperativeStickyBalancer()) — cooperative-sticky assignor (§14)
-//  5. kgo.DisableAutoCommit()                 — manual commit; we commit after produce (ALO §4.1)
-//  6. kgo.WithLogger(...)                     — bridge kgo log to slog
-//  7. kgo.OnPartitionsAssigned(...)           — calls co.onAssigned if set, else log-only stub
-//  8. kgo.OnPartitionsRevoked(...)            — calls co.onRevoked if set, then commits offsets
-//  9. kgo.RecordPartitioner(...)              — mixed partitioner: pin when Partition>=0, key-hash otherwise
+// buildOpts translates a gstream.Config into a kgo.Opt slice. Pure helper kept
+// separate so unit tests can reason about option construction independently.
 func buildOpts(cfg gstream.Config, topics []string, logger *slog.Logger, co *clientOptions) []kgo.Opt {
 	return []kgo.Opt{
 		kgo.SeedBrokers(cfg.Brokers...),
@@ -204,9 +169,6 @@ func buildOpts(cfg gstream.Config, topics []string, logger *slog.Logger, co *cli
 		kgo.Balancers(kgo.CooperativeStickyBalancer()),
 		kgo.DisableAutoCommit(),
 		kgo.WithLogger(newKgoLogger(logger)),
-		// Mixed partitioner (P2 verdict C): pinned changelog records go to their
-		// specified partition; unpinned sink records are distributed by key hash.
-		// See mixedPartitionerFn for routing rules.
 		kgo.RecordPartitioner(kgo.BasicConsistentPartitioner(mixedPartitionerFn)),
 		kgo.OnPartitionsAssigned(func(ctx context.Context, _ *kgo.Client, assigned map[string][]int32) {
 			logger.Info("partitions assigned", slog.Any("partitions", assigned))
@@ -221,8 +183,6 @@ func buildOpts(cfg gstream.Config, topics []string, logger *slog.Logger, co *cli
 			if co.onRevoked != nil {
 				co.onRevoked(ctx, revoked)
 			}
-			// Commit any pending offsets for revoked partitions synchronously before
-			// returning, so we don't lose ALO progress.
 			if err := cl.CommitUncommittedOffsets(ctx); err != nil {
 				logger.Warn("failed to commit offsets on revoke", slog.Any("error", err))
 			}
@@ -233,13 +193,8 @@ func buildOpts(cfg gstream.Config, topics []string, logger *slog.Logger, co *cli
 // Run is the main consume-transform-produce-commit loop. It blocks until ctx is
 // cancelled or a fatal error is encountered.
 //
-// ALO commit ordering (§4.1): for each polled batch —
-//  1. process(record) → outputs
-//  2. produce outputs synchronously
-//  3. commit offsets for all processed records
-//
-// If process returns an error the batch is aborted: no produce, no commit. The
-// records will be redelivered on the next poll (at-least-once).
+// ALO commit ordering: for each polled batch — process → produce → commit offsets.
+// If process returns an error the batch is aborted (at-least-once redelivery).
 func (c *Client) Run(ctx context.Context, process ProcessFunc) error {
 	c.logger.Info("kafka client run started",
 		slog.String("applicationID", c.cfg.ApplicationID),
@@ -257,8 +212,6 @@ func (c *Client) Run(ctx context.Context, process ProcessFunc) error {
 			return nil
 		}
 
-		// Log any fetch-level errors (partition leadership changes, etc.) but do not
-		// abort the whole loop — other partitions in the same fetch may be healthy.
 		fetches.EachError(func(topic string, partition int32, err error) {
 			c.logger.Error("fetch error",
 				slog.String("topic", topic),
@@ -271,7 +224,6 @@ func (c *Client) Run(ctx context.Context, process ProcessFunc) error {
 			continue
 		}
 
-		// Collect all records from this poll and their kgo pointers (needed for commit).
 		var (
 			inRecords  []InRecord
 			kgoRecords []*kgo.Record
@@ -288,28 +240,16 @@ func (c *Client) Run(ctx context.Context, process ProcessFunc) error {
 			kgoRecords = append(kgoRecords, r)
 		})
 
-		// Step 1: process each record; collect outputs.
-		// processBatch returns ok=false on any process error, discarding partial
-		// outputs so that Steps 2 and 3 are skipped entirely — whole-batch redelivery.
 		allOut, ok := processBatch(ctx, c.logger, inRecords, process)
 		if !ok {
-			// A process error was already logged inside processBatch. Skip produce
-			// and commit so the whole batch is redelivered on the next poll (ALO §4.1).
 			goto nextBatch
 		}
 
-		// Step 1b (stateful path): post-batch hook — flush changelog mutations to
-		// Kafka BEFORE producing sink records and committing offsets.
-		//
-		// ALO write order (§P2-S7):
-		//   process(record→store+collector) → postBatch(flush changelog) →
-		//   produce sinks → commit source offsets → checkpoint.
-		//
-		// ALO caveat: a crash between postBatch(flush) and commit leaves the
-		// changelog ahead of the committed source offset. On restart, the batch
-		// is re-processed (record replayed), so aggFn may be applied twice.
-		// ExactlyOnce (P5) eliminates this window by making store write, changelog
-		// write, and offset commit atomic in a single Kafka transaction.
+		// Post-batch hook: flush changelog mutations to Kafka BEFORE producing sink
+		// records and committing offsets (ALO write order).
+		// ALO caveat: a crash between flush and commit leaves the changelog ahead of
+		// the committed source offset. On restart aggFn may be applied twice.
+		// ExactlyOnce makes the window atomic via a single Kafka transaction.
 		if c.postBatch != nil {
 			if err := c.postBatch(ctx); err != nil {
 				c.logger.Error("post-batch hook failed; not committing offsets",
@@ -319,7 +259,6 @@ func (c *Client) Run(ctx context.Context, process ProcessFunc) error {
 			}
 		}
 
-		// Step 2: produce all output records synchronously before committing.
 		if len(allOut) > 0 {
 			kgoOuts := make([]*kgo.Record, len(allOut))
 			for i, o := range allOut {
@@ -328,13 +267,11 @@ func (c *Client) Run(ctx context.Context, process ProcessFunc) error {
 					Key:   o.Key,
 					Value: o.Value,
 				}
-				// Map OutRecord.Partition pointer to the kgo.Record sentinel:
-				//   nil (sink / zero-value) → -1 so mixedPartitionerFn routes by key hash.
-				//   non-nil                 → *Partition so the record is pinned.
-				if o.Partition == nil {
+				// IsValid=false → -1 (key-hash path); IsValid=true → pinned partition.
+				if !o.Partition.IsValid {
 					kr.Partition = -1
 				} else {
-					kr.Partition = *o.Partition
+					kr.Partition = o.Partition.Value
 				}
 				kgoOuts[i] = kr
 			}
@@ -351,11 +288,9 @@ func (c *Client) Run(ctx context.Context, process ProcessFunc) error {
 			}
 		}
 
-		// Step 3: commit offsets for all records in this batch (ALO: after produce).
-		// A commit failure is non-fatal: the broker will re-deliver uncommitted records
-		// on the next session, which is the expected ALO behaviour (may produce
-		// duplicates but no data is lost). We warn rather than abort so a transient
-		// network hiccup does not stall the processing loop.
+		// Commit offsets after produce (ALO). A commit failure is non-fatal:
+		// the broker re-delivers uncommitted records on the next session (may
+		// produce duplicates but no data is lost).
 		if err := c.kc.CommitRecords(ctx, kgoRecords...); err != nil {
 			c.logger.Warn("failed to commit offsets; batch will be reprocessed on reconnect",
 				slog.Any("error", err),

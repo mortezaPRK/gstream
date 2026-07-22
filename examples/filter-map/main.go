@@ -37,11 +37,15 @@ func main() {
 	if brokers == "" {
 		brokers = "localhost:9092"
 	}
-	cfg := gstream.Config{
-		ApplicationID: "filter-map-example",
-		Brokers:       strings.Split(brokers, ","),
+	cfg, err := gstream.Configure(
+		gstream.WithName("filter-map-example"),
+		gstream.WithBrokerStr(brokers),
+		gstream.WithDefaults(),
+	)
+	if err != nil {
+		logger.Error("invalid config", slog.Any("error", err))
+		os.Exit(1)
 	}
-	cfg.ApplyDefaults()
 
 	// -------------------------------------------------------------------------
 	// 2. Build the topology using the StreamBuilder DSL: source → filter → mapvalues → sink
@@ -66,7 +70,7 @@ func main() {
 		Filter(func(_ string, v string) bool {
 			return len(v) >= 4
 		}).
-		MapValues(func(v string) string {
+		MapValues(func(_ string, v string) string {
 			return strings.ToUpper(v)
 		}).
 		To(
@@ -85,7 +89,7 @@ func main() {
 	//    the topology has a matching binding, then wraps the topology in a
 	//    synchronous TestDriver for per-record execution.
 	// -------------------------------------------------------------------------
-	adapter, err := runtime.NewAdapter(bt, logger)
+	adapter, err := runtime.NewAdapter(bt, cfg, logger)
 	if err != nil {
 		logger.Error("failed to create adapter", slog.Any("error", err))
 		os.Exit(1)

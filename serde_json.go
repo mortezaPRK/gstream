@@ -1,12 +1,10 @@
 package gstream
 
-import "encoding/json"
+import "encoding/json/v2"
 
 // JSONSerde is a generic JSON serializer/deserializer for values of type T,
-// implementing Serde[T] via encoding/json (§10.1 of the design document).
+// implementing Serde[T] via encoding/json.
 //
-// It marshals the domain value T to a JSON byte slice and unmarshals it back,
-// making it the simplest built-in serde for human-readable messages.
 // The zero value is ready to use; no configuration is required.
 //
 // Usage:

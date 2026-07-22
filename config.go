@@ -6,21 +6,22 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 )
 
-// Guarantee selects the processing guarantee for the application (§4, §13).
+// Guarantee selects the processing guarantee for the application.
 type Guarantee int
 
 const (
 	// AtLeastOnce is the default guarantee. Offsets are committed after outputs are
 	// acknowledged. On crash, records after the last commit may be reprocessed,
-	// so duplicate outputs are possible. Lowest latency path (§4.1).
+	// so duplicate outputs are possible.
 	AtLeastOnce Guarantee = iota
 
 	// ExactlyOnce uses Kafka transactions so that sink writes, changelog writes,
 	// and consumed offsets commit atomically. No duplicate outputs, but latency is
-	// bounded by the commit interval rather than by processing time (§4.2).
+	// bounded by the commit interval rather than by processing time.
 	ExactlyOnce
 )
 
@@ -36,19 +37,16 @@ func (g Guarantee) String() string {
 	}
 }
 
-// Config is the only public configuration surface for gstream (§13).
+// Config is the public configuration surface for gstream.
 //
 // franz-go and Pebble are intentionally hidden: callers never import or reference
-// kgo.* or pebble.* types. gstream picks sane defaults for both libraries and
-// enforces invariants (e.g. ReadCommitted isolation under EOS) that cannot be
-// overridden by callers. An Advanced escape hatch for power users is planned
-// post-v1 (§13).
+// kgo.* or pebble.* types. gstream picks sane defaults for both libraries.
 //
 // Use ApplyDefaults to fill in zero values, then Validate to confirm the result
 // is sound before passing Config to a topology builder or runtime.
 type Config struct {
 	// ApplicationID is the logical name of this stream application. It becomes the
-	// Kafka consumer-group ID and the TransactionalID prefix for EOS (§4.2, §14).
+	// Kafka consumer-group ID and the TransactionalID prefix for EOS.
 	// Must be non-empty.
 	ApplicationID string
 
@@ -57,33 +55,97 @@ type Config struct {
 	Brokers []string
 
 	// Guarantee selects the processing guarantee (ALO or EOS). Defaults to
-	// AtLeastOnce if zero (§4, §13).
+	// AtLeastOnce if zero.
 	Guarantee Guarantee
 
-	// StateDir is the root directory under which Pebble stores local state. Each
-	// store gets its own sub-directory keyed by ApplicationID and store name.
-	// Defaults to an OS-temp-derived path: os.TempDir()/gstream-<ApplicationID>.
-	// The directory is created on first use (§5, §13).
+	// StateDir is the root directory under which Pebble stores local state.
+	// Defaults to os.TempDir()/gstream-<ApplicationID>.
 	StateDir string
 
 	// NumTaskThreads is the maximum number of concurrent task-processing goroutines.
-	// Concurrency is min(assigned partitions, NumTaskThreads) at runtime, so setting
-	// this higher than your partition count is harmless (§7).
 	// Defaults to runtime.GOMAXPROCS(0). Must be non-negative after defaults.
 	NumTaskThreads int
 
 	// CommitInterval controls how frequently offsets (ALO) or Kafka transactions
-	// (EOS) are committed. Smaller values reduce reprocessing on restart but
-	// increase commit overhead. Defaults to 100 ms (§4, §11, §13).
+	// (EOS) are committed. Defaults to 100 ms.
 	CommitInterval time.Duration
 }
 
+// Option is a functional option for Configure.
+type Option func(*Config)
+
+// WithName sets ApplicationID.
+func WithName(name string) Option {
+	return func(c *Config) { c.ApplicationID = name }
+}
+
+// WithBrokers sets the broker list from individual address strings.
+func WithBrokers(brokers ...string) Option {
+	return func(c *Config) { c.Brokers = brokers }
+}
+
+// WithBrokerStr parses a comma-separated broker string (e.g. "b1:9092,b2:9092"),
+// trims spaces from each element, and sets Brokers.
+func WithBrokerStr(csv string) Option {
+	return func(c *Config) {
+		parts := strings.Split(csv, ",")
+		out := make([]string, 0, len(parts))
+		for _, p := range parts {
+			if s := strings.TrimSpace(p); s != "" {
+				out = append(out, s)
+			}
+		}
+		c.Brokers = out
+	}
+}
+
+// WithStateDir sets StateDir.
+func WithStateDir(dir string) Option {
+	return func(c *Config) { c.StateDir = dir }
+}
+
+// WithGuarantee sets the processing guarantee.
+func WithGuarantee(g Guarantee) Option {
+	return func(c *Config) { c.Guarantee = g }
+}
+
+// WithCommitInterval sets CommitInterval.
+func WithCommitInterval(d time.Duration) Option {
+	return func(c *Config) { c.CommitInterval = d }
+}
+
+// WithNumTaskThreads sets NumTaskThreads.
+func WithNumTaskThreads(n int) Option {
+	return func(c *Config) { c.NumTaskThreads = n }
+}
+
+// WithDefaults is an explicit-intent marker accepted by Configure.
+// Defaults are always applied automatically by Configure regardless of whether
+// this option is present; callers may include it to document intent.
+func WithDefaults() Option { return func(*Config) {} }
+
+// Configure builds a Config from the supplied options, applies defaults for any
+// unset fields, validates the result, and returns it. An error is returned if
+// validation fails (e.g. empty ApplicationID or no brokers).
+//
+// Defaults are always applied unconditionally; WithDefaults() is an optional
+// explicit-intent no-op that documents the caller's desire for defaults.
+func Configure(opts ...Option) (Config, error) {
+	var cfg Config
+	for _, o := range opts {
+		o(&cfg)
+	}
+	cfg.ApplyDefaults()
+	if err := cfg.Validate(); err != nil {
+		return Config{}, err
+	}
+	return cfg, nil
+}
+
 // ApplyDefaults fills in zero-value fields with sensible production defaults.
-// Most fields follow a "don't overwrite non-zero" rule, with one notable
-// exception: Guarantee's zero value IS the default (AtLeastOnce == 0), so an
-// explicitly set AtLeastOnce and an unset Guarantee are indistinguishable — both
-// resolve to AtLeastOnce. EOS is always set explicitly (ExactlyOnce != 0) and is
-// therefore never overwritten. This is intentional by design (§4.1).
+// Guarantee's zero value IS the default (AtLeastOnce == 0), so an explicitly
+// set AtLeastOnce and an unset Guarantee are indistinguishable — both resolve
+// to AtLeastOnce. EOS is always set explicitly (ExactlyOnce != 0).
 func (c *Config) ApplyDefaults() {
 	if c.Guarantee == 0 {
 		c.Guarantee = AtLeastOnce

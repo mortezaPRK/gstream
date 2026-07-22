@@ -6,16 +6,7 @@ import (
 	"github.com/mortezaPRK/gstream/internal/topology"
 )
 
-// StreamBuilder assembles a typed topology by wrapping topology.Builder (§6.3).
-//
-// Usage:
-//
-//	b := gstream.NewStreamBuilder()
-//	src := gstream.Stream[string, Order](b, "orders", "orders-src",
-//	    gstream.JSONSerde[string]{}, gstream.JSONSerde[Order]{})
-//	src.To("enriched-orders", "enriched-sink",
-//	    gstream.JSONSerde[string]{}, gstream.JSONSerde[Order]{})
-//	built := b.Build()
+// StreamBuilder assembles a typed topology.
 //
 // Operator methods (Filter, Map, SelectKey, etc.) are defined in operators.go
 // (same package).
@@ -29,8 +20,7 @@ type StreamBuilder struct {
 	windowStores map[string]WindowStoreBinding
 }
 
-// NewStreamBuilder creates and returns a new StreamBuilder ready to accept
-// source, processor, and sink registrations (§6.3).
+// NewStreamBuilder creates and returns a new StreamBuilder.
 func NewStreamBuilder() *StreamBuilder {
 	return &StreamBuilder{
 		internal:     topology.NewBuilder(),
@@ -42,20 +32,17 @@ func NewStreamBuilder() *StreamBuilder {
 	}
 }
 
-// nextName returns a unique node name for the given prefix by appending and
-// incrementing an internal counter. It is unexported and used by operators.go
-// (same package) to obtain deterministic node names, e.g. "map-0", "filter-1".
+// nextName returns a unique node name for the given prefix, e.g. "map-0", "filter-1".
 func (b *StreamBuilder) nextName(prefix string) string {
 	name := fmt.Sprintf("%s-%d", prefix, b.counter)
 	b.counter++
 	return name
 }
 
-// KStream is a typed, lazy stream that compiles to a topology DAG node (§6.3).
+// KStream is a typed, lazy stream that compiles to a topology DAG node.
 //
-// K and V are the key and value types for records on this stream. KStream does
-// not process data eagerly; it records DAG wiring that the runtime or
-// TestDriver executes after Build().
+// K and V are the key and value types. KStream records DAG wiring executed
+// after Build().
 //
 // Operator methods (Filter, Map, MapValues, SelectKey, etc.) are defined in
 // operators.go (same package).
@@ -65,26 +52,22 @@ type KStream[K, V any] struct {
 }
 
 // SourceBinding is the type-erased decode pair for a source node. It is stored
-// in StreamBuilder and copied verbatim into BuiltTopology. The runtime uses
-// DecodeKey/DecodeVal to decode raw Kafka bytes into typed values before feeding
-// them into the processor DAG (§10, §6.3).
+// in StreamBuilder and copied verbatim into BuiltTopology.
 type SourceBinding struct {
 	// Topic is the Kafka source topic name.
 	Topic string
 
-	// DecodeKey deserializes a raw Kafka key byte slice into an any value.
-	// The underlying concrete type matches K from the originating Stream[K,V] call.
+	// DecodeKey deserializes a raw Kafka key byte slice. The underlying concrete
+	// type matches K from the originating Stream[K,V] call.
 	DecodeKey func([]byte) (any, error)
 
-	// DecodeVal deserializes a raw Kafka value byte slice into an any value.
-	// The underlying concrete type matches V from the originating Stream[K,V] call.
+	// DecodeVal deserializes a raw Kafka value byte slice. The underlying concrete
+	// type matches V from the originating Stream[K,V] call.
 	DecodeVal func([]byte) (any, error)
 }
 
 // SinkBinding is the type-erased encode pair for a sink node, bound to the
-// output K,V types at the call site of KStream[K,V].To() (§6.3, §10).
-//
-// This corrects the original Adapter single-serde bug: each EncodeKey/EncodeVal
+// output K,V types at the call site of KStream[K,V].To(). Each EncodeKey/EncodeVal
 // closure captures the concrete Serde[K] and Serde[V] at the point where To() is
 // called, so type-changing operators (Map, SelectKey) are handled correctly.
 type SinkBinding struct {
@@ -99,14 +82,8 @@ type SinkBinding struct {
 }
 
 // StoreBinding is the type-erased serde pair for a stateful store registered via
-// Count or Aggregate. It is stored in StreamBuilder and copied verbatim into
-// BuiltTopology so the runtime can open, write to, and recover the store without
-// retaining generic type parameters (§6.3, §10).
-//
-// ChangelogTopic carries the bare store name. The runtime derives the full Kafka
-// topic as <AppID>-<StoreName>-changelog; the binding intentionally does not
-// include the AppID prefix because the AppID is a runtime concern, not a topology
-// concern.
+// Count or Aggregate. ChangelogTopic carries the bare store name; the runtime
+// derives the full Kafka topic as <AppID>-<StoreName>-changelog.
 type StoreBinding struct {
 	// StoreName is the logical identifier of the state store.
 	StoreName string
@@ -115,40 +92,31 @@ type StoreBinding struct {
 	// appends -changelog to form the actual Kafka topic name.
 	ChangelogTopic string
 
-	// EncodeKey serializes an any value (underlying concrete type K) to bytes for
-	// Pebble and the changelog topic.
+	// EncodeKey serializes an any value (underlying concrete type K) to bytes.
 	EncodeKey func(any) ([]byte, error)
 
-	// DecodeKey deserializes bytes from Pebble or the changelog topic back into
-	// an any value whose underlying type is K.
+	// DecodeKey deserializes bytes back into an any value whose underlying type is K.
 	DecodeKey func([]byte) (any, error)
 
-	// EncodeVal serializes an any value (underlying concrete accumulator type A)
-	// to bytes for Pebble and the changelog topic.
+	// EncodeVal serializes an any value (underlying concrete accumulator type A) to bytes.
 	EncodeVal func(any) ([]byte, error)
 
-	// DecodeVal deserializes bytes from Pebble or the changelog topic back into
-	// an any value whose underlying type is the accumulator A.
+	// DecodeVal deserializes bytes back into an any value whose underlying type is A.
 	DecodeVal func([]byte) (any, error)
 }
 
 // WindowStoreBinding extends StoreBinding with window-specific metadata.
-// Registered by TimeWindowedStream.Aggregate/Count so the runtime (P3-T4) can
-// open the correct byte store and configure the window sweeper with the right
-// retention parameters (MaxSizeMs + GraceMs).
+// The runtime uses WindowDef.MaxSizeMs() together with GraceMs to compute retention.
 type WindowStoreBinding struct {
 	StoreBinding
-	// WindowDef is the WindowDefinition used to assign windows.  The runtime
-	// uses WindowDef.MaxSizeMs() together with GraceMs to compute retention.
+	// WindowDef is the WindowDefinition used to assign windows.
 	WindowDef WindowDefinition
 	// GraceMs is the late-record grace period in milliseconds.
 	GraceMs int64
 }
 
-// BuiltTopology is the immutable, sealed output of StreamBuilder.Build() (§6.3).
-// It is consumed by the runtime (to spin up tasks) and by the TestDriver
-// (for broker-free testing, §16). After Build() is called the StreamBuilder
-// must not be used further.
+// BuiltTopology is the immutable, sealed output of StreamBuilder.Build().
+// After Build() the StreamBuilder must not be used further.
 type BuiltTopology struct {
 	// Topology is the sealed processor DAG from internal/topology.
 	Topology *topology.Topology
@@ -160,24 +128,16 @@ type BuiltTopology struct {
 	Sinks map[string]SinkBinding
 
 	// StoreBindings maps store names to their type-erased serde bindings.
-	// The runtime uses these to open KeyValueStore instances and wire them
-	// into the Executor's stores map before processing begins.
 	StoreBindings map[string]StoreBinding
 
-	// WindowStoreBindings maps window store names to their type-erased serde +
-	// window metadata bindings. The runtime uses these to open the byte store
-	// and configure the window sweeper for each windowed aggregation.
+	// WindowStoreBindings maps window store names to their serde + window metadata bindings.
 	WindowStoreBindings map[string]WindowStoreBinding
 }
 
-// Stream registers a typed source node in the topology and returns a
-// KStream[K,V] representing that source (§6.2, §10).
+// Stream registers a typed source node in the topology and returns a KStream[K,V].
 //
-// topic is the Kafka topic to consume. sourceName is the unique node name for
-// this source in the DAG. keySerde and valSerde are used to decode raw bytes
-// into typed K and V values at the source boundary; the closures stored in
-// SourceBinding erase the concrete types to any while preserving their
-// behaviour.
+// topic is the Kafka topic to consume. sourceName is the unique node name in the DAG.
+// keySerde and valSerde decode raw bytes into typed K and V values at the source boundary.
 func Stream[K, V any](b *StreamBuilder, topic, sourceName string, keySerde Serde[K], valSerde Serde[V]) KStream[K, V] {
 	b.internal.AddSource(sourceName)
 
@@ -195,13 +155,11 @@ func Stream[K, V any](b *StreamBuilder, topic, sourceName string, keySerde Serde
 }
 
 // To registers a typed sink node in the topology, binding the encode closures
-// to the current K,V types of this KStream (§6.2, §10).
+// to the current K,V types of this KStream.
 //
 // topic is the Kafka sink topic. sinkName is the unique node name in the DAG.
 // keySerde and valSerde encode K/V values back to bytes at the sink boundary.
-//
-// Each encode closure performs a two-value type assertion so that a type mismatch
-// (e.g. a key-changing operator that was not accounted for) surfaces as an
+// Each encode closure type-asserts the value so a type mismatch surfaces as an
 // explicit error rather than a silent panic.
 func (s KStream[K, V]) To(topic, sinkName string, keySerde Serde[K], valSerde Serde[V]) {
 	s.builder.internal.AddSink(sinkName, s.nodeName)
@@ -225,15 +183,11 @@ func (s KStream[K, V]) To(topic, sinkName string, keySerde Serde[K], valSerde Se
 	}
 }
 
-// Build seals the topology and returns an immutable BuiltTopology (§6.3).
+// Build seals the topology and returns an immutable BuiltTopology.
+// After Build() the StreamBuilder must not be used further.
 //
-// After Build() the StreamBuilder must not be used further; the underlying
-// topology.Builder is consumed.
-//
-// Note: repartitions (marked by key-changing operators such as SelectKey) are
-// tracked in b.repartitions but repartition topic creation/management is deferred
-// to P4 (§6.3, §14). The field is preserved so P4 can iterate over it without
-// API changes.
+// Repartition topics (key-changing operators such as Map, SelectKey) are tracked
+// in b.repartitions but not yet wired; repartition topic management is deferred.
 func (b *StreamBuilder) Build() *BuiltTopology {
 	return &BuiltTopology{
 		Topology:            b.internal.Build(),
