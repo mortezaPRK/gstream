@@ -1,6 +1,7 @@
 package topology_test
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"sync"
@@ -61,7 +62,7 @@ func TestExecutor_StatelessPipeline(t *testing.T) {
 	// Same output via Executor (nil stores — stateless).
 	exec := topology.NewExecutor(topo, nil)
 	for _, r := range inputs {
-		if err := exec.Process("source", r); err != nil {
+		if err := exec.Process(context.Background(), "source", r); err != nil {
 			t.Fatalf("Executor.Process: %v", err)
 		}
 	}
@@ -89,7 +90,7 @@ func TestExecutor_StatefulProcessor(t *testing.T) {
 
 	// Stateful counter: increments a per-key counter in the store and forwards a
 	// record whose Value is the new count.
-	counter := topology.StatefulProcessFunc(func(r topology.Record, ctx topology.ProcessorContext) error {
+	counter := topology.StatefulProcessFunc(func(_ context.Context, r topology.Record, ctx topology.ProcessorContext) error {
 		s := ctx.Store("counts")
 		if s == nil {
 			return fmt.Errorf("store 'counts' not found")
@@ -110,7 +111,7 @@ func TestExecutor_StatefulProcessor(t *testing.T) {
 
 	// Pipe the same key three times; we expect counts 1, 2, 3.
 	for i := 0; i < 3; i++ {
-		if err := exec.Process("src", topology.Record{Key: "k", Value: nil, Timestamp: int64(i)}); err != nil {
+		if err := exec.Process(context.Background(), "src", topology.Record{Key: "k", Value: nil, Timestamp: int64(i)}); err != nil {
 			t.Fatalf("Process[%d]: %v", i, err)
 		}
 	}
@@ -141,13 +142,13 @@ func TestExecutor_ErrorPropagation(t *testing.T) {
 		b := topology.NewBuilder()
 		src := b.AddSource("src")
 		failing := b.AddProcessor("failing",
-			func(_ topology.Record, _ topology.Forwarder) error { return sentinel },
+			func(_ context.Context, _ topology.Record, _ topology.Forwarder) error { return sentinel },
 			src,
 		)
 		b.AddSink("sink", failing)
 		exec := topology.NewExecutor(b.Build(), nil)
 
-		err := exec.Process("src", topology.Record{Key: "k", Value: "v", Timestamp: 1})
+		err := exec.Process(context.Background(), "src", topology.Record{Key: "k", Value: "v", Timestamp: 1})
 		if err == nil {
 			t.Fatal("expected error, got nil")
 		}
@@ -160,14 +161,14 @@ func TestExecutor_ErrorPropagation(t *testing.T) {
 		b := topology.NewBuilder()
 		src := b.AddSource("src")
 		failing := b.AddStatefulProcessor("failing",
-			func(_ topology.Record, _ topology.ProcessorContext) error { return sentinel },
+			func(_ context.Context, _ topology.Record, _ topology.ProcessorContext) error { return sentinel },
 			nil,
 			src,
 		)
 		b.AddSink("sink", failing)
 		exec := topology.NewExecutor(b.Build(), nil)
 
-		err := exec.Process("src", topology.Record{Key: "k", Value: "v", Timestamp: 1})
+		err := exec.Process(context.Background(), "src", topology.Record{Key: "k", Value: "v", Timestamp: 1})
 		if err == nil {
 			t.Fatal("expected error, got nil")
 		}
@@ -188,7 +189,7 @@ func TestExecutorConcurrencySafety(t *testing.T) {
 	src := b.AddSource("src")
 
 	// Stateful accumulator: appends r.Value to the "log" store slice.
-	accum := topology.StatefulProcessFunc(func(r topology.Record, ctx topology.ProcessorContext) error {
+	accum := topology.StatefulProcessFunc(func(_ context.Context, r topology.Record, ctx topology.ProcessorContext) error {
 		s := ctx.Store("log")
 		if s == nil {
 			return fmt.Errorf("store 'log' not found")
@@ -216,7 +217,7 @@ func TestExecutorConcurrencySafety(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 5; i++ {
-			if err := execA.Process("src", topology.Record{Key: "a", Value: fmt.Sprintf("A%d", i), Timestamp: int64(i)}); err != nil {
+			if err := execA.Process(context.Background(), "src", topology.Record{Key: "a", Value: fmt.Sprintf("A%d", i), Timestamp: int64(i)}); err != nil {
 				t.Errorf("execA.Process: %v", err)
 			}
 		}
@@ -225,7 +226,7 @@ func TestExecutorConcurrencySafety(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 5; i++ {
-			if err := execB.Process("src", topology.Record{Key: "b", Value: fmt.Sprintf("B%d", i), Timestamp: int64(i)}); err != nil {
+			if err := execB.Process(context.Background(), "src", topology.Record{Key: "b", Value: fmt.Sprintf("B%d", i), Timestamp: int64(i)}); err != nil {
 				t.Errorf("execB.Process: %v", err)
 			}
 		}
@@ -288,7 +289,7 @@ func TestExecutor_UnknownSourceReturnsError(t *testing.T) {
 	topo := buildStatelessPipeline(t)
 	exec := topology.NewExecutor(topo, nil)
 
-	err := exec.Process("nonexistent", topology.Record{Key: "x", Value: "y"})
+	err := exec.Process(context.Background(), "nonexistent", topology.Record{Key: "x", Value: "y"})
 	if err == nil {
 		t.Fatal("expected error for unknown source, got nil")
 	}
@@ -312,7 +313,7 @@ func TestExecutor_DrainSinkClearsBuffer(t *testing.T) {
 	topo := buildStatelessPipeline(t)
 	exec := topology.NewExecutor(topo, nil)
 
-	if err := exec.Process("source", topology.Record{Key: "a", Value: "hello", Timestamp: 1}); err != nil {
+	if err := exec.Process(context.Background(), "source", topology.Record{Key: "a", Value: "hello", Timestamp: 1}); err != nil {
 		t.Fatalf("Process: %v", err)
 	}
 
@@ -336,7 +337,7 @@ func TestProcessorCtx_StreamTime(t *testing.T) {
 		b := topology.NewBuilder()
 		src := b.AddSource("src")
 		var observed int64 = -1
-		proc := topology.StatefulProcessFunc(func(r topology.Record, ctx topology.ProcessorContext) error {
+		proc := topology.StatefulProcessFunc(func(_ context.Context, r topology.Record, ctx topology.ProcessorContext) error {
 			ctx.AdvanceStreamTime(r.Timestamp) // must not panic
 			observed = ctx.StreamTime()
 			ctx.Forward(r)
@@ -348,7 +349,7 @@ func TestProcessorCtx_StreamTime(t *testing.T) {
 
 		// NewExecutor has nil streamTime pointer — AdvanceStreamTime is a no-op.
 		exec := topology.NewExecutor(topo, nil)
-		if err := exec.Process("src", topology.Record{Key: "k", Value: "v", Timestamp: 100}); err != nil {
+		if err := exec.Process(context.Background(), "src", topology.Record{Key: "k", Value: "v", Timestamp: 100}); err != nil {
 			t.Fatalf("Process: %v", err)
 		}
 		// StreamTime() must return 0 when streamTime pointer is nil.
@@ -362,7 +363,7 @@ func TestProcessorCtx_StreamTime(t *testing.T) {
 		b := topology.NewBuilder()
 		src := b.AddSource("src")
 		var lastSeen int64
-		proc := topology.StatefulProcessFunc(func(r topology.Record, ctx topology.ProcessorContext) error {
+		proc := topology.StatefulProcessFunc(func(_ context.Context, r topology.Record, ctx topology.ProcessorContext) error {
 			ctx.AdvanceStreamTime(r.Timestamp)
 			lastSeen = ctx.StreamTime()
 			ctx.Forward(r)
@@ -386,7 +387,7 @@ func TestProcessorCtx_StreamTime(t *testing.T) {
 			{30, 50}, // lower than current max — must not regress
 		}
 		for _, tc := range timestamps {
-			if err := exec.Process("src", topology.Record{Key: "k", Value: "v", Timestamp: tc.ts}); err != nil {
+			if err := exec.Process(context.Background(), "src", topology.Record{Key: "k", Value: "v", Timestamp: tc.ts}); err != nil {
 				t.Fatalf("Process ts=%d: %v", tc.ts, err)
 			}
 			if lastSeen != tc.want {
@@ -407,7 +408,7 @@ func TestNewExecutor_Unchanged(t *testing.T) {
 	t.Run("stateless", func(t *testing.T) {
 		topo := buildStatelessPipeline(t)
 		exec := topology.NewExecutor(topo, nil)
-		if err := exec.Process("source", topology.Record{Key: "x", Value: "hello", Timestamp: 1}); err != nil {
+		if err := exec.Process(context.Background(), "source", topology.Record{Key: "x", Value: "hello", Timestamp: 1}); err != nil {
 			t.Fatalf("Process: %v", err)
 		}
 		out, err := exec.DrainSink("sink")
@@ -425,7 +426,7 @@ func TestNewExecutor_Unchanged(t *testing.T) {
 	t.Run("stateful", func(t *testing.T) {
 		b := topology.NewBuilder()
 		src := b.AddSource("src")
-		counter := topology.StatefulProcessFunc(func(r topology.Record, ctx topology.ProcessorContext) error {
+		counter := topology.StatefulProcessFunc(func(_ context.Context, r topology.Record, ctx topology.ProcessorContext) error {
 			m := ctx.Store("c").(map[string]int)
 			m["n"]++
 			ctx.Forward(topology.Record{Key: r.Key, Value: m["n"], Timestamp: r.Timestamp})
@@ -438,7 +439,7 @@ func TestNewExecutor_Unchanged(t *testing.T) {
 		counts := map[string]int{}
 		exec := topology.NewExecutor(topo, map[string]any{"c": counts})
 		for i := 0; i < 3; i++ {
-			if err := exec.Process("src", topology.Record{Key: "k", Value: nil, Timestamp: int64(i)}); err != nil {
+			if err := exec.Process(context.Background(), "src", topology.Record{Key: "k", Value: nil, Timestamp: int64(i)}); err != nil {
 				t.Fatalf("Process[%d]: %v", i, err)
 			}
 		}
@@ -466,7 +467,7 @@ func TestExecutorWithStreamTime(t *testing.T) {
 
 	// Processor advances stream-time to each record's timestamp and forwards the
 	// current stream-time value as the record's Value so tests can inspect it.
-	proc := topology.StatefulProcessFunc(func(r topology.Record, ctx topology.ProcessorContext) error {
+	proc := topology.StatefulProcessFunc(func(_ context.Context, r topology.Record, ctx topology.ProcessorContext) error {
 		ctx.AdvanceStreamTime(r.Timestamp)
 		ctx.Forward(topology.Record{Key: r.Key, Value: ctx.StreamTime(), Timestamp: r.Timestamp})
 		return nil
@@ -487,7 +488,7 @@ func TestExecutorWithStreamTime(t *testing.T) {
 	wantStreamTimes := []int64{100, 300, 300, 400}
 
 	for i, r := range records {
-		if err := exec.Process("src", r); err != nil {
+		if err := exec.Process(context.Background(), "src", r); err != nil {
 			t.Fatalf("Process[%d]: %v", i, err)
 		}
 	}

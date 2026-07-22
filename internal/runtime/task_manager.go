@@ -7,13 +7,13 @@ import (
 	"path/filepath"
 	"sync"
 
+	"github.com/cockroachdb/pebble"
 	gstream "github.com/mortezaPRK/gstream"
 	"github.com/mortezaPRK/gstream/internal/state"
 	"github.com/mortezaPRK/gstream/internal/topology"
-	"github.com/cockroachdb/pebble"
 )
 
-// task holds the per-partition state for stateful stream processing (§7, P2-S7).
+// task holds the per-partition state for stateful stream processing.
 //
 // Each task owns:
 //   - A Pebble DB shard at StateDir/<appID>/partition-<N>.
@@ -22,19 +22,18 @@ import (
 //   - One MutationCollector per store, collecting mutations during processing.
 //   - One ChangelogProducer per store, flushing mutations to the changelog topic.
 //
-// For windowed topologies (P3-T4):
+// For windowed topologies:
 //   - streamTime is the per-task stream-time watermark; the Executor holds
 //     &streamTime so windowed processors advance it via ctx.AdvanceStreamTime.
 //   - lastSweepTime tracks the stream-time at the last retention sweep for
 //     amortization (sweep only once per window-size of stream-time advancement).
-//   - stores retains the concrete store references so PostBatch can access them
-//     for the retention sweep.
+//   - stores retains the concrete store references so PostBatch can access them.
 type task struct {
 	db            *pebble.DB
 	executor      *topology.Executor
-	collectors    map[string]*state.MutationCollector  // keyed by store name
-	producers     map[string]*state.ChangelogProducer  // keyed by store name
-	stores        map[string]any                       // keyed by store name; both regular + window
+	collectors    map[string]*state.MutationCollector // keyed by store name
+	producers     map[string]*state.ChangelogProducer // keyed by store name
+	stores        map[string]any                      // keyed by store name; both regular + window
 	partition     int32
 	streamTime    int64 // per-task stream-time watermark; 0 if no windowed stores
 	lastSweepTime int64 // stream-time at last retention sweep (amortization)
@@ -48,13 +47,13 @@ type task struct {
 // kafka.Client's cooperative-sticky rebalance ensures onAssigned and onRevoked
 // are not concurrent with each other or with Run's processBatch.
 type TaskManager struct {
-	mu     sync.Mutex
-	tasks  map[int32]*task // keyed by partition
+	mu    sync.Mutex
+	tasks map[int32]*task // keyed by partition
 
-	bt      *gstream.BuiltTopology
-	cfg     gstream.Config
-	logger  *slog.Logger
-	appID   string
+	bt     *gstream.BuiltTopology
+	cfg    gstream.Config
+	logger *slog.Logger
+	appID  string
 }
 
 // NewTaskManager creates a TaskManager for the given topology and config.
@@ -76,18 +75,8 @@ func NewTaskManager(bt *gstream.BuiltTopology, cfg gstream.Config, logger *slog.
 }
 
 // OnAssigned is the partition-assignment lifecycle callback. For each assigned
-// partition it:
-//  1. Opens a Pebble DB at StateDir/<appID>/partition-<N>.
-//  2. For each StoreBinding and WindowStoreBinding: reads the checkpoint, then
-//     restores from the changelog topic (synchronous — R6 verdict A).
-//  3. Creates a MutationCollector + KeyValueStoreWithChangelog per store.
-//  4. Creates a ChangelogProducer per store.
-//  5. For windowed topologies: reads the persisted stream-time watermark.
-//  6. Builds a topology.Executor (with stream-time pointer for windowed paths).
-//
-// OnAssigned blocks until all partitions are restored. The kafka.Client
-// (cooperative-sticky) will not deliver fetches for these partitions until
-// the callback returns.
+// partition it opens a Pebble DB, restores from the changelog, creates stores,
+// and builds a topology.Executor. Blocks until all partitions are restored.
 func (tm *TaskManager) OnAssigned(ctx context.Context, assigned map[string][]int32) error {
 	// Collect all partition numbers from the assigned map (source topic → []partitions).
 	partitions := collectPartitions(assigned)
@@ -101,13 +90,8 @@ func (tm *TaskManager) OnAssigned(ctx context.Context, assigned map[string][]int
 }
 
 // OnRevoked is the partition-revocation lifecycle callback. For each revoked
-// partition it:
-//  1. Drains any pending mutations and flushes them to the changelog.
-//  2. For windowed topologies: persists the final stream-time watermark.
-//  3. Writes a final checkpoint to Pebble for each store.
-//  4. Closes the ChangelogProducer(s).
-//  5. Closes the Pebble DB.
-//  6. Removes the task from the map.
+// partition it flushes pending mutations, persists stream-time and checkpoints,
+// closes producers, and closes the Pebble DB.
 func (tm *TaskManager) OnRevoked(ctx context.Context, revoked map[string][]int32) {
 	partitions := collectPartitions(revoked)
 	for _, p := range partitions {
@@ -115,36 +99,34 @@ func (tm *TaskManager) OnRevoked(ctx context.Context, revoked map[string][]int32
 	}
 }
 
-// PostBatch is the post-batch hook. For every live task it:
-//  1. Runs the retention sweep for windowed stores (amortized; before flush so
-//     tombstones from expired windows are included in this batch's flush).
-//  2. Drains the MutationCollector(s) and flushes mutations via the
-//     ChangelogProducer(s), pinned to the task's partition.
-//  3. Persists the stream-time watermark (windowed topologies only).
+// PostBatch is the post-batch hook. For every live task it runs the retention
+// sweep (windowed stores), flushes mutations via the ChangelogProducers, and
+// persists the stream-time watermark. Runs AFTER processBatch and BEFORE
+// produce+commit in the ALO write order.
 //
-// This runs AFTER processBatch and BEFORE produce+commit in the ALO write order.
-//
-// ALO caveat (stream-time ordering): WriteStreamTime uses pebble.Sync which
-// commits to disk BEFORE the source offsets are committed to Kafka. On a crash
-// between the Sync and the Kafka commit, the persisted stream-time may be ahead
-// of the replayed source offset on restart. Windows already swept or expired per
-// the persisted stream-time may not be rebuilt from the redelivered records —
-// acceptable under at-least-once semantics. EOS (P5) closes this gap.
+// ALO caveat: WriteStreamTime uses pebble.Sync which commits to disk BEFORE
+// the source offsets are committed to Kafka. On a crash between the Sync and
+// the Kafka commit, the persisted stream-time may be ahead of the replayed
+// source offset on restart. Windows already swept per the persisted stream-time
+// may not be rebuilt from the redelivered records — acceptable under ALO.
+// EOS closes this gap.
 func (tm *TaskManager) PostBatch(ctx context.Context) error {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
 	for partition, t := range tm.tasks {
-		// Retention sweep (windowed stores only). Runs before the changelog flush
-		// so tombstones for expired windows are drained and flushed in the same batch.
-		// Amortized: sweeps only when stream-time advances by >= MaxSizeMs since last sweep.
+		if t.db == nil {
+			continue
+		}
+
+		// Retention sweep runs before the changelog flush so tombstones for expired
+		// windows are drained and flushed in the same batch (amortized).
 		if len(tm.bt.WindowStoreBindings) > 0 {
 			if err := tm.runSweep(t); err != nil {
 				return fmt.Errorf("TaskManager.PostBatch: partition %d: sweep: %w", partition, err)
 			}
 		}
 
-		// Flush all mutations (state updates + sweep tombstones) to changelog.
 		for storeName, collector := range t.collectors {
 			muts := collector.Drain()
 			if len(muts) == 0 {
@@ -159,8 +141,6 @@ func (tm *TaskManager) PostBatch(ctx context.Context) error {
 			}
 		}
 
-		// Persist stream-time after changelog flush (windowed topologies only).
-		// See ALO caveat in the method doc above.
 		if len(tm.bt.WindowStoreBindings) > 0 {
 			if err := state.WriteStreamTime(t.db, t.streamTime); err != nil {
 				// Non-fatal: on crash, stream-time will be rebuilt from redelivered records.
@@ -175,18 +155,14 @@ func (tm *TaskManager) PostBatch(ctx context.Context) error {
 }
 
 // WriteCheckpoints writes the current changelog high-watermark checkpoint for
-// each store on each live task. This must be called AFTER produce+commit so
-// the checkpoint reflects offsets whose corresponding source records are already
-// committed.
-//
-// Covers both regular StoreBindings and WindowStoreBindings.
+// each store on each live task. Must be called AFTER produce+commit.
 func (tm *TaskManager) WriteCheckpoints(ctx context.Context, brokers []string) {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
 	for partition, t := range tm.tasks {
 		for storeName, changelogTopic := range tm.allChangelogTopics() {
-			hw, err := state.RestoreFromChangelog(ctx, brokers, changelogTopic, partition, /*checkpointOffset=*/int64(^uint64(0)>>1), t.db, storeName)
+			hw, err := state.RestoreFromChangelog(ctx, brokers, changelogTopic, partition /*checkpointOffset=*/, int64(^uint64(0)>>1), t.db, storeName)
 			if err != nil {
 				tm.logger.Warn("WriteCheckpoints: fetch HW via restore failed",
 					slog.Int("partition", int(partition)),
@@ -209,12 +185,28 @@ func (tm *TaskManager) WriteCheckpoints(ctx context.Context, brokers []string) {
 	}
 }
 
-// Executor returns the executor for the given partition, or nil if no task is
-// assigned for that partition. Used by the Adapter to route records.
+// Executor returns the executor for the given partition.
+//
+// For stateful topologies it returns nil if no task is assigned for that partition
+// (OnAssigned must fire first). For zero-store topologies the task is created
+// lazily on first access so callers can process records without the assignment lifecycle.
 func (tm *TaskManager) Executor(partition int32) *topology.Executor {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 	if t, ok := tm.tasks[partition]; ok {
+		return t.executor
+	}
+	if len(tm.bt.StoreBindings) == 0 && len(tm.bt.WindowStoreBindings) == 0 {
+		t := &task{
+			db:         nil,
+			collectors: make(map[string]*state.MutationCollector),
+			producers:  make(map[string]*state.ChangelogProducer),
+			stores:     make(map[string]any),
+			partition:  partition,
+			streamTime: 0,
+		}
+		t.executor = topology.NewExecutor(tm.bt.Topology, t.stores)
+		tm.tasks[partition] = t
 		return t.executor
 	}
 	return nil
@@ -234,20 +226,38 @@ func (tm *TaskManager) allChangelogTopics() map[string]string {
 }
 
 // openTask creates and restores a single per-partition task. Called from OnAssigned.
+// Zero-store topologies skip Pebble entirely; an Executor is still created.
 func (tm *TaskManager) openTask(ctx context.Context, partition int32) error {
-	// Build the Pebble directory: StateDir/<appID>/partition-<N>
+	totalStores := len(tm.bt.StoreBindings) + len(tm.bt.WindowStoreBindings)
+	stores := make(map[string]any, totalStores)
+	collectors := make(map[string]*state.MutationCollector, totalStores)
+	producers := make(map[string]*state.ChangelogProducer, totalStores)
+
+	if totalStores == 0 {
+		t := &task{
+			db:         nil,
+			collectors: collectors,
+			producers:  producers,
+			stores:     stores,
+			partition:  partition,
+			streamTime: 0,
+		}
+		t.executor = topology.NewExecutor(tm.bt.Topology, stores)
+		tm.mu.Lock()
+		tm.tasks[partition] = t
+		tm.mu.Unlock()
+		tm.logger.Info("task opened (zero-store)",
+			slog.Int("partition", int(partition)),
+		)
+		return nil
+	}
+
 	dbDir := filepath.Join(tm.cfg.StateDir, tm.appID, fmt.Sprintf("partition-%d", partition))
 	db, err := state.OpenDB(dbDir)
 	if err != nil {
 		return fmt.Errorf("open pebble at %q: %w", dbDir, err)
 	}
 
-	totalStores := len(tm.bt.StoreBindings) + len(tm.bt.WindowStoreBindings)
-	stores := make(map[string]any, totalStores)
-	collectors := make(map[string]*state.MutationCollector, totalStores)
-	producers := make(map[string]*state.ChangelogProducer, totalStores)
-
-	// Regular (non-windowed) store bindings.
 	for storeName, binding := range tm.bt.StoreBindings {
 		changelogTopic := tm.appID + "-" + binding.ChangelogTopic + "-changelog"
 
@@ -273,8 +283,6 @@ func (tm *TaskManager) openTask(ctx context.Context, partition int32) error {
 			return fmt.Errorf("NewChangelogProducer store %q: %w", storeName, err)
 		}
 
-		// Option A (P2-S7fix): raw-bytes KeyValueStore. The DSL processors hold
-		// their concrete serdes and encode/decode themselves at the DSL boundary.
 		store := state.NewKeyValueStoreWithChangelog[[]byte, []byte](
 			storeName,
 			db,
@@ -288,11 +296,6 @@ func (tm *TaskManager) openTask(ctx context.Context, partition int32) error {
 		producers[storeName] = producer
 	}
 
-	// Windowed store bindings (P3-T4). Same byte-store pattern as regular stores;
-	// the window composite key encoding lives in internal/state and is transparent
-	// to the runtime — it's just bytes from this layer's perspective.
-	// RestoreFromChangelog replays windowed keys exactly like regular keys (including
-	// any retention tombstones produced by previous sweeps).
 	for storeName, binding := range tm.bt.WindowStoreBindings {
 		changelogTopic := tm.appID + "-" + binding.ChangelogTopic + "-changelog"
 
@@ -305,9 +308,6 @@ func (tm *TaskManager) openTask(ctx context.Context, partition int32) error {
 			checkpoint = -1
 		}
 
-		// Restore windowed state from changelog. Window composite keys are just bytes;
-		// RestoreFromChangelog replays them — including tombstones from past sweeps
-		// which will delete any expired windows that were previously written.
 		_, err = state.RestoreFromChangelog(ctx, tm.cfg.Brokers, changelogTopic, partition, checkpoint, db, storeName)
 		if err != nil {
 			_ = db.Close()
@@ -334,7 +334,6 @@ func (tm *TaskManager) openTask(ctx context.Context, partition int32) error {
 		producers[storeName] = producer
 	}
 
-	// Read persisted stream-time (0 if not found — safe initial watermark).
 	var streamTime int64
 	if len(tm.bt.WindowStoreBindings) > 0 {
 		ts, _, err := state.ReadStreamTime(db)
@@ -348,7 +347,8 @@ func (tm *TaskManager) openTask(ctx context.Context, partition int32) error {
 		streamTime = ts
 	}
 
-	// Create the task first so its streamTime field has a stable address for the Executor.
+	// Create the task first so its streamTime field has a stable address for the Executor
+	// (NewExecutorWithStreamTime stores &t.streamTime).
 	t := &task{
 		db:         db,
 		collectors: collectors,
@@ -358,10 +358,6 @@ func (tm *TaskManager) openTask(ctx context.Context, partition int32) error {
 		streamTime: streamTime,
 	}
 
-	// Wire executor. Use NewExecutorWithStreamTime when windowed stores are present so
-	// windowed processors can advance the shared stream-time watermark via
-	// ctx.AdvanceStreamTime. Non-windowed processors never touch stream-time — harmless.
-	// Keep NewExecutor for the no-window path so stateless/non-windowed tests are unaffected.
 	if len(tm.bt.WindowStoreBindings) > 0 {
 		t.executor = topology.NewExecutorWithStreamTime(tm.bt.Topology, stores, &t.streamTime)
 	} else {
@@ -393,7 +389,11 @@ func (tm *TaskManager) closeTask(ctx context.Context, partition int32) {
 		return
 	}
 
-	// Flush any pending mutations before closing.
+	if t.db == nil {
+		tm.logger.Info("task closed (zero-store)", slog.Int("partition", int(partition)))
+		return
+	}
+
 	for storeName, collector := range t.collectors {
 		muts := collector.Drain()
 		if len(muts) > 0 {
@@ -407,9 +407,6 @@ func (tm *TaskManager) closeTask(ctx context.Context, partition int32) {
 		}
 	}
 
-	// Persist stream-time before close so a clean shutdown does not lose watermark.
-	// On the next assignment, ReadStreamTime in openTask will recover this value,
-	// allowing windowed processors to resume from the correct watermark.
 	if len(tm.bt.WindowStoreBindings) > 0 {
 		if err := state.WriteStreamTime(t.db, t.streamTime); err != nil {
 			tm.logger.Warn("closeTask: WriteStreamTime failed",
@@ -419,9 +416,6 @@ func (tm *TaskManager) closeTask(ctx context.Context, partition int32) {
 		}
 	}
 
-	// Write a final checkpoint (read HW, then checkpoint HW-1) for all stores
-	// (regular + windowed). Covering window stores ensures restore on the next
-	// assignment skips already-applied changelog entries.
 	for storeName, changelogTopic := range tm.allChangelogTopics() {
 		hw, err := state.RestoreFromChangelog(ctx, tm.cfg.Brokers, changelogTopic, partition, int64(^uint64(0)>>1), t.db, storeName)
 		if err == nil && hw > 0 {
@@ -435,12 +429,10 @@ func (tm *TaskManager) closeTask(ctx context.Context, partition int32) {
 		}
 	}
 
-	// Close changelog producers.
 	for _, producer := range t.producers {
 		producer.Close()
 	}
 
-	// Close the Pebble DB last.
 	if err := t.db.Close(); err != nil {
 		tm.logger.Warn("closeTask: pebble close failed",
 			slog.Int("partition", int(partition)),
@@ -451,9 +443,7 @@ func (tm *TaskManager) closeTask(ctx context.Context, partition int32) {
 	tm.logger.Info("task closed", slog.Int("partition", int(partition)))
 }
 
-// computeSweepInterval returns the maximum MaxSizeMs across all window store
-// bindings. PostBatch uses this to amortize sweeps: sweep only once per
-// window-size of stream-time advancement.
+// computeSweepInterval returns the maximum MaxSizeMs across all window store bindings.
 func (tm *TaskManager) computeSweepInterval() int64 {
 	var maxSize int64
 	for _, binding := range tm.bt.WindowStoreBindings {
@@ -466,22 +456,13 @@ func (tm *TaskManager) computeSweepInterval() int64 {
 
 // runSweep runs the retention sweep for all windowed stores on t, but only
 // if stream-time has advanced by at least sweepInterval ms since the last sweep.
-//
-// Amortization cadence: sweep only when task.streamTime - task.lastSweepTime >=
-// max(MaxSizeMs across all window bindings). This caps sweep cost to at most once
-// per window-size of stream-time advancement. Correctness is preserved: a window
-// swept late was already past its grace period and could no longer be updated;
-// late sweeping only wastes disk briefly.
-//
-// After sweeping, tombstone Mutations are in each store's collector. They will be
-// drained and flushed to the changelog in the same PostBatch call (the flush loop
-// runs after runSweep), ensuring changelog consumers never rebuild expired windows.
+// Tombstone mutations end up in each store's collector and are flushed in the
+// same PostBatch call, keeping the changelog consistent.
 func (tm *TaskManager) runSweep(t *task) error {
 	sweepInterval := tm.computeSweepInterval()
 	if sweepInterval <= 0 {
 		return nil
 	}
-	// Skip if stream-time hasn't advanced enough since the last sweep.
 	if t.streamTime-t.lastSweepTime < sweepInterval {
 		return nil
 	}
@@ -512,14 +493,12 @@ func (tm *TaskManager) runSweep(t *task) error {
 // that sort after the first key in the store. Iterating the full store and checking
 // each windowStart is the only correct approach.
 //
-// Each store.Delete appends a Mutation{IsDelete:true} tombstone to the store's
-// attached MutationCollector. The caller (PostBatch) drains the collector and
-// flushes tombstones to the changelog so that restore correctly skips or deletes
-// expired windows on the next assignment.
+// Each store.Delete appends a tombstone Mutation to the store's MutationCollector.
+// The caller (PostBatch) drains the collector and flushes tombstones to the changelog
+// so that restore correctly skips or deletes expired windows on the next assignment.
 //
-// sweepWindowStore is intentionally a package-level function (not a method) so it
-// can be exercised in unit tests without a running Kafka broker (the store and
-// collector are constructed from an in-memory Pebble DB).
+// sweepWindowStore is a package-level function (not a method) so it can be exercised
+// in unit tests without a running Kafka broker.
 func sweepWindowStore(
 	store *state.KeyValueStore[[]byte, []byte],
 	windowDef gstream.WindowDefinition,
@@ -527,13 +506,11 @@ func sweepWindowStore(
 ) (int, error) {
 	expiryBoundary := streamTime - windowDef.MaxSizeMs() - graceMs
 	if expiryBoundary <= 0 {
-		// No stream-time advancement yet, or boundary is non-positive: nothing to expire.
 		return 0, nil
 	}
 
-	// Collect expired composite keys first; do not delete while iterating.
-	// Range calls fn with slices backed by Pebble's iterator buffer — we must copy
-	// before the next iterator step invalidates them.
+	// Collect expired keys first; Range slices are backed by Pebble's iterator buffer
+	// and must be copied before the next iterator step invalidates them.
 	var expired [][]byte
 	if err := store.Range(func(compositeKey, _ []byte) bool {
 		_, windowStart, decErr := state.DecodeWindowCompositeKey(compositeKey)
@@ -551,11 +528,6 @@ func sweepWindowStore(
 		return 0, fmt.Errorf("sweepWindowStore: full-store range scan: %w", err)
 	}
 
-	// Delete expired entries. store.Delete(k) encodes k via BytesSerde (identity),
-	// prepends the store prefix to get the full Pebble key, deletes it, and appends
-	// Mutation{Key: prefix+k, IsDelete: true} to the store's MutationCollector.
-	// The caller's PostBatch flush loop will drain this collector and push the
-	// tombstones to the changelog in the same batch.
 	for _, ck := range expired {
 		if err := store.Delete(ck); err != nil {
 			return 0, fmt.Errorf("sweepWindowStore: delete expired window key: %w", err)
@@ -565,9 +537,7 @@ func sweepWindowStore(
 }
 
 // collectPartitions flattens a topic→[]partition map into a deduplicated slice.
-// The map comes from kgo rebalance callbacks; keys are source topic names.
-// Because one task runs per partition (regardless of how many source topics
-// share that partition index), we deduplicate by partition number.
+// Deduplication is needed because multiple source topics may share the same partition index.
 func collectPartitions(m map[string][]int32) []int32 {
 	seen := make(map[int32]struct{})
 	var out []int32
@@ -581,9 +551,3 @@ func collectPartitions(m map[string][]int32) []int32 {
 	}
 	return out
 }
-
-// No erasedStore / bytesSerde here — Option A (P2-S7fix) puts the bytes boundary
-// directly in the store construction above (NewKeyValueStoreWithChangelog[[]byte,[]byte]
-// with gstream.BytesSerde{}). The Aggregate/Count processors capture their serdes at
-// DSL-build time and encode/decode themselves, so the runtime does not need to know
-// the concrete K,A types at all.

@@ -113,12 +113,26 @@ func inRecord(t *testing.T, key, value string) kafka.InRecord {
 	}
 }
 
+// unitTestCfg returns a minimal valid Config for unit tests that do not
+// contact a real broker (stateless topology tests).
+func unitTestCfg(t *testing.T) gstream.Config {
+	t.Helper()
+	cfg, err := gstream.Configure(
+		gstream.WithName("unit-test"),
+		gstream.WithBrokers("localhost:9092"),
+	)
+	if err != nil {
+		t.Fatalf("unitTestCfg: %v", err)
+	}
+	return cfg
+}
+
 // ---------------------------------------------------------------------------
 // NewAdapter validation tests
 // ---------------------------------------------------------------------------
 
 func TestNewAdapter_NilBt(t *testing.T) {
-	_, err := runtime.NewAdapter(nil, nil)
+	_, err := runtime.NewAdapter(nil, unitTestCfg(t), nil)
 	if err == nil {
 		t.Fatal("expected error for nil bt")
 	}
@@ -142,7 +156,7 @@ func TestNewAdapter_MultipleSourcesRejected(t *testing.T) {
 			"sink": {Topic: "t", EncodeKey: func(any) ([]byte, error) { return nil, nil }, EncodeVal: func(any) ([]byte, error) { return nil, nil }},
 		},
 	}
-	_, err := runtime.NewAdapter(bt, nil)
+	_, err := runtime.NewAdapter(bt, unitTestCfg(t), nil)
 	if err == nil {
 		t.Fatal("expected error for topology with more than one source")
 	}
@@ -163,7 +177,7 @@ func TestNewAdapter_MissingSinkBinding(t *testing.T) {
 			// "sink" is intentionally absent
 		},
 	}
-	_, err := runtime.NewAdapter(bt, nil)
+	_, err := runtime.NewAdapter(bt, unitTestCfg(t), nil)
 	if err == nil {
 		t.Fatal("expected error when sink binding is missing")
 	}
@@ -172,7 +186,7 @@ func TestNewAdapter_MissingSinkBinding(t *testing.T) {
 func TestNewAdapter_NilLogger(t *testing.T) {
 	bt := buildSimpleBuiltTopology(t)
 	// nil logger must not panic — falls back to slog.Default().
-	_, err := runtime.NewAdapter(bt, nil)
+	_, err := runtime.NewAdapter(bt, unitTestCfg(t), nil)
 	if err != nil {
 		t.Fatalf("NewAdapter with nil logger: %v", err)
 	}
@@ -186,7 +200,7 @@ func TestNewAdapter_NilLogger(t *testing.T) {
 // len >= 4 pass and are uppercased; short ones are filtered.
 func TestAdapter_FilterAndMap(t *testing.T) {
 	bt := buildSimpleBuiltTopology(t)
-	adapter, err := runtime.NewAdapter(bt, nil)
+	adapter, err := runtime.NewAdapter(bt, unitTestCfg(t), nil)
 	if err != nil {
 		t.Fatalf("NewAdapter: %v", err)
 	}
@@ -234,7 +248,7 @@ func TestAdapter_FilterAndMap(t *testing.T) {
 // key via the Mapper (test topology prefixes "mapped-" to the decoded string key).
 func TestAdapter_KeyPropagation(t *testing.T) {
 	bt := buildSimpleBuiltTopology(t)
-	adapter, err := runtime.NewAdapter(bt, nil)
+	adapter, err := runtime.NewAdapter(bt, unitTestCfg(t), nil)
 	if err != nil {
 		t.Fatalf("NewAdapter: %v", err)
 	}
@@ -280,7 +294,7 @@ func TestAdapter_TopicFromSinkBinding(t *testing.T) {
 		},
 	}
 
-	adapter, err := runtime.NewAdapter(bt, nil)
+	adapter, err := runtime.NewAdapter(bt, unitTestCfg(t), nil)
 	if err != nil {
 		t.Fatalf("NewAdapter: %v", err)
 	}
@@ -355,7 +369,7 @@ func TestAdapter_TypeChangingPipeline_NoSilentDrop(t *testing.T) {
 		},
 	}
 
-	adapter, err := runtime.NewAdapter(bt, nil)
+	adapter, err := runtime.NewAdapter(bt, unitTestCfg(t), nil)
 	if err != nil {
 		t.Fatalf("NewAdapter: %v", err)
 	}
@@ -392,7 +406,7 @@ func TestAdapter_TypeChangingPipeline_NoSilentDrop(t *testing.T) {
 // return an error (ALO: no produce, no commit).
 func TestAdapter_DecodeValError(t *testing.T) {
 	bt := buildSimpleBuiltTopology(t)
-	adapter, err := runtime.NewAdapter(bt, nil)
+	adapter, err := runtime.NewAdapter(bt, unitTestCfg(t), nil)
 	if err != nil {
 		t.Fatalf("NewAdapter: %v", err)
 	}
@@ -436,7 +450,7 @@ func TestAdapter_EncodeValError(t *testing.T) {
 		},
 	}
 
-	adapter, err := runtime.NewAdapter(bt, nil)
+	adapter, err := runtime.NewAdapter(bt, unitTestCfg(t), nil)
 	if err != nil {
 		t.Fatalf("NewAdapter: %v", err)
 	}
@@ -452,7 +466,7 @@ func TestAdapter_EncodeValError(t *testing.T) {
 func TestAdapter_ProcessorError(t *testing.T) {
 	b := topology.NewBuilder()
 	src := b.AddSource("src")
-	fail := b.AddProcessor("fail", func(_ topology.Record, _ topology.Forwarder) error {
+	fail := b.AddProcessor("fail", func(_ context.Context, _ topology.Record, _ topology.Forwarder) error {
 		return fmt.Errorf("intentional failure")
 	}, src)
 	b.AddSink("sink", fail)
@@ -477,7 +491,7 @@ func TestAdapter_ProcessorError(t *testing.T) {
 		},
 	}
 
-	adapter, err := runtime.NewAdapter(bt, nil)
+	adapter, err := runtime.NewAdapter(bt, unitTestCfg(t), nil)
 	if err != nil {
 		t.Fatalf("NewAdapter: %v", err)
 	}
@@ -492,7 +506,7 @@ func TestAdapter_ProcessorError(t *testing.T) {
 // records are filtered out by the DAG.
 func TestAdapter_AllFilteredNoOutputs(t *testing.T) {
 	bt := buildSimpleBuiltTopology(t)
-	adapter, err := runtime.NewAdapter(bt, nil)
+	adapter, err := runtime.NewAdapter(bt, unitTestCfg(t), nil)
 	if err != nil {
 		t.Fatalf("NewAdapter: %v", err)
 	}
@@ -513,7 +527,7 @@ func TestAdapter_AllFilteredNoOutputs(t *testing.T) {
 // the kafka.ProcessFunc type at compile time.
 func TestAdapter_ProcessFuncIsKafkaProcessFunc(t *testing.T) {
 	bt := buildSimpleBuiltTopology(t)
-	adapter, err := runtime.NewAdapter(bt, nil)
+	adapter, err := runtime.NewAdapter(bt, unitTestCfg(t), nil)
 	if err != nil {
 		t.Fatalf("NewAdapter: %v", err)
 	}
@@ -548,7 +562,7 @@ func TestAdapter_TimestampPreserved(t *testing.T) {
 		},
 	}
 
-	adapter, err := runtime.NewAdapter(bt, nil)
+	adapter, err := runtime.NewAdapter(bt, unitTestCfg(t), nil)
 	if err != nil {
 		t.Fatalf("NewAdapter: %v", err)
 	}

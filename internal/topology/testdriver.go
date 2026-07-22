@@ -1,6 +1,9 @@
 package topology
 
-import "fmt"
+import (
+	"context"
+	"fmt"
+)
 
 // TestDriver drives a sealed Topology synchronously and deterministically with
 // synthetic Records — no Kafka broker and no Pebble store required. This is the
@@ -49,7 +52,7 @@ func NewTestDriver(topo *Topology) *TestDriver {
 		n := sinkNode
 		sinkName := name
 		d.buffers[sinkName] = nil // initialize the buffer key
-		n.processFn = func(r Record, _ Forwarder) error {
+		n.processFn = func(_ context.Context, r Record, _ Forwarder) error {
 			d.buffers[sinkName] = append(d.buffers[sinkName], r)
 			return nil
 		}

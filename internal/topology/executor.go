@@ -1,8 +1,11 @@
 package topology
 
-import "fmt"
+import (
+	"context"
+	"fmt"
+)
 
-// Executor drives a sealed Topology for production (one per task/partition, §7).
+// Executor drives a sealed Topology for production (one per task/partition).
 //
 // Unlike TestDriver, Executor does NOT permanently mutate node.processFn on the
 // shared *Topology.  Concurrency safety is achieved as follows:
@@ -62,15 +65,18 @@ func NewExecutorWithStreamTime(topo *Topology, stores map[string]any, streamTime
 // synchronously to completion using processWithCtxAndHook. Sink records are
 // captured in this Executor's private buffers without touching node.processFn.
 //
+// ctx is threaded through every ProcessFunc and StatefulProcessFunc in the DAG,
+// enabling cancellation and deadline propagation from the caller.
+//
 // Returns an error if any processor returns an error, or if the source name is
 // not found in the topology.
-func (e *Executor) Process(sourceName string, r Record) error {
+func (e *Executor) Process(ctx context.Context, sourceName string, r Record) error {
 	src, ok := e.topo.sources[sourceName]
 	if !ok {
 		return fmt.Errorf("topology: source %q not found in topology (sources: %v)",
 			sourceName, e.topo.SourceNames())
 	}
-	return src.processWithCtxAndHook(r, e.stores, e.streamTime, func(sinkName string, rec Record) {
+	return src.processWithCtxAndHook(ctx, r, e.stores, e.streamTime, func(sinkName string, rec Record) {
 		e.buffers[sinkName] = append(e.buffers[sinkName], rec)
 	})
 }

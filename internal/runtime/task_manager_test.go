@@ -37,53 +37,59 @@ func buildStatefulTopology(t *testing.T) *gstream.BuiltTopology {
 }
 
 // ---------------------------------------------------------------------------
-// NewAdapter — stateful validation
+// NewAdapter — nil bt returns error
 // ---------------------------------------------------------------------------
 
-// TestNewAdapterWithConfig_NilBt verifies that nil bt returns an error.
-func TestNewAdapterWithConfig_NilBt(t *testing.T) {
-	_, err := runtime.NewAdapterWithConfig(nil, gstream.Config{}, nil)
+// TestNewAdapter_NilBt_WithConfig verifies that nil bt returns an error
+// (mirrors TestNewAdapter_NilBt in adapter_test.go, here with a full config).
+func TestNewAdapter_NilBt_WithConfig(t *testing.T) {
+	_, err := runtime.NewAdapter(nil, unitTestCfg(t), nil)
 	if err == nil {
 		t.Fatal("expected error for nil bt")
 	}
 }
 
-// TestNewAdapterWithConfig_StatefulReturnsAdapter verifies that a stateful
-// topology (StoreBindings non-empty) constructs successfully.
-func TestNewAdapterWithConfig_StatefulReturnsAdapter(t *testing.T) {
+// TestNewAdapter_StatefulReturnsAdapter verifies that a stateful topology
+// (StoreBindings non-empty) constructs successfully via the unified NewAdapter.
+func TestNewAdapter_StatefulReturnsAdapter(t *testing.T) {
 	bt := buildStatefulTopology(t)
 	if len(bt.StoreBindings) == 0 {
 		t.Fatal("buildStatefulTopology returned no StoreBindings")
 	}
-	// cfg has no brokers — fine for unit test (no I/O happens at construction time).
-	cfg := gstream.Config{
-		ApplicationID: "test-stateful",
-		Brokers:       []string{"localhost:9092"},
-	}
-	cfg.ApplyDefaults()
-	adapter, err := runtime.NewAdapterWithConfig(bt, cfg, nil)
+	cfg, err := gstream.Configure(
+		gstream.WithName("test-stateful"),
+		gstream.WithBrokers("localhost:9092"),
+	)
 	if err != nil {
-		t.Fatalf("NewAdapterWithConfig stateful: %v", err)
+		t.Fatalf("Configure: %v", err)
+	}
+	adapter, err := runtime.NewAdapter(bt, cfg, nil)
+	if err != nil {
+		t.Fatalf("NewAdapter stateful: %v", err)
 	}
 	if adapter == nil {
 		t.Fatal("expected non-nil adapter")
 	}
 }
 
-// TestAdapter_LifecycleCallbacksNilForStateless verifies that stateless
-// topologies return nil callbacks.
-func TestAdapter_LifecycleCallbacksNilForStateless(t *testing.T) {
+// TestAdapter_LifecycleCallbacksNonNilForStateless verifies that stateless
+// topologies return NON-nil callbacks (unified path — TaskManager always wired).
+func TestAdapter_LifecycleCallbacksNonNilForStateless(t *testing.T) {
 	bt := buildSimpleBuiltTopology(t) // from adapter_test.go helper
-	adapter, err := runtime.NewAdapter(bt, nil)
+	adapter, err := runtime.NewAdapter(bt, unitTestCfg(t), nil)
 	if err != nil {
 		t.Fatalf("NewAdapter: %v", err)
 	}
 	onAssigned, onRevoked := adapter.LifecycleCallbacks()
-	if onAssigned != nil || onRevoked != nil {
-		t.Error("expected nil lifecycle callbacks for stateless topology")
+	// Unified path: callbacks are always non-nil (TaskManager is always created).
+	if onAssigned == nil {
+		t.Error("expected non-nil onAssigned for zero-store topology (unified path)")
 	}
-	if adapter.PostBatchHook() != nil {
-		t.Error("expected nil PostBatchHook for stateless topology")
+	if onRevoked == nil {
+		t.Error("expected non-nil onRevoked for zero-store topology (unified path)")
+	}
+	if adapter.PostBatchHook() == nil {
+		t.Error("expected non-nil PostBatchHook for zero-store topology (unified path)")
 	}
 }
 
@@ -91,11 +97,16 @@ func TestAdapter_LifecycleCallbacksNilForStateless(t *testing.T) {
 // topologies return non-nil callbacks.
 func TestAdapter_LifecycleCallbacksNonNilForStateful(t *testing.T) {
 	bt := buildStatefulTopology(t)
-	cfg := gstream.Config{ApplicationID: "test-app", Brokers: []string{"localhost:9092"}}
-	cfg.ApplyDefaults()
-	adapter, err := runtime.NewAdapterWithConfig(bt, cfg, nil)
+	cfg, err := gstream.Configure(
+		gstream.WithName("test-app"),
+		gstream.WithBrokers("localhost:9092"),
+	)
 	if err != nil {
-		t.Fatalf("NewAdapterWithConfig: %v", err)
+		t.Fatalf("Configure: %v", err)
+	}
+	adapter, err := runtime.NewAdapter(bt, cfg, nil)
+	if err != nil {
+		t.Fatalf("NewAdapter: %v", err)
 	}
 	onAssigned, onRevoked := adapter.LifecycleCallbacks()
 	if onAssigned == nil {
@@ -110,15 +121,15 @@ func TestAdapter_LifecycleCallbacksNonNilForStateful(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Stateless path regression guard
+// Stateless path regression guard (via zero-store TaskManager)
 // ---------------------------------------------------------------------------
 
 // TestStatelessAdapterUnchanged verifies that the stateless Adapter (no
 // StoreBindings) still behaves exactly as before: it processes records through
-// the TestDriver and returns encoded outputs.
+// the zero-store TaskManager/Executor and returns encoded outputs.
 func TestStatelessAdapterUnchanged(t *testing.T) {
 	bt := buildSimpleBuiltTopology(t)
-	adapter, err := runtime.NewAdapter(bt, nil)
+	adapter, err := runtime.NewAdapter(bt, unitTestCfg(t), nil)
 	if err != nil {
 		t.Fatalf("NewAdapter: %v", err)
 	}
@@ -143,11 +154,13 @@ func TestStatelessAdapterUnchanged(t *testing.T) {
 // TestClientOption_WithLifecycle_NoError verifies that New() with WithLifecycle
 // succeeds and the resulting client is non-nil.
 func TestClientOption_WithLifecycle_NoError(t *testing.T) {
-	cfg := gstream.Config{
-		ApplicationID: "test-lifecycle",
-		Brokers:       []string{"localhost:9092"},
+	cfg, err := gstream.Configure(
+		gstream.WithName("test-lifecycle"),
+		gstream.WithBrokers("localhost:9092"),
+	)
+	if err != nil {
+		t.Fatalf("Configure: %v", err)
 	}
-	cfg.ApplyDefaults()
 
 	called := false
 	cl, err := kafka.New(cfg, []string{"topic"}, nil,
@@ -174,11 +187,13 @@ func TestClientOption_WithLifecycle_NoError(t *testing.T) {
 // TestClientOption_WithPostBatch_NoError verifies that New() with WithPostBatch
 // succeeds.
 func TestClientOption_WithPostBatch_NoError(t *testing.T) {
-	cfg := gstream.Config{
-		ApplicationID: "test-postbatch",
-		Brokers:       []string{"localhost:9092"},
+	cfg, err := gstream.Configure(
+		gstream.WithName("test-postbatch"),
+		gstream.WithBrokers("localhost:9092"),
+	)
+	if err != nil {
+		t.Fatalf("Configure: %v", err)
 	}
-	cfg.ApplyDefaults()
 
 	cl, err := kafka.New(cfg, []string{"topic"}, nil,
 		kafka.WithPostBatch(func(ctx context.Context) error {
@@ -197,11 +212,13 @@ func TestClientOption_WithPostBatch_NoError(t *testing.T) {
 // TestClientOption_NoOptsPreservesExistingBehaviour verifies that New() with
 // no options (the old call signature) continues to work.
 func TestClientOption_NoOptsPreservesExistingBehaviour(t *testing.T) {
-	cfg := gstream.Config{
-		ApplicationID: "test-noopts",
-		Brokers:       []string{"localhost:9092"},
+	cfg, err := gstream.Configure(
+		gstream.WithName("test-noopts"),
+		gstream.WithBrokers("localhost:9092"),
+	)
+	if err != nil {
+		t.Fatalf("Configure: %v", err)
 	}
-	cfg.ApplyDefaults()
 
 	cl, err := kafka.New(cfg, []string{"topic"}, nil)
 	if err != nil {
@@ -221,11 +238,16 @@ func TestClientOption_NoOptsPreservesExistingBehaviour(t *testing.T) {
 // TaskManager with no tasks is a no-op.
 func TestTaskManager_PostBatch_EmptyIsNoError(t *testing.T) {
 	bt := buildStatefulTopology(t)
-	cfg := gstream.Config{ApplicationID: "test-app", Brokers: []string{"localhost:9092"}}
-	cfg.ApplyDefaults()
-	adapter, err := runtime.NewAdapterWithConfig(bt, cfg, nil)
+	cfg, err := gstream.Configure(
+		gstream.WithName("test-app"),
+		gstream.WithBrokers("localhost:9092"),
+	)
 	if err != nil {
-		t.Fatalf("NewAdapterWithConfig: %v", err)
+		t.Fatalf("Configure: %v", err)
+	}
+	adapter, err := runtime.NewAdapter(bt, cfg, nil)
+	if err != nil {
+		t.Fatalf("NewAdapter: %v", err)
 	}
 	hook := adapter.PostBatchHook()
 	if hook == nil {
@@ -246,11 +268,16 @@ func TestTaskManager_PostBatch_EmptyIsNoError(t *testing.T) {
 // aborted, no commit).
 func TestStatefulAdapter_NoTask_ReturnsError(t *testing.T) {
 	bt := buildStatefulTopology(t)
-	cfg := gstream.Config{ApplicationID: "test-app", Brokers: []string{"localhost:9092"}}
-	cfg.ApplyDefaults()
-	adapter, err := runtime.NewAdapterWithConfig(bt, cfg, nil)
+	cfg, err := gstream.Configure(
+		gstream.WithName("test-app"),
+		gstream.WithBrokers("localhost:9092"),
+	)
 	if err != nil {
-		t.Fatalf("NewAdapterWithConfig: %v", err)
+		t.Fatalf("Configure: %v", err)
+	}
+	adapter, err := runtime.NewAdapter(bt, cfg, nil)
+	if err != nil {
+		t.Fatalf("NewAdapter: %v", err)
 	}
 
 	fn := adapter.ProcessFunc()
@@ -282,7 +309,7 @@ func TestExecutor_PerPartitionIndependence(t *testing.T) {
 	exec2 := topology.NewExecutor(topo, nil)
 
 	rec := topology.Record{Key: "k", Value: "v", Timestamp: 0}
-	if err := exec1.Process("src", rec); err != nil {
+	if err := exec1.Process(context.Background(), "src", rec); err != nil {
 		t.Fatalf("exec1.Process: %v", err)
 	}
 	// exec2 should have zero buffered records (independent buffers).
@@ -361,7 +388,7 @@ func TestBuildByteStoreAndExecuteCount(t *testing.T) {
 
 	// Feed three records.
 	for _, key := range []string{"foo", "bar", "foo"} {
-		if err := exec.Process("source", topology.Record{Key: key, Value: key, Timestamp: 1}); err != nil {
+		if err := exec.Process(context.Background(), "source", topology.Record{Key: key, Value: key, Timestamp: 1}); err != nil {
 			t.Fatalf("Process key=%q: unexpected error (P2-S7fix regression): %v", key, err)
 		}
 	}

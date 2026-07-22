@@ -1,17 +1,22 @@
 package topology
 
+import "context"
+
 // Forwarder is given to a Processor so it can emit records downstream.
 // Each call to Forward enqueues the record for the next nodes in the DAG.
 // Multiple calls within one Process invocation are allowed (fan-out, flat-map).
 type Forwarder func(r Record)
 
 // ProcessFunc is the core processing function type.
+// ctx carries cancellation and deadlines for the current pipeline invocation.
 // It receives an incoming Record, a Forwarder to emit zero or more downstream
 // Records, and returns an error (nil = success). Returning an error halts the
 // synchronous pipeline in the TestDriver and propagates to the caller of PipeInput.
-type ProcessFunc func(r Record, forward Forwarder) error
+type ProcessFunc func(ctx context.Context, r Record, forward Forwarder) error
 
 // ProcessorContext is passed to stateful processors: forwarding + named store access.
+// ctx (cancellation/deadlines) is a SEPARATE explicit parameter on StatefulProcessFunc,
+// not embedded here. Do not stash context.Context in ProcessorContext values.
 type ProcessorContext interface {
 	Forward(r Record)
 	Store(name string) any // concrete store; caller type-asserts. nil if unregistered.
@@ -25,7 +30,9 @@ type ProcessorContext interface {
 }
 
 // StatefulProcessFunc is a processor with state access.
-type StatefulProcessFunc func(r Record, ctx ProcessorContext) error
+// ctx is the real context.Context for cancellation/deadlines — it is a separate
+// first parameter and must NOT be stored inside pctx (ProcessorContext).
+type StatefulProcessFunc func(ctx context.Context, r Record, pctx ProcessorContext) error
 
 // node is the internal DAG node; it wraps a ProcessFunc with its downstream edges.
 // Source and Sink nodes use special-cased ProcessFuncs (see source.go / sink.go).
@@ -81,25 +88,15 @@ func (c *processorCtxImpl) AdvanceStreamTime(ts int64) {
 
 // processWithCtx drives execution of this node with the given store map, then
 // recursively drives all downstream nodes for each forwarded record.
-//
 // The named return (firstErr) accumulates the first error seen anywhere in the
-// subtree: downstream errors win over the current-node error (first-error-wins,
-// stop-on-error semantics are preserved from the original processWithErr).
-//
-// When stores is nil all Store() calls return nil; this is the normal path for
-// stateless processors (processFn set, statefulFn nil).
-// streamTime is a shared pointer owned by the Executor (or nil for the TestDriver
-// path); the same pointer is threaded into every processorCtxImpl in one traversal.
-func (n *node) processWithCtx(r Record, stores map[string]any, streamTime *int64) (firstErr error) {
-	// Build the shared downstream-forwarding closure that both stateless and
-	// stateful paths use.  It captures firstErr by reference so downstream
-	// errors are accumulated in the outer named return.
+// subtree (first-error-wins, stop-on-error).
+func (n *node) processWithCtx(ctx context.Context, r Record, stores map[string]any, streamTime *int64) (firstErr error) {
 	forward := func(out Record) {
 		if firstErr != nil {
 			return // stop forwarding once we have an error
 		}
 		for _, ds := range n.downstreams {
-			if err := ds.processWithCtx(out, stores, streamTime); err != nil {
+			if err := ds.processWithCtx(ctx, out, stores, streamTime); err != nil {
 				firstErr = err
 				return
 			}
@@ -107,16 +104,12 @@ func (n *node) processWithCtx(r Record, stores map[string]any, streamTime *int64
 	}
 
 	if n.statefulFn != nil {
-		// Stateful path: build a fresh ProcessorContext backed by the shared
-		// forward closure, caller-supplied stores map, and shared stream-time pointer.
-		ctx := &processorCtxImpl{forwardFn: forward, stores: stores, streamTime: streamTime}
-		if fnErr := n.statefulFn(r, ctx); fnErr != nil && firstErr == nil {
+		pctx := &processorCtxImpl{forwardFn: forward, stores: stores, streamTime: streamTime}
+		if fnErr := n.statefulFn(ctx, r, pctx); fnErr != nil && firstErr == nil {
 			firstErr = fnErr
 		}
 	} else {
-		// Stateless path: wrap the forward closure in the Forwarder type and
-		// delegate to processFn exactly as the original processWithErr did.
-		if fnErr := n.processFn(r, Forwarder(forward)); fnErr != nil && firstErr == nil {
+		if fnErr := n.processFn(ctx, r, Forwarder(forward)); fnErr != nil && firstErr == nil {
 			firstErr = fnErr
 		}
 	}
@@ -126,13 +119,9 @@ func (n *node) processWithCtx(r Record, stores map[string]any, streamTime *int64
 // processWithCtxAndHook is identical to processWithCtx except that for nodes
 // marked isSink==true it calls onSink(n.name, r) instead of executing the node's
 // processFn. This allows the Executor to collect sink output into its own private
-// buffers WITHOUT permanently mutating node.processFn on the shared *Topology.
-//
+// buffers without permanently mutating node.processFn on the shared *Topology.
 // onSink must not be nil when the topology contains sink nodes.
-// streamTime is a shared pointer owned by the Executor; nil is safe (no-op).
-func (n *node) processWithCtxAndHook(r Record, stores map[string]any, streamTime *int64, onSink func(sinkName string, r Record)) (firstErr error) {
-	// Sink nodes are leaf interceptors: hand off to the caller's hook instead
-	// of running the placeholder processFn.
+func (n *node) processWithCtxAndHook(ctx context.Context, r Record, stores map[string]any, streamTime *int64, onSink func(sinkName string, r Record)) (firstErr error) {
 	if n.isSink {
 		onSink(n.name, r)
 		return nil
@@ -143,7 +132,7 @@ func (n *node) processWithCtxAndHook(r Record, stores map[string]any, streamTime
 			return
 		}
 		for _, ds := range n.downstreams {
-			if err := ds.processWithCtxAndHook(out, stores, streamTime, onSink); err != nil {
+			if err := ds.processWithCtxAndHook(ctx, out, stores, streamTime, onSink); err != nil {
 				firstErr = err
 				return
 			}
@@ -151,32 +140,27 @@ func (n *node) processWithCtxAndHook(r Record, stores map[string]any, streamTime
 	}
 
 	if n.statefulFn != nil {
-		ctx := &processorCtxImpl{forwardFn: forward, stores: stores, streamTime: streamTime}
-		if fnErr := n.statefulFn(r, ctx); fnErr != nil && firstErr == nil {
+		pctx := &processorCtxImpl{forwardFn: forward, stores: stores, streamTime: streamTime}
+		if fnErr := n.statefulFn(ctx, r, pctx); fnErr != nil && firstErr == nil {
 			firstErr = fnErr
 		}
 	} else {
-		if fnErr := n.processFn(r, Forwarder(forward)); fnErr != nil && firstErr == nil {
+		if fnErr := n.processFn(ctx, r, Forwarder(forward)); fnErr != nil && firstErr == nil {
 			firstErr = fnErr
 		}
 	}
 	return
 }
 
-// processWithErr drives the node using processWithCtx with no stores (nil map)
-// and no stream-time tracking (nil pointer). This keeps the TestDriver — which
-// calls processWithErr directly — working identically for all stateless topologies.
-// The error semantics (first error wins, stop-on-error, current-node error only if
-// no downstream error) are unchanged.
+// processWithErr drives the node using processWithCtx with no stores, no
+// stream-time tracking, and context.Background(). Used by TestDriver.
 func (n *node) processWithErr(r Record) error {
-	return n.processWithCtx(r, nil, nil)
+	return n.processWithCtx(context.Background(), r, nil, nil)
 }
 
-// Filter returns a ProcessFunc that passes the Record downstream only when
-// predicate returns true. This is the simplest example of a stateless filter
-// processor (§6.2: KStream[K,V].Filter).
+// Filter returns a ProcessFunc that passes the Record downstream only when predicate returns true.
 func Filter(predicate func(key, value any) bool) ProcessFunc {
-	return func(r Record, forward Forwarder) error {
+	return func(_ context.Context, r Record, forward Forwarder) error {
 		if predicate(r.Key, r.Value) {
 			forward(r)
 		}
@@ -184,10 +168,9 @@ func Filter(predicate func(key, value any) bool) ProcessFunc {
 	}
 }
 
-// Mapper returns a ProcessFunc that transforms every Record 1-to-1 using
-// mapFn. The result is forwarded downstream. This models KStream[K,V].Map (§6.2).
+// Mapper returns a ProcessFunc that transforms every Record 1-to-1 using mapFn.
 func Mapper(mapFn func(key, value any) (newKey, newValue any)) ProcessFunc {
-	return func(r Record, forward Forwarder) error {
+	return func(_ context.Context, r Record, forward Forwarder) error {
 		k2, v2 := mapFn(r.Key, r.Value)
 		forward(Record{Key: k2, Value: v2, Timestamp: r.Timestamp})
 		return nil

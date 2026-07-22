@@ -12,10 +12,11 @@
 // captured at DSL build time. This correctly handles type-changing operators such as
 // Map and SelectKey (the P0 Adapter[V] single-serde silent-drop bug is fixed here).
 //
-// Adapter uses [topology.TestDriver] for synchronous, depth-first DAG traversal
-// — the same execution model that topology unit tests rely on.  For the P1 ALO
-// path this is correct: kafka.Client calls the ProcessFunc once per record from a
-// single goroutine, so per-record synchronous dispatch is safe and deterministic.
+// Adapter routes every record to a per-partition [topology.Executor] held by a
+// [TaskManager]. For zero-store topologies the Executor is created lazily on first
+// access (no Pebble, no changelog); for stateful topologies it is created during
+// the partition-assignment lifecycle. Both paths share a single code path: the
+// stateless/stateful split lives inside TaskManager.openTask, not in the Adapter.
 //
 // # Full runtime responsibilities (P2+)
 //

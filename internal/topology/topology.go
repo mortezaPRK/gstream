@@ -1,13 +1,13 @@
 package topology
 
-import "fmt"
+import (
+	"context"
+	"fmt"
+)
 
-// Topology is an immutable, sealed processor DAG. It is produced by Builder.Build()
-// and consumed by the runtime (one instance per assigned partition task, §7) or by
-// TestDriver for broker-free testing (§16).
-//
-// The topology holds references to all named nodes (sources, processors, sinks) so
-// that the driver/runtime can look them up by name to inject or collect records.
+// Topology is an immutable, sealed processor DAG produced by Builder.Build().
+// It is consumed by the runtime (one Executor per assigned partition task) or by
+// TestDriver for broker-free testing.
 type Topology struct {
 	sources map[string]*node // keyed by source name
 	sinks   map[string]*node // keyed by sink name
@@ -68,7 +68,7 @@ func (b *Builder) AddSource(name string) string {
 		name: name,
 		// Source's ProcessFunc simply forwards the record as-is; the TestDriver
 		// calls processWithErr directly on the source node after this injection.
-		processFn: func(r Record, forward Forwarder) error {
+		processFn: func(_ context.Context, r Record, forward Forwarder) error {
 			forward(r)
 			return nil
 		},
@@ -101,10 +101,8 @@ func (b *Builder) AddProcessor(name string, fn ProcessFunc, parents ...string) s
 	return name
 }
 
-// AddStatefulProcessor registers a named stateful processor node with the given
-// StatefulProcessFunc and an optional list of store names the processor will
-// access via ProcessorContext.Store. It mirrors AddProcessor but sets node.statefulFn
-// and node.storeNames instead of node.processFn.
+// AddStatefulProcessor registers a named stateful processor node. It mirrors
+// AddProcessor but sets node.statefulFn and node.storeNames instead of node.processFn.
 // parents must be names of previously added nodes.
 func (b *Builder) AddStatefulProcessor(name string, fn StatefulProcessFunc, storeNames []string, parents ...string) string {
 	if _, exists := b.nodes[name]; exists {
@@ -137,9 +135,8 @@ func (b *Builder) AddSink(name string, parents ...string) string {
 		panic(fmt.Sprintf("topology: sink %q must have at least one parent", name))
 	}
 
-	// The sink ProcessFunc is a stub; records are captured by the TestDriver by
-	// replacing it with a collector-injecting function at Build() time. In
-	// production runtime the sink ProcessFunc writes to Kafka.
+	// The sink processFn is a stub; records are captured by the Executor via
+	// processWithCtxAndHook (which intercepts isSink==true nodes).
 	n := &node{
 		name:      name,
 		processFn: sinkPlaceholderFn,
@@ -159,7 +156,7 @@ func (b *Builder) AddSink(name string, parents ...string) string {
 }
 
 // sinkPlaceholderFn is replaced by the TestDriver before driving records.
-func sinkPlaceholderFn(_ Record, _ Forwarder) error {
+func sinkPlaceholderFn(_ context.Context, _ Record, _ Forwarder) error {
 	return fmt.Errorf("topology: sink has no handler installed (use TestDriver or runtime)")
 }
 

@@ -1,6 +1,7 @@
 package topology_test
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
@@ -227,7 +228,7 @@ func TestPipeInput_ProcessorError_Propagates(t *testing.T) {
 
 	sentinel := fmt.Errorf("processor failure")
 	b.AddProcessor("failing",
-		func(_ topology.Record, _ topology.Forwarder) error { return sentinel },
+		func(_ context.Context, _ topology.Record, _ topology.Forwarder) error { return sentinel },
 		src,
 	)
 	// We still need a sink (Build panics without one), but the error should stop
@@ -256,7 +257,7 @@ func TestPipeInput_ProcessorSuccess(t *testing.T) {
 	b := topology.NewBuilder()
 	src := b.AddSource("src")
 	passthrough := b.AddProcessor("passthrough",
-		func(r topology.Record, forward topology.Forwarder) error {
+		func(_ context.Context, r topology.Record, forward topology.Forwarder) error {
 			forward(r)
 			return nil
 		},
