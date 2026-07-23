@@ -435,6 +435,121 @@ func (s *KeyValueStore[K, V]) WindowPut(kBytes []byte, windowStart int64, val []
 	return nil
 }
 
+// RangeCompositeBytes iterates keys in [lower, upper) within this store's prefix,
+// WITHOUT K/V serde — raw bytes. lower and upper are per-store composite key
+// portions; the store prefix is added internally for iteration bounds.
+// fn receives copies of the per-store composite key (store prefix stripped) and
+// value bytes (safe to retain after fn returns). The composite key is decodable by
+// DecodeWindowCompositeKey. Return false from fn to stop early.
+// Mirrors RangeBytes's iterator setup and byte-copy semantics.
+func (s *KeyValueStore[K, V]) RangeCompositeBytes(lower, upper []byte, fn func(compositeKey, val []byte) bool) error {
+	if err := s.checkOpen(); err != nil {
+		return err
+	}
+
+	lowerBound := make([]byte, len(s.prefix)+len(lower))
+	copy(lowerBound, s.prefix)
+	copy(lowerBound[len(s.prefix):], lower)
+
+	upperBound := make([]byte, len(s.prefix)+len(upper))
+	copy(upperBound, s.prefix)
+	copy(upperBound[len(s.prefix):], upper)
+
+	iterOpts := &pebble.IterOptions{
+		LowerBound: lowerBound,
+		UpperBound: upperBound,
+	}
+
+	iter, err := s.db.NewIter(iterOpts)
+	if err != nil {
+		return fmt.Errorf("state: RangeCompositeBytes new iter: %w", err)
+	}
+	defer func() {
+		_ = iter.Close()
+	}()
+
+	for valid := iter.First(); valid; valid = iter.Next() {
+		rawKey := iter.Key()
+		rawVal := iter.Value()
+
+		// Strip the store prefix; fn receives the per-store composite key only.
+		compositeKey := rawKey[len(s.prefix):]
+
+		// Copy both before handing to fn — Pebble reuses its buffers.
+		keyCopy := make([]byte, len(compositeKey))
+		copy(keyCopy, compositeKey)
+		valCopy := make([]byte, len(rawVal))
+		copy(valCopy, rawVal)
+
+		if !fn(keyCopy, valCopy) {
+			break
+		}
+	}
+
+	if err := iter.Error(); err != nil {
+		return fmt.Errorf("state: RangeCompositeBytes iter error: %w", err)
+	}
+	return nil
+}
+
+// WindowDelete removes the entry for the composite (kBytes, sessionStart) key.
+// It is not an error to delete a key that does not exist. If a MutationCollector
+// is attached, a Delete{Key} mutation is appended after the Pebble write succeeds.
+// The Mutation.Key is the full Pebble key (prefix + composite), matching the key
+// form used by WindowPut's Put mutation and Delete's Delete mutation.
+func (s *KeyValueStore[K, V]) WindowDelete(kBytes []byte, sessionStart int64) error {
+	if err := s.checkOpen(); err != nil {
+		return err
+	}
+	ck := WindowCompositeKey(kBytes, sessionStart)
+	pk := make([]byte, len(s.prefix)+len(ck))
+	copy(pk, s.prefix)
+	copy(pk[len(s.prefix):], ck)
+
+	if err := s.db.Delete(pk, pebble.Sync); err != nil {
+		return fmt.Errorf("state: WindowDelete pebble: %w", err)
+	}
+
+	if s.collector != nil {
+		keyCopy := make([]byte, len(pk))
+		copy(keyCopy, pk)
+		s.collector.Append(Delete{Key: keyCopy})
+	}
+	return nil
+}
+
+// RangeForKey iterates all windowed / session entries stored under kBytes, calling
+// fn with each entry's sessionStart (decoded from the composite key) and raw value
+// bytes (safe to retain after fn returns). Return false from fn to stop early.
+//
+// The composite-key format (WindowCompositeKey) is owned by internal/state; this
+// method decodes it so callers outside the package do not need to import internal/state
+// just to enumerate sessions. (gstream cannot import internal/state: internal/state
+// imports gstream via Serde[T], which would create a cycle.)
+//
+// [T1-amendment] Added additively for the session-windows DSL.
+func (s *KeyValueStore[K, V]) RangeForKey(kBytes []byte, fn func(sessionStart int64, val []byte) bool) error {
+	if err := s.checkOpen(); err != nil {
+		return err
+	}
+	lower := WindowKeyLowerBound(kBytes)
+	upper := WindowKeyUpperBound(kBytes)
+
+	var decodeErr error
+	err := s.RangeCompositeBytes(lower, upper, func(compositeKey, val []byte) bool {
+		_, sessionStart, dErr := DecodeWindowCompositeKey(compositeKey)
+		if dErr != nil {
+			decodeErr = dErr
+			return false // stop on malformed key
+		}
+		return fn(sessionStart, val)
+	})
+	if err != nil {
+		return err
+	}
+	return decodeErr
+}
+
 // Iter returns an iter.Seq2 iterator over all key-value pairs in ascending order.
 // It wraps Range; early-termination from yield propagates to Range's fn.
 func (s *KeyValueStore[K, V]) Iter() iter.Seq2[K, V] {

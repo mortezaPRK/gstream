@@ -862,6 +862,223 @@ func TestIter(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// RangeCompositeBytes tests
+// ---------------------------------------------------------------------------
+
+// TestRangeCompositeBytes verifies that RangeCompositeBytes:
+//   - returns only entries for the queried kBytes (kA vs kB isolation)
+//   - fn receives the per-store composite key (prefix stripped, decodable via
+//     DecodeWindowCompositeKey) and the correct value
+//   - keys come back in ascending order
+//   - early-stop via return false works
+func TestRangeCompositeBytes(t *testing.T) {
+	db, err := state.OpenMemDB()
+	if err != nil {
+		t.Fatalf("OpenMemDB: %v", err)
+	}
+	defer db.Close()
+
+	store := state.NewKeyValueStore[[]byte, []byte]("rcb-store", db, rawBytesSerde{}, rawBytesSerde{})
+	defer store.Close()
+
+	kA := []byte("userA")
+	kB := []byte("userB")
+
+	// Write three windows for kA and one for kB.
+	startsA := []int64{100, 200, 300}
+	for _, s := range startsA {
+		val := []byte(fmt.Sprintf("val-A-%d", s))
+		if err := store.WindowPut(kA, s, val); err != nil {
+			t.Fatalf("WindowPut kA %d: %v", s, err)
+		}
+	}
+	if err := store.WindowPut(kB, 150, []byte("val-B-150")); err != nil {
+		t.Fatalf("WindowPut kB: %v", err)
+	}
+
+	// RangeCompositeBytes over kA's full range.
+	lower := state.WindowKeyLowerBound(kA)
+	upper := state.WindowKeyUpperBound(kA)
+
+	var gotKeys [][]byte
+	var gotVals [][]byte
+	if err := store.RangeCompositeBytes(lower, upper, func(compositeKey, val []byte) bool {
+		gotKeys = append(gotKeys, compositeKey)
+		gotVals = append(gotVals, val)
+		return true
+	}); err != nil {
+		t.Fatalf("RangeCompositeBytes: %v", err)
+	}
+
+	// Expect exactly the three kA entries.
+	if len(gotKeys) != 3 {
+		t.Fatalf("expected 3 entries for kA, got %d", len(gotKeys))
+	}
+
+	// Each composite key must decode to kA and the corresponding windowStart.
+	for i, ck := range gotKeys {
+		decodedK, decodedStart, err := state.DecodeWindowCompositeKey(ck)
+		if err != nil {
+			t.Fatalf("entry[%d] DecodeWindowCompositeKey: %v", i, err)
+		}
+		if string(decodedK) != string(kA) {
+			t.Errorf("entry[%d]: decoded key %q, want %q", i, decodedK, kA)
+		}
+		if decodedStart != startsA[i] {
+			t.Errorf("entry[%d]: decoded windowStart %d, want %d", i, decodedStart, startsA[i])
+		}
+		wantVal := fmt.Sprintf("val-A-%d", startsA[i])
+		if string(gotVals[i]) != wantVal {
+			t.Errorf("entry[%d]: value %q, want %q", i, gotVals[i], wantVal)
+		}
+	}
+
+	// Early-stop: fn returns false after first entry.
+	var stopCount int
+	if err := store.RangeCompositeBytes(lower, upper, func(_, _ []byte) bool {
+		stopCount++
+		return false // stop immediately
+	}); err != nil {
+		t.Fatalf("RangeCompositeBytes early-stop: %v", err)
+	}
+	if stopCount != 1 {
+		t.Fatalf("early-stop: expected 1 call, got %d", stopCount)
+	}
+}
+
+// TestRangeCompositeBytes_ClosedStoreError verifies error on closed store.
+func TestRangeCompositeBytes_ClosedStoreError(t *testing.T) {
+	db, err := state.OpenMemDB()
+	if err != nil {
+		t.Fatalf("OpenMemDB: %v", err)
+	}
+	defer db.Close()
+
+	store := state.NewKeyValueStore[[]byte, []byte]("rcb-closed", db, rawBytesSerde{}, rawBytesSerde{})
+	store.Close()
+
+	if err := store.RangeCompositeBytes([]byte("a"), []byte("z"), func(_, _ []byte) bool { return true }); err == nil {
+		t.Fatal("expected error on closed store, got nil")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// WindowDelete tests
+// ---------------------------------------------------------------------------
+
+// TestWindowDelete verifies that WindowDelete removes the entry and that the
+// MutationCollector receives a Delete with the full prefixed Pebble key.
+func TestWindowDelete(t *testing.T) {
+	db, err := state.OpenMemDB()
+	if err != nil {
+		t.Fatalf("OpenMemDB: %v", err)
+	}
+	defer db.Close()
+
+	c := &state.MutationCollector{}
+	store := state.NewKeyValueStoreWithChangelog[[]byte, []byte]("wd-store", db, rawBytesSerde{}, rawBytesSerde{}, c)
+	defer store.Close()
+
+	kBytes := []byte("mykey")
+	sessionStart := int64(1000)
+	val := []byte("myval")
+
+	// Put then delete.
+	if err := store.WindowPut(kBytes, sessionStart, val); err != nil {
+		t.Fatalf("WindowPut: %v", err)
+	}
+	c.Drain() // clear Put mutation
+
+	if err := store.WindowDelete(kBytes, sessionStart); err != nil {
+		t.Fatalf("WindowDelete: %v", err)
+	}
+
+	// Key must be gone.
+	got, found, err := store.WindowGet(kBytes, sessionStart)
+	if err != nil {
+		t.Fatalf("WindowGet after WindowDelete: %v", err)
+	}
+	if found {
+		t.Fatalf("WindowGet: expected found=false after delete, got value %q", got)
+	}
+
+	// Collector must have one Delete with the full prefixed key.
+	mutations := c.Drain()
+	if len(mutations) != 1 {
+		t.Fatalf("expected 1 mutation, got %d", len(mutations))
+	}
+	del, ok := mutations[0].(state.Delete)
+	if !ok {
+		t.Fatalf("expected state.Delete, got %T", mutations[0])
+	}
+
+	// Verify full key: "wd-store\x00" + WindowCompositeKey(kBytes, sessionStart)
+	prefix := append([]byte("wd-store"), 0x00)
+	ck := state.WindowCompositeKey(kBytes, sessionStart)
+	wantKey := append(prefix, ck...)
+	if string(del.Key) != string(wantKey) {
+		t.Errorf("Delete.Key = %x, want %x", del.Key, wantKey)
+	}
+}
+
+// TestWindowDelete_MissingKeyNoError verifies that WindowDelete on a missing key is a no-op.
+func TestWindowDelete_MissingKeyNoError(t *testing.T) {
+	db, err := state.OpenMemDB()
+	if err != nil {
+		t.Fatalf("OpenMemDB: %v", err)
+	}
+	defer db.Close()
+
+	store := state.NewKeyValueStore[[]byte, []byte]("wd-noop", db, rawBytesSerde{}, rawBytesSerde{})
+	defer store.Close()
+
+	if err := store.WindowDelete([]byte("ghost"), 999); err != nil {
+		t.Fatalf("WindowDelete on missing key: unexpected error: %v", err)
+	}
+}
+
+// TestWindowDelete_NilCollectorSafe verifies no panic when collector is nil.
+func TestWindowDelete_NilCollectorSafe(t *testing.T) {
+	db, err := state.OpenMemDB()
+	if err != nil {
+		t.Fatalf("OpenMemDB: %v", err)
+	}
+	defer db.Close()
+
+	store := state.NewKeyValueStore[[]byte, []byte]("wd-nilcol", db, rawBytesSerde{}, rawBytesSerde{})
+	defer store.Close()
+
+	if err := store.WindowPut([]byte("k"), 42, []byte("v")); err != nil {
+		t.Fatalf("WindowPut: %v", err)
+	}
+	if err := store.WindowDelete([]byte("k"), 42); err != nil {
+		t.Fatalf("WindowDelete with nil collector: %v", err)
+	}
+}
+
+// TestWindowDelete_ClosedStoreError verifies error on closed store.
+func TestWindowDelete_ClosedStoreError(t *testing.T) {
+	db, err := state.OpenMemDB()
+	if err != nil {
+		t.Fatalf("OpenMemDB: %v", err)
+	}
+	defer db.Close()
+
+	store := state.NewKeyValueStore[[]byte, []byte]("wd-closed", db, rawBytesSerde{}, rawBytesSerde{})
+	store.Close()
+
+	if err := store.WindowDelete([]byte("k"), 0); err == nil {
+		t.Fatal("expected error on closed store, got nil")
+	}
+}
+
+// rawBytesSerde is a Serde[[]byte] that passes bytes through unchanged.
+type rawBytesSerde struct{}
+
+func (rawBytesSerde) Serialize(b []byte) ([]byte, error)   { return b, nil }
+func (rawBytesSerde) Deserialize(b []byte) ([]byte, error) { return b, nil }
+
 // TestIterBytes verifies that IterBytes yields raw key/value pairs in [lower, upper)
 // and that early termination via break stops iteration correctly.
 func TestIterBytes(t *testing.T) {
@@ -910,5 +1127,121 @@ func TestIterBytes(t *testing.T) {
 	}
 	if earlyCount != 1 {
 		t.Fatalf("IterBytes early-stop: expected 1 iteration, got %d", earlyCount)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// RangeForKey tests  [T1-amendment]
+// ---------------------------------------------------------------------------
+
+// TestRangeForKey verifies that RangeForKey:
+//   - calls fn with the correct sessionStart (ascending) and intact value bytes
+//   - isolates entries for the queried kBytes from those of another key
+//   - early-stop via return false works
+func TestRangeForKey(t *testing.T) {
+	db, err := state.OpenMemDB()
+	if err != nil {
+		t.Fatalf("OpenMemDB: %v", err)
+	}
+	defer db.Close()
+
+	store := state.NewKeyValueStore[[]byte, []byte]("rfk-store", db, rawBytesSerde{}, rawBytesSerde{})
+	defer store.Close()
+
+	kA := []byte("alice")
+	kB := []byte("bob")
+
+	// Write three sessions for kA and one for kB.
+	startsA := []int64{1000, 2000, 3000}
+	for _, s := range startsA {
+		val := []byte(fmt.Sprintf("val-A-%d", s))
+		if err := store.WindowPut(kA, s, val); err != nil {
+			t.Fatalf("WindowPut kA %d: %v", s, err)
+		}
+	}
+	if err := store.WindowPut(kB, 1500, []byte("val-B-1500")); err != nil {
+		t.Fatalf("WindowPut kB: %v", err)
+	}
+
+	// RangeForKey over kA — expect exactly the three kA entries in ascending order.
+	var gotStarts []int64
+	var gotVals [][]byte
+	if err := store.RangeForKey(kA, func(sStart int64, val []byte) bool {
+		gotStarts = append(gotStarts, sStart)
+		gotVals = append(gotVals, val)
+		return true
+	}); err != nil {
+		t.Fatalf("RangeForKey: %v", err)
+	}
+
+	if len(gotStarts) != 3 {
+		t.Fatalf("expected 3 entries for kA, got %d", len(gotStarts))
+	}
+	for i, s := range startsA {
+		if gotStarts[i] != s {
+			t.Errorf("entry[%d]: sessionStart got %d, want %d", i, gotStarts[i], s)
+		}
+		wantVal := fmt.Sprintf("val-A-%d", s)
+		if string(gotVals[i]) != wantVal {
+			t.Errorf("entry[%d]: value %q, want %q", i, gotVals[i], wantVal)
+		}
+	}
+
+	// kB entry must NOT appear in kA's range.
+	for _, s := range gotStarts {
+		if s == 1500 {
+			t.Error("kB entry at sStart=1500 appeared in kA's RangeForKey — isolation violated")
+		}
+	}
+
+	// Early-stop: fn returns false after first entry.
+	var stopCount int
+	if err := store.RangeForKey(kA, func(_ int64, _ []byte) bool {
+		stopCount++
+		return false // stop immediately
+	}); err != nil {
+		t.Fatalf("RangeForKey early-stop: %v", err)
+	}
+	if stopCount != 1 {
+		t.Fatalf("early-stop: expected 1 call, got %d", stopCount)
+	}
+}
+
+// TestRangeForKey_EmptyKey verifies that RangeForKey on a key with no sessions calls fn zero times.
+func TestRangeForKey_EmptyKey(t *testing.T) {
+	db, err := state.OpenMemDB()
+	if err != nil {
+		t.Fatalf("OpenMemDB: %v", err)
+	}
+	defer db.Close()
+
+	store := state.NewKeyValueStore[[]byte, []byte]("rfk-empty", db, rawBytesSerde{}, rawBytesSerde{})
+	defer store.Close()
+
+	var count int
+	if err := store.RangeForKey([]byte("ghost"), func(_ int64, _ []byte) bool {
+		count++
+		return true
+	}); err != nil {
+		t.Fatalf("RangeForKey on empty key: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected 0 calls for key with no sessions, got %d", count)
+	}
+}
+
+// TestRangeForKey_ClosedStoreError verifies error on closed store.
+func TestRangeForKey_ClosedStoreError(t *testing.T) {
+	db, err := state.OpenMemDB()
+	if err != nil {
+		t.Fatalf("OpenMemDB: %v", err)
+	}
+	defer db.Close()
+
+	store := state.NewKeyValueStore[[]byte, []byte]("rfk-closed", db, rawBytesSerde{}, rawBytesSerde{})
+	store.Close()
+
+	if err := store.RangeForKey([]byte("k"), func(_ int64, _ []byte) bool { return true }); err == nil {
+		t.Fatal("expected error on closed store, got nil")
 	}
 }
