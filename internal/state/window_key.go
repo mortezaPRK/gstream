@@ -3,9 +3,14 @@ package state
 import (
 	"encoding/binary"
 	"fmt"
+
+	"github.com/mortezaPRK/gstream/internal/winkey"
 )
 
-// WindowCompositeKey builds the per-store byte key for a windowed entry:
+// WindowCompositeKey builds the per-store byte key for a windowed entry.
+// The canonical format is owned by internal/winkey.CompositeKey; this function
+// is a thin wrapper so existing callers inside internal/state and its tests do
+// not need to change their import paths.
 //
 //	uint32(len(kBytes)) big-endian ‖ kBytes ‖ int64(windowStart) big-endian
 //
@@ -13,11 +18,7 @@ import (
 // 0x00 bytes. The result is used as the "per-store key portion" passed to
 // RangeBytes / DeleteRangeBytes (the store prefix is added by those methods).
 func WindowCompositeKey(kBytes []byte, windowStart int64) []byte {
-	out := make([]byte, 4+len(kBytes)+8)
-	binary.BigEndian.PutUint32(out[0:4], uint32(len(kBytes)))
-	copy(out[4:], kBytes)
-	binary.BigEndian.PutUint64(out[4+len(kBytes):], uint64(windowStart))
-	return out
+	return winkey.CompositeKey(kBytes, windowStart)
 }
 
 // DecodeWindowCompositeKey reverses WindowCompositeKey.
