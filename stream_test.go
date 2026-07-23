@@ -442,6 +442,38 @@ func TestBuild_NoSinks_Panics(t *testing.T) {
 // Repartition-marker assertions (direct builder inspection)
 // ---------------------------------------------------------------------------
 
+// TestBuild_SessionStoreBindings verifies that a manually inserted sessionStores
+// entry survives Build() and appears verbatim in BuiltTopology.SessionStoreBindings.
+func TestBuild_SessionStoreBindings(t *testing.T) {
+	t.Parallel()
+
+	b := NewStreamBuilder()
+	src := Stream[string, string](b, "t", "src", JSONSerde[string]{}, JSONSerde[string]{})
+	src.To("t", "sink", JSONSerde[string]{}, JSONSerde[string]{})
+
+	binding := SessionStoreBinding{
+		StoreBinding: StoreBinding{StoreName: "sess-store", ChangelogTopic: "sess-store"},
+		GapMs:        5000,
+		GraceMs:      1000,
+	}
+	b.sessionStores["sess-store"] = binding
+
+	bt := b.Build()
+	got, ok := bt.SessionStoreBindings["sess-store"]
+	if !ok {
+		t.Fatal("SessionStoreBindings missing \"sess-store\" entry after Build()")
+	}
+	if got.StoreName != binding.StoreName {
+		t.Errorf("StoreName: got %q, want %q", got.StoreName, binding.StoreName)
+	}
+	if got.GapMs != binding.GapMs {
+		t.Errorf("GapMs: got %d, want %d", got.GapMs, binding.GapMs)
+	}
+	if got.GraceMs != binding.GraceMs {
+		t.Errorf("GraceMs: got %d, want %d", got.GraceMs, binding.GraceMs)
+	}
+}
+
 // TestRepartitionMarkers_MapAndSelectKeyBothMark verifies that Map and SelectKey
 // set repartitions[name] = true, while Filter and MapValues do not.
 func TestRepartitionMarkers_MapAndSelectKeyBothMark(t *testing.T) {
