@@ -24,4 +24,10 @@ type KTable[K, V any] struct {
 	builder   *StreamBuilder
 	nodeName  string
 	storeName string
+	// keySerde is used by stream-table join to encode the lookup key.
+	keySerde Serde[K]
+	// valSerde is used by stream-table join to decode the stored value bytes
+	// back into the concrete V type. Set by Aggregate (accSerde); nil for
+	// windowed/session KTables (key is Windowed[K], not stream-joinable in P4a).
+	valSerde Serde[V]
 }

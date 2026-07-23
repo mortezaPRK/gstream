@@ -98,7 +98,7 @@ func main() {
 	// -------------------------------------------------------------------------
 	// 4. Create the Kafka client and run the pipeline with graceful shutdown.
 	// -------------------------------------------------------------------------
-	client, err := kafka.New(cfg, []string{"input-topic"}, logger)
+	client, err := kafka.New(cfg, adapter.SourceTopics(), logger)
 	if err != nil {
 		logger.Error("failed to create kafka client", slog.Any("error", err))
 		os.Exit(1)

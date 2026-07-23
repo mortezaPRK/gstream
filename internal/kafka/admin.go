@@ -187,6 +187,56 @@ func describeSpec(name string, specs []TopicSpec) string {
 	return fmt.Sprintf("  topic=%q (spec not found)", name)
 }
 
+// ValidateCoPartitioned returns an error if the given topics do not all have the
+// same partition count. Co-partitioning is required for a stream-table join so
+// that key K lands on the same partition index in both topics.
+//
+// Fewer than 2 topics → nil (nothing to compare).
+// Missing or zero-partition topic → error naming it.
+// Partition count mismatch → error naming both topics and both counts.
+func ValidateCoPartitioned(ctx context.Context, brokers []string, topics []string) error {
+	if len(topics) < 2 {
+		return nil
+	}
+
+	cl, err := kgo.NewClient(kgo.SeedBrokers(brokers...))
+	if err != nil {
+		return fmt.Errorf("kafka.ValidateCoPartitioned: create client: %w", err)
+	}
+	defer cl.Close()
+
+	// fetchTopicMetadata only uses TopicSpec.Name; other fields are irrelevant here.
+	specs := make([]TopicSpec, len(topics))
+	for i, t := range topics {
+		specs[i] = TopicSpec{Name: t}
+	}
+
+	meta, err := fetchTopicMetadata(ctx, cl, specs)
+	if err != nil {
+		return fmt.Errorf("kafka.ValidateCoPartitioned: metadata: %w", err)
+	}
+
+	for _, t := range topics {
+		info, ok := meta[t]
+		if !ok || info.partitions == 0 {
+			return fmt.Errorf("kafka.ValidateCoPartitioned: topic %q not found or has 0 partitions", t)
+		}
+	}
+
+	first := topics[0]
+	for _, t := range topics[1:] {
+		na := meta[first].partitions
+		nb := meta[t].partitions
+		if na != nb {
+			return fmt.Errorf(
+				"co-partitioning violation: topic %q has %d partitions but %q has %d; join topics must have equal partition counts",
+				first, na, t, nb,
+			)
+		}
+	}
+	return nil
+}
+
 // describeTopicConfig fetches a single config entry for a topic via a
 // DescribeConfigs request. It returns the string value, or an error if the
 // topic or config key is unknown. This is unexported and used only by tests.

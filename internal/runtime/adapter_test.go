@@ -298,7 +298,10 @@ func TestAdapter_TopicFromSinkBinding(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewAdapter: %v", err)
 	}
-	outs, err := adapter.ProcessFunc()(context.Background(), inRecord(t, "k", "hello"))
+	outs, err := adapter.ProcessFunc()(context.Background(), kafka.InRecord{
+		Topic: "in", Partition: 0, Offset: 0,
+		Key: []byte("k"), Value: mustSerialize(t, "hello"), Timestamp: time.Now(),
+	})
 	if err != nil {
 		t.Fatalf("process: %v", err)
 	}
@@ -455,7 +458,9 @@ func TestAdapter_EncodeValError(t *testing.T) {
 		t.Fatalf("NewAdapter: %v", err)
 	}
 
-	_, err = adapter.ProcessFunc()(context.Background(), inRecord(t, "k", "hello"))
+	_, err = adapter.ProcessFunc()(context.Background(), kafka.InRecord{
+		Topic: "in", Key: []byte("k"), Value: mustSerialize(t, "hello"), Timestamp: time.Now(),
+	})
 	if err == nil {
 		t.Fatal("expected error from failing EncodeVal (ALO: encode error must propagate)")
 	}
@@ -496,7 +501,9 @@ func TestAdapter_ProcessorError(t *testing.T) {
 		t.Fatalf("NewAdapter: %v", err)
 	}
 
-	_, err = adapter.ProcessFunc()(context.Background(), inRecord(t, "k", "hello"))
+	_, err = adapter.ProcessFunc()(context.Background(), kafka.InRecord{
+		Topic: "in", Key: []byte("k"), Value: mustSerialize(t, "hello"), Timestamp: time.Now(),
+	})
 	if err == nil {
 		t.Fatal("expected error from failing processor (ALO: processor error must propagate)")
 	}

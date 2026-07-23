@@ -171,5 +171,7 @@ func (g KGroupedStream[K, V]) Aggregate[A any](
 		builder:   g.builder,
 		nodeName:  name,
 		storeName: storeName,
+		keySerde:  g.keySerde,
+		valSerde:  accSerde,
 	}
 }
