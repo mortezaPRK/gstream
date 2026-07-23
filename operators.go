@@ -53,13 +53,11 @@ func (s KStream[K, V]) MapValues[V2 any](fn func(K, V) V2) KStream[K, V2] {
 
 // Map transforms each record's key and value from (K, V) to (K2, V2) using fn.
 //
-// WARNING: Map marks a repartition boundary because the key distribution changes.
-// The boundary is recorded in the builder but the repartition topic is not yet wired.
-// Downstream operators that require co-partitioning (joins, aggregations) must not be
-// used across this boundary until repartition topics are supported.
+// Map introduces a repartition boundary because the key distribution changes.
+// Register a RepartitionBinding (C2 DSL) to wire the intermediate topic before
+// using downstream operators that require co-partitioning (joins, aggregations).
 func (s KStream[K, V]) Map[K2, V2 any](fn func(K, V) (K2, V2)) KStream[K2, V2] {
 	name := s.builder.nextName("map")
-	s.builder.repartitions[name] = true
 	s.builder.internal.AddProcessor(name, func(_ context.Context, r topology.Record, forward topology.Forwarder) error {
 		k, ok := r.Key.(K)
 		if !ok {
@@ -83,13 +81,11 @@ func (s KStream[K, V]) Map[K2, V2 any](fn func(K, V) (K2, V2)) KStream[K2, V2] {
 // SelectKey replaces the key of each record using fn(k, v) → K2. The value V
 // is passed through unchanged.
 //
-// WARNING: SelectKey marks a repartition boundary because the key distribution changes.
-// The boundary is recorded in the builder but the repartition topic is not yet wired.
-// Downstream operators that require co-partitioning (joins, aggregations) must not be
-// used across this boundary until repartition topics are supported.
+// SelectKey introduces a repartition boundary because the key distribution changes.
+// Register a RepartitionBinding (C2 DSL) to wire the intermediate topic before
+// using downstream operators that require co-partitioning (joins, aggregations).
 func (s KStream[K, V]) SelectKey[K2 any](fn func(K, V) K2) KStream[K2, V] {
 	name := s.builder.nextName("selectkey")
-	s.builder.repartitions[name] = true
 	s.builder.internal.AddProcessor(name, func(_ context.Context, r topology.Record, forward topology.Forwarder) error {
 		k, ok := r.Key.(K)
 		if !ok {

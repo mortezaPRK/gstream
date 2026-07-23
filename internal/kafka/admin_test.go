@@ -8,8 +8,10 @@ import (
 	"testing"
 	"time"
 
+	gstream "github.com/mortezaPRK/gstream"
 	testcontainers "github.com/testcontainers/testcontainers-go"
 	kafkamodule "github.com/testcontainers/testcontainers-go/modules/kafka"
+	"github.com/twmb/franz-go/pkg/kgo"
 )
 
 // TestValidateCoPartitioned_LessThanTwo verifies the <2 topics → nil short-circuit.
@@ -193,4 +195,99 @@ func TestValidateCoPartitioned(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestEnsureRepartitionTopics_EmptyBindings verifies the short-circuit: no
+// RepartitionBindings → nil return without any broker contact.
+func TestEnsureRepartitionTopics_EmptyBindings(t *testing.T) {
+	cfg := gstream.Config{
+		ApplicationID: "test-app",
+		Brokers:       []string{"broker:9092"},
+	}
+	bt := &gstream.BuiltTopology{
+		RepartitionBindings: map[string]gstream.RepartitionBinding{},
+	}
+	if err := EnsureRepartitionTopics(context.Background(), cfg, bt); err != nil {
+		t.Errorf("empty bindings: want nil, got %v", err)
+	}
+}
+
+// TestEnsureRepartitionTopics verifies that EnsureRepartitionTopics:
+//  1. Creates repartition topic with the correct partition count.
+//  2. Sets cleanup.policy=delete (NOT compact).
+//  3. Is idempotent: a second call returns no error.
+func TestEnsureRepartitionTopics(t *testing.T) {
+	if !dockerAvailable() {
+		t.Skip("Docker not available; skipping integration test")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	kc, err := kafkamodule.Run(ctx, "confluentinc/cp-kafka:7.4.0",
+		kafkamodule.WithClusterID("test-repartition-cluster"),
+		testcontainers.WithEnv(map[string]string{
+			"KAFKA_AUTO_CREATE_TOPICS_ENABLE": "false",
+		}),
+	)
+	if err != nil {
+		t.Skipf("failed to start Kafka container (Docker may be unavailable or slow): %v", err)
+	}
+	t.Cleanup(func() { _ = kc.Terminate(ctx) })
+
+	brokers, err := kc.Brokers(ctx)
+	if err != nil {
+		t.Fatalf("failed to get broker addresses: %v", err)
+	}
+
+	const appID = "myapp"
+	cfg := gstream.Config{
+		ApplicationID: appID,
+		Brokers:       brokers,
+	}
+	bt := &gstream.BuiltTopology{
+		RepartitionBindings: map[string]gstream.RepartitionBinding{
+			"rp": {Name: "rp", Partitions: 4},
+		},
+	}
+
+	// First call: should create the topic.
+	if err := EnsureRepartitionTopics(ctx, cfg, bt); err != nil {
+		t.Fatalf("EnsureRepartitionTopics (create): %v", err)
+	}
+
+	const fullTopic = appID + "-rp-repartition"
+
+	// Verify partition count via metadata.
+	specs := []TopicSpec{{Name: fullTopic}}
+	cl, clErr := kgo.NewClient(kgo.SeedBrokers(brokers...))
+	if clErr != nil {
+		t.Fatalf("create test client: %v", clErr)
+	}
+	defer cl.Close()
+	meta, metaErr := fetchTopicMetadata(ctx, cl, specs)
+	if metaErr != nil {
+		t.Fatalf("fetchTopicMetadata: %v", metaErr)
+	}
+	info, ok := meta[fullTopic]
+	if !ok {
+		t.Fatalf("topic %q not found in metadata", fullTopic)
+	}
+	if info.partitions != 4 {
+		t.Errorf("partition count: got %d, want 4", info.partitions)
+	}
+
+	// Verify cleanup.policy=delete.
+	policy, descErr := describeTopicConfig(ctx, brokers, fullTopic, "cleanup.policy")
+	if descErr != nil {
+		t.Fatalf("describeTopicConfig: %v", descErr)
+	}
+	if policy != "delete" {
+		t.Errorf("cleanup.policy: got %q, want %q", policy, "delete")
+	}
+
+	// Second call: idempotent — no error.
+	if err := EnsureRepartitionTopics(ctx, cfg, bt); err != nil {
+		t.Fatalf("EnsureRepartitionTopics (idempotent second call): %v", err)
+	}
 }

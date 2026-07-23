@@ -33,10 +33,12 @@ import (
 // Adapter is NOT safe for concurrent use. kafka.Client calls ProcessFunc
 // sequentially from a single goroutine.
 type Adapter struct {
-	taskManager   *TaskManager
-	bt            *gstream.BuiltTopology
-	logger        *slog.Logger
-	topicToSource map[string]string // Kafka topic → topology source-node name
+	taskManager     *TaskManager
+	bt              *gstream.BuiltTopology
+	logger          *slog.Logger
+	topicToSource   map[string]string                // Kafka topic → topology source-node name
+	resolvedSources map[string]gstream.SourceBinding // source-node name → SourceBinding (includes repartition)
+	resolvedSinks   map[string]gstream.SinkBinding   // sink-node name → SinkBinding (includes repartition)
 }
 
 // NewAdapter constructs an Adapter driven by a *gstream.BuiltTopology.
@@ -71,10 +73,51 @@ func NewAdapter(bt *gstream.BuiltTopology, cfg gstream.Config, logger *slog.Logg
 		return nil, fmt.Errorf("runtime.NewAdapter: topology has no source nodes")
 	}
 
-	// Build topic → source-node-name map; validate every source has a binding.
-	topicToSource := make(map[string]string, len(srcs))
+	// Build resolved source and sink maps seeded from bt.Sources and bt.Sinks.
+	// Repartition bindings are merged in BEFORE the topicToSource-building loop
+	// so the source validation step finds repartition source nodes without error.
+	resolvedSources := make(map[string]gstream.SourceBinding, len(bt.Sources)+len(bt.RepartitionBindings))
+	for name, sb := range bt.Sources {
+		resolvedSources[name] = sb
+	}
+	resolvedSinks := make(map[string]gstream.SinkBinding, len(bt.Sinks)+len(bt.RepartitionBindings))
+	for name, sb := range bt.Sinks {
+		resolvedSinks[name] = sb
+	}
+
+	// Register repartition bindings: each adds a full Kafka topic to topicToSource
+	// (consumed by the client) and populates both resolvedSources and resolvedSinks
+	// so process() and drainSinks() need no repartition-specific logic.
+	// Must run BEFORE the topicToSource-building loop because SourceNames() includes
+	// the repartition source nodes, which are not present in bt.Sources.
+	topicToSource := make(map[string]string, len(srcs)+len(bt.RepartitionBindings))
+	for _, rb := range bt.RepartitionBindings {
+		fullTopic := cfg.ApplicationID + "-" + rb.Name + "-repartition"
+
+		// Write side: repartition sink node → SinkBinding for the full topic.
+		resolvedSinks[rb.SinkName] = gstream.SinkBinding{
+			Topic:     fullTopic,
+			EncodeKey: rb.EncodeKey,
+			EncodeVal: rb.EncodeVal,
+		}
+
+		// Read side: repartition source node → SourceBinding for the full topic.
+		// topicToSource maps the full topic to the source node so process() routes
+		// re-consumed records from the repartition topic to the repartition source
+		// node — same lookup P4a uses for regular sources.
+		resolvedSources[rb.SourceName] = gstream.SourceBinding{
+			Topic:     fullTopic,
+			DecodeKey: rb.DecodeKey,
+			DecodeVal: rb.DecodeVal,
+		}
+		topicToSource[fullTopic] = rb.SourceName
+	}
+
+	// Build topic → source-node-name map for all source nodes. Repartition source
+	// nodes are already in topicToSource (registered above); skip them to avoid the
+	// "same topic" duplicate check firing on itself.
 	for _, name := range srcs {
-		binding, ok := bt.Sources[name]
+		binding, ok := resolvedSources[name]
 		if !ok {
 			return nil, fmt.Errorf(
 				"runtime.NewAdapter: source %q has no entry in bt.Sources",
@@ -82,6 +125,10 @@ func NewAdapter(bt *gstream.BuiltTopology, cfg gstream.Config, logger *slog.Logg
 			)
 		}
 		if existing, dup := topicToSource[binding.Topic]; dup {
+			if existing == name {
+				// Already registered (repartition source node) — skip duplicate insert.
+				continue
+			}
 			return nil, fmt.Errorf(
 				"runtime.NewAdapter: sources %q and %q map to the same topic %q",
 				existing, name, binding.Topic,
@@ -90,11 +137,11 @@ func NewAdapter(bt *gstream.BuiltTopology, cfg gstream.Config, logger *slog.Logg
 		topicToSource[binding.Topic] = name
 	}
 
-	// Internal sinks (absent from bt.Sinks — e.g. ktable-out-N) are valid for
+	// Internal sinks (absent from resolvedSinks — e.g. ktable-out-N) are valid for
 	// stateful topologies; for zero-store topologies all sinks must have bindings.
 	hasStores := len(bt.StoreBindings) > 0 || len(bt.WindowStoreBindings) > 0 || len(bt.SessionStoreBindings) > 0
 	for _, sinkName := range bt.Topology.SinkNames() {
-		if _, ok := bt.Sinks[sinkName]; !ok {
+		if _, ok := resolvedSinks[sinkName]; !ok {
 			if !hasStores {
 				return nil, fmt.Errorf(
 					"runtime.NewAdapter: sink %q has no entry in bt.Sinks (provide a SinkBinding with Topic, EncodeKey, and EncodeVal)",
@@ -106,10 +153,12 @@ func NewAdapter(bt *gstream.BuiltTopology, cfg gstream.Config, logger *slog.Logg
 	}
 
 	return &Adapter{
-		taskManager:   NewTaskManager(bt, cfg, logger),
-		bt:            bt,
-		logger:        logger,
-		topicToSource: topicToSource,
+		taskManager:     NewTaskManager(bt, cfg, logger),
+		bt:              bt,
+		logger:          logger,
+		topicToSource:   topicToSource,
+		resolvedSources: resolvedSources,
+		resolvedSinks:   resolvedSinks,
 	}, nil
 }
 
@@ -152,7 +201,7 @@ func (a *Adapter) process(ctx context.Context, in kafka.InRecord) ([]kafka.OutRe
 	if !ok {
 		return nil, fmt.Errorf("runtime: no source for topic %q", in.Topic)
 	}
-	binding := a.bt.Sources[sourceName]
+	binding := a.resolvedSources[sourceName]
 
 	key, err := binding.DecodeKey(in.Key)
 	if err != nil {
@@ -195,12 +244,13 @@ func (a *Adapter) process(ctx context.Context, in kafka.InRecord) ([]kafka.OutRe
 }
 
 // drainSinks collects output records from all sinks, encodes them, and returns
-// the resulting []kafka.OutRecord. Internal sinks (absent from bt.Sinks — e.g.
-// ktable-out-N) are drained and discarded.
+// the resulting []kafka.OutRecord. Internal sinks (absent from resolvedSinks — e.g.
+// ktable-out-N) are drained and discarded. Repartition sinks produce OutRecords
+// with Partition UNSET (IsValid=false) so the murmur2 partitioner routes by key.
 func (a *Adapter) drainSinks(drainFn func(string) ([]topology.Record, error)) ([]kafka.OutRecord, error) {
 	var outs []kafka.OutRecord
 	for _, sinkName := range a.bt.Topology.SinkNames() {
-		sb, ok := a.bt.Sinks[sinkName]
+		sb, ok := a.resolvedSinks[sinkName]
 		if !ok {
 			// Internal sink (e.g. ktable-out-N); drain so the buffer doesn't grow
 			// unboundedly, but discard — no Kafka topic.

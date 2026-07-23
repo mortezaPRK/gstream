@@ -602,3 +602,237 @@ func mustSerialize(t *testing.T, v string) []byte {
 	}
 	return b
 }
+
+// ---------------------------------------------------------------------------
+// RepartitionBinding resolver tests (C3)
+// ---------------------------------------------------------------------------
+
+// buildRepartitionBuiltTopology builds a BuiltTopology with:
+//
+//	source → repartitionSink  (write side; encoded with rb)
+//	repartitionSource → sink  (read side; decoded with rb)
+//
+// This mirrors the shape C2 (repartition.go) will emit.
+func buildRepartitionBuiltTopology(t *testing.T) (*gstream.BuiltTopology, string /*fullTopic*/) {
+	t.Helper()
+
+	b := topology.NewBuilder()
+	src := b.AddSource("source")
+	b.AddSink("repart-sink", src)
+
+	rePartSrc := b.AddSource("repart-source")
+	b.AddSink("final-sink", rePartSrc)
+	topo := b.Build()
+
+	const appID = "testapp"
+	const repartName = "mykey"
+	fullTopic := appID + "-" + repartName + "-repartition"
+
+	strSerde := gstream.JSONSerde[string]{}
+
+	// Encode/decode closures shared between user source and repartition binding.
+	encKey := func(x any) ([]byte, error) { return []byte(x.(string)), nil }
+	decKey := func(raw []byte) (any, error) { return string(raw), nil }
+	encVal := func(x any) ([]byte, error) { return strSerde.Serialize(x.(string)) }
+	decVal := func(raw []byte) (any, error) { return strSerde.Deserialize(raw) }
+
+	bt := &gstream.BuiltTopology{
+		Topology: topo,
+		Sources: map[string]gstream.SourceBinding{
+			"source": {
+				Topic:     "input-topic",
+				DecodeKey: decKey,
+				DecodeVal: decVal,
+			},
+		},
+		Sinks: map[string]gstream.SinkBinding{
+			"final-sink": {
+				Topic:     "output-topic",
+				EncodeKey: encKey,
+				EncodeVal: encVal,
+			},
+		},
+		RepartitionBindings: map[string]gstream.RepartitionBinding{
+			repartName: {
+				Name:       repartName,
+				SinkName:   "repart-sink",
+				SourceName: "repart-source",
+				Partitions: 3,
+				EncodeKey:  encKey,
+				EncodeVal:  encVal,
+				DecodeKey:  decKey,
+				DecodeVal:  decVal,
+			},
+		},
+	}
+	cfg, err := gstream.Configure(
+		gstream.WithName(appID),
+		gstream.WithBrokers("localhost:9092"),
+	)
+	if err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	_ = cfg // returned to caller via appID constant
+	return bt, fullTopic
+}
+
+// TestAdapter_RepartitionSourceTopicsIncluded asserts SourceTopics() includes the
+// repartition full topic and the original source topic.
+func TestAdapter_RepartitionSourceTopicsIncluded(t *testing.T) {
+	bt, fullTopic := buildRepartitionBuiltTopology(t)
+	cfg, err := gstream.Configure(
+		gstream.WithName("testapp"),
+		gstream.WithBrokers("localhost:9092"),
+	)
+	if err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+
+	adapter, err := runtime.NewAdapter(bt, cfg, nil)
+	if err != nil {
+		t.Fatalf("NewAdapter: %v", err)
+	}
+
+	topics := adapter.SourceTopics()
+	topicSet := make(map[string]struct{}, len(topics))
+	for _, tp := range topics {
+		topicSet[tp] = struct{}{}
+	}
+
+	if _, ok := topicSet[fullTopic]; !ok {
+		t.Errorf("SourceTopics missing repartition topic %q; got %v", fullTopic, topics)
+	}
+	if _, ok := topicSet["input-topic"]; !ok {
+		t.Errorf("SourceTopics missing original source topic %q; got %v", "input-topic", topics)
+	}
+}
+
+// TestAdapter_RepartitionSinkRoutesToRepartitionTopic asserts that a record arriving
+// at "source" is routed through repart-sink and produces an OutRecord on the
+// repartition topic with Partition UNSET (IsValid=false — murmur2 path).
+func TestAdapter_RepartitionSinkRoutesToRepartitionTopic(t *testing.T) {
+	bt, fullTopic := buildRepartitionBuiltTopology(t)
+	cfg, err := gstream.Configure(
+		gstream.WithName("testapp"),
+		gstream.WithBrokers("localhost:9092"),
+	)
+	if err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+
+	adapter, err := runtime.NewAdapter(bt, cfg, nil)
+	if err != nil {
+		t.Fatalf("NewAdapter: %v", err)
+	}
+
+	in := kafka.InRecord{
+		Topic:     "input-topic",
+		Partition: 0,
+		Key:       []byte("mykey"),
+		Value:     mustSerialize(t, "hello"),
+		Timestamp: time.Now(),
+	}
+	outs, err := adapter.ProcessFunc()(context.Background(), in)
+	if err != nil {
+		t.Fatalf("process: %v", err)
+	}
+	// repart-sink should produce one record to the repartition topic.
+	// final-sink produces nothing here (repartitionSource not yet fed).
+	var repartOuts []kafka.OutRecord
+	for _, o := range outs {
+		if o.Topic == fullTopic {
+			repartOuts = append(repartOuts, o)
+		}
+	}
+	if len(repartOuts) != 1 {
+		t.Fatalf("expected 1 output on repartition topic %q, got %d total outputs (topics: %v)",
+			fullTopic, len(outs), outTopics(outs))
+	}
+
+	// Partition MUST be unset (IsValid=false) so murmur2 routes by key.
+	if repartOuts[0].Partition.IsValid {
+		t.Errorf("repartition OutRecord Partition must be UNSET (IsValid=false), got IsValid=true value=%d",
+			repartOuts[0].Partition.Value)
+	}
+}
+
+// TestAdapter_RepartitionTopicRoutesToRepartitionSource asserts that a record
+// arriving on the repartition topic is routed to the repartition source node
+// (repart-source) and flows through to the final sink.
+func TestAdapter_RepartitionTopicRoutesToRepartitionSource(t *testing.T) {
+	bt, fullTopic := buildRepartitionBuiltTopology(t)
+	cfg, err := gstream.Configure(
+		gstream.WithName("testapp"),
+		gstream.WithBrokers("localhost:9092"),
+	)
+	if err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+
+	adapter, err := runtime.NewAdapter(bt, cfg, nil)
+	if err != nil {
+		t.Fatalf("NewAdapter: %v", err)
+	}
+
+	// Feed a record on the repartition topic directly (simulates a re-consumed record).
+	in := kafka.InRecord{
+		Topic:     fullTopic,
+		Partition: 1,
+		Key:       []byte("rekey"),
+		Value:     mustSerialize(t, "repartitioned"),
+		Timestamp: time.Now(),
+	}
+	outs, err := adapter.ProcessFunc()(context.Background(), in)
+	if err != nil {
+		t.Fatalf("process repartition topic: %v", err)
+	}
+
+	// Should have one output on "output-topic" (final-sink), none on fullTopic.
+	var finalOuts []kafka.OutRecord
+	for _, o := range outs {
+		if o.Topic == "output-topic" {
+			finalOuts = append(finalOuts, o)
+		}
+	}
+	if len(finalOuts) != 1 {
+		t.Fatalf("expected 1 output on output-topic after repartition re-consume, got %d total (topics: %v)",
+			len(outs), outTopics(outs))
+	}
+}
+
+// TestAdapter_RepartitionNoBindings_RegressionZero confirms that a topology with zero
+// RepartitionBindings behaves identically to before — resolved maps are just copies of
+// bt.Sources/bt.Sinks; no new topics, no new sinks.
+func TestAdapter_RepartitionNoBindings_RegressionZero(t *testing.T) {
+	bt := buildSimpleBuiltTopology(t)
+	// Ensure RepartitionBindings is explicitly nil/empty.
+	bt.RepartitionBindings = nil
+
+	adapter, err := runtime.NewAdapter(bt, unitTestCfg(t), nil)
+	if err != nil {
+		t.Fatalf("NewAdapter: %v", err)
+	}
+
+	topics := adapter.SourceTopics()
+	if len(topics) != 1 || topics[0] != "input-topic" {
+		t.Errorf("zero-repartition: expected [input-topic], got %v", topics)
+	}
+
+	fn := adapter.ProcessFunc()
+	outs, err := fn(context.Background(), inRecord(t, "k", "hello"))
+	if err != nil {
+		t.Fatalf("process: %v", err)
+	}
+	if len(outs) != 1 || outs[0].Topic != "output-topic" {
+		t.Errorf("zero-repartition: expected 1 output on output-topic, got %v", outTopics(outs))
+	}
+}
+
+// outTopics extracts topic names from OutRecords for error messages.
+func outTopics(outs []kafka.OutRecord) []string {
+	topics := make([]string, len(outs))
+	for i, o := range outs {
+		topics[i] = o.Topic
+	}
+	return topics
+}
