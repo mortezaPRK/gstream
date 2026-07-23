@@ -3,8 +3,7 @@
 // pipeline with no broker").
 //
 // The test file lives in package gstream (not gstream_test) so that tests can
-// inspect unexported StreamBuilder fields such as repartitions — used to assert
-// that Map and SelectKey correctly mark repartition boundaries.
+// inspect unexported StreamBuilder fields.
 package gstream
 
 import (
@@ -231,8 +230,7 @@ func TestMapValues_TypeMismatch_ReturnsError(t *testing.T) {
 // Map unit tests
 // ---------------------------------------------------------------------------
 
-// TestMap_ChangesBothTypes verifies that Map transforms both key and value types
-// and sets the repartition marker.
+// TestMap_ChangesBothTypes verifies that Map transforms both key and value types.
 func TestMap_ChangesBothTypes(t *testing.T) {
 	t.Parallel()
 
@@ -264,21 +262,6 @@ func TestMap_ChangesBothTypes(t *testing.T) {
 	if rec.Timestamp != ts {
 		t.Errorf("Timestamp: got %d, want %d", rec.Timestamp, ts)
 	}
-
-	// The Map node must have been registered as a repartition boundary.
-	if len(b.repartitions) == 0 {
-		t.Fatal("expected at least one repartition marker; repartitions map is empty")
-	}
-	foundRepartition := false
-	for name, marked := range b.repartitions {
-		if marked && strings.HasPrefix(name, "map-") {
-			foundRepartition = true
-			break
-		}
-	}
-	if !foundRepartition {
-		t.Errorf("no map-* node found in repartitions; got: %v", b.repartitions)
-	}
 }
 
 // TestMap_TypeMismatch_ReturnsError verifies that a wrong key type causes
@@ -303,7 +286,7 @@ func TestMap_TypeMismatch_ReturnsError(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestSelectKey_ChangesKeyPreservesValue verifies that SelectKey replaces the
-// key, keeps the value unchanged, and sets the repartition marker.
+// key and keeps the value unchanged.
 func TestSelectKey_ChangesKeyPreservesValue(t *testing.T) {
 	t.Parallel()
 
@@ -332,21 +315,6 @@ func TestSelectKey_ChangesKeyPreservesValue(t *testing.T) {
 	}
 	if rec.Timestamp != ts {
 		t.Errorf("Timestamp: got %d, want %d", rec.Timestamp, ts)
-	}
-
-	// The SelectKey node must have been registered as a repartition boundary.
-	if len(b.repartitions) == 0 {
-		t.Fatal("expected at least one repartition marker; repartitions map is empty")
-	}
-	foundRepartition := false
-	for name, marked := range b.repartitions {
-		if marked && strings.HasPrefix(name, "selectkey-") {
-			foundRepartition = true
-			break
-		}
-	}
-	if !foundRepartition {
-		t.Errorf("no selectkey-* node found in repartitions; got: %v", b.repartitions)
 	}
 }
 
@@ -385,8 +353,8 @@ func TestNewStreamBuilder_InitialState(t *testing.T) {
 	if b.sinks == nil {
 		t.Error("sinks map is nil; want empty non-nil map")
 	}
-	if b.repartitions == nil {
-		t.Error("repartitions map is nil; want empty non-nil map")
+	if b.repartitionBindings == nil {
+		t.Error("repartitionBindings map is nil; want empty non-nil map")
 	}
 	if b.internal == nil {
 		t.Error("internal topology.Builder is nil")
@@ -397,8 +365,8 @@ func TestNewStreamBuilder_InitialState(t *testing.T) {
 	if len(b.sinks) != 0 {
 		t.Errorf("sinks: want 0 entries, got %d", len(b.sinks))
 	}
-	if len(b.repartitions) != 0 {
-		t.Errorf("repartitions: want 0 entries, got %d", len(b.repartitions))
+	if len(b.repartitionBindings) != 0 {
+		t.Errorf("repartitionBindings: want 0 entries, got %d", len(b.repartitionBindings))
 	}
 }
 
@@ -471,40 +439,5 @@ func TestBuild_SessionStoreBindings(t *testing.T) {
 	}
 	if got.GraceMs != binding.GraceMs {
 		t.Errorf("GraceMs: got %d, want %d", got.GraceMs, binding.GraceMs)
-	}
-}
-
-// TestRepartitionMarkers_MapAndSelectKeyBothMark verifies that Map and SelectKey
-// set repartitions[name] = true, while Filter and MapValues do not.
-func TestRepartitionMarkers_MapAndSelectKeyBothMark(t *testing.T) {
-	t.Parallel()
-
-	b := NewStreamBuilder()
-	src := Stream[string, string](b, "t", "src", JSONSerde[string]{}, JSONSerde[string]{})
-
-	// Filter and MapValues should NOT mark repartitions.
-	afterFilter := src.Filter(func(k, v string) bool { return true })
-	afterMV := afterFilter.MapValues[int](func(_ string, v string) int { return len(v) })
-
-	// Map and SelectKey SHOULD mark repartitions.
-	afterMap := afterMV.Map[string, string](func(k string, v int) (string, string) {
-		return k, fmt.Sprintf("%d", v)
-	})
-	afterSK := afterMap.SelectKey[int](func(k, v string) int { return len(k) })
-	afterSK.To("t", "sink", JSONSerde[int]{}, JSONSerde[string]{})
-
-	_ = b.Build()
-
-	// Two repartition markers expected (one for Map, one for SelectKey).
-	if len(b.repartitions) != 2 {
-		t.Errorf("expected 2 repartition markers; got %d: %v", len(b.repartitions), b.repartitions)
-	}
-	for name, marked := range b.repartitions {
-		if !marked {
-			t.Errorf("repartition[%q] = false; expected true", name)
-		}
-		if !strings.HasPrefix(name, "map-") && !strings.HasPrefix(name, "selectkey-") {
-			t.Errorf("unexpected repartition node name %q", name)
-		}
 	}
 }

@@ -11,26 +11,26 @@ import (
 // Operator methods (Filter, Map, SelectKey, etc.) are defined in operators.go
 // (same package).
 type StreamBuilder struct {
-	internal      *topology.Builder
-	counter       int
-	sources       map[string]SourceBinding
-	sinks         map[string]SinkBinding
-	repartitions  map[string]bool
-	stores        map[string]StoreBinding
-	windowStores  map[string]WindowStoreBinding
-	sessionStores map[string]SessionStoreBinding
+	internal            *topology.Builder
+	counter             int
+	sources             map[string]SourceBinding
+	sinks               map[string]SinkBinding
+	repartitionBindings map[string]RepartitionBinding
+	stores              map[string]StoreBinding
+	windowStores        map[string]WindowStoreBinding
+	sessionStores       map[string]SessionStoreBinding
 }
 
 // NewStreamBuilder creates and returns a new StreamBuilder.
 func NewStreamBuilder() *StreamBuilder {
 	return &StreamBuilder{
-		internal:      topology.NewBuilder(),
-		sources:       make(map[string]SourceBinding),
-		sinks:         make(map[string]SinkBinding),
-		repartitions:  make(map[string]bool),
-		stores:        make(map[string]StoreBinding),
-		windowStores:  make(map[string]WindowStoreBinding),
-		sessionStores: make(map[string]SessionStoreBinding),
+		internal:            topology.NewBuilder(),
+		sources:             make(map[string]SourceBinding),
+		sinks:               make(map[string]SinkBinding),
+		repartitionBindings: make(map[string]RepartitionBinding),
+		stores:              make(map[string]StoreBinding),
+		windowStores:        make(map[string]WindowStoreBinding),
+		sessionStores:       make(map[string]SessionStoreBinding),
 	}
 }
 
@@ -128,6 +128,47 @@ type SessionStoreBinding struct {
 	GraceMs int64
 }
 
+// RepartitionBinding is the type-erased serde pair for a repartition topic that
+// sits between a key-changing operator (Map, SelectKey) and its downstream
+// consumer. It combines the encode shape of SinkBinding with the decode shape of
+// SourceBinding so the C3 adapter resolver can register it into resolvedSinks and
+// resolvedSources with zero special-casing.
+//
+// Name is the bare logical name; the runtime derives the full Kafka topic as
+// <AppID>-<Name>-repartition. SinkName and SourceName are the DAG node names
+// that the topology uses for the write and read sides respectively.
+// Partitions is the desired partition count — must match any co-grouped or joined
+// topics, enforced by C4 (admin validation).
+type RepartitionBinding struct {
+	// Name is the bare logical identifier; runtime forms <AppID>-<Name>-repartition.
+	Name string
+
+	// SinkName is the topology sink node name for the write side.
+	SinkName string
+
+	// SourceName is the topology source node name for the read side.
+	SourceName string
+
+	// Partitions is the desired partition count for the repartition topic.
+	Partitions int32
+
+	// EncodeKey serializes an any value (underlying concrete type K) into bytes.
+	// Mirrors SinkBinding.EncodeKey exactly.
+	EncodeKey func(any) ([]byte, error)
+
+	// EncodeVal serializes an any value (underlying concrete type V) into bytes.
+	// Mirrors SinkBinding.EncodeVal exactly.
+	EncodeVal func(any) ([]byte, error)
+
+	// DecodeKey deserializes a raw Kafka key byte slice.
+	// Mirrors SourceBinding.DecodeKey exactly.
+	DecodeKey func([]byte) (any, error)
+
+	// DecodeVal deserializes a raw Kafka value byte slice.
+	// Mirrors SourceBinding.DecodeVal exactly.
+	DecodeVal func([]byte) (any, error)
+}
+
 // BuiltTopology is the immutable, sealed output of StreamBuilder.Build().
 // After Build() the StreamBuilder must not be used further.
 type BuiltTopology struct {
@@ -139,6 +180,10 @@ type BuiltTopology struct {
 
 	// Sinks maps sink node names to their type-erased encode bindings.
 	Sinks map[string]SinkBinding
+
+	// RepartitionBindings maps logical repartition names to their combined
+	// encode+decode bindings. Populated by Build(); consumed by C3 (adapter).
+	RepartitionBindings map[string]RepartitionBinding
 
 	// StoreBindings maps store names to their type-erased serde bindings.
 	StoreBindings map[string]StoreBinding
@@ -201,14 +246,12 @@ func (s KStream[K, V]) To(topic, sinkName string, keySerde Serde[K], valSerde Se
 
 // Build seals the topology and returns an immutable BuiltTopology.
 // After Build() the StreamBuilder must not be used further.
-//
-// Repartition topics (key-changing operators such as Map, SelectKey) are tracked
-// in b.repartitions but not yet wired; repartition topic management is deferred.
 func (b *StreamBuilder) Build() *BuiltTopology {
 	return &BuiltTopology{
 		Topology:             b.internal.Build(),
 		Sources:              b.sources,
 		Sinks:                b.sinks,
+		RepartitionBindings:  b.repartitionBindings,
 		StoreBindings:        b.stores,
 		WindowStoreBindings:  b.windowStores,
 		SessionStoreBindings: b.sessionStores,

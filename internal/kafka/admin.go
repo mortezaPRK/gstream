@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	gstream "github.com/mortezaPRK/gstream"
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kmsg"
@@ -79,6 +80,34 @@ func EnsureTopics(ctx context.Context, brokers []string, specs []TopicSpec) erro
 	}
 
 	return createTopicSpecs(ctx, cl, missing)
+}
+
+// EnsureRepartitionTopics idempotently creates the repartition topics declared
+// in bt.RepartitionBindings. For each binding the full topic name is formed as
+// <cfg.ApplicationID>-<rb.Name>-repartition and the topic is created with:
+//   - Partitions = rb.Partitions (the declared co-partition count; callers set
+//     this to match the co-grouped topics — use ValidateCoPartitioned if you
+//     want to assert alignment at startup).
+//   - cleanup.policy=delete (repartition topics are transient, NOT compacted).
+//
+// Empty RepartitionBindings → nil. Topic-already-exists is not an error
+// (idempotent, same behaviour as EnsureTopics).
+func EnsureRepartitionTopics(ctx context.Context, cfg gstream.Config, bt *gstream.BuiltTopology) error {
+	if len(bt.RepartitionBindings) == 0 {
+		return nil
+	}
+
+	specs := make([]TopicSpec, 0, len(bt.RepartitionBindings))
+	for _, rb := range bt.RepartitionBindings {
+		fullTopic := cfg.ApplicationID + "-" + rb.Name + "-repartition"
+		specs = append(specs, TopicSpec{
+			Name:              fullTopic,
+			Partitions:        rb.Partitions,
+			ReplicationFactor: 1,
+			Configs:           map[string]string{"cleanup.policy": "delete"},
+		})
+	}
+	return EnsureTopics(ctx, cfg.Brokers, specs)
 }
 
 // topicMeta holds the summary information returned by a Metadata response.
