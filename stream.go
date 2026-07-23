@@ -11,24 +11,26 @@ import (
 // Operator methods (Filter, Map, SelectKey, etc.) are defined in operators.go
 // (same package).
 type StreamBuilder struct {
-	internal     *topology.Builder
-	counter      int
-	sources      map[string]SourceBinding
-	sinks        map[string]SinkBinding
-	repartitions map[string]bool
-	stores       map[string]StoreBinding
-	windowStores map[string]WindowStoreBinding
+	internal      *topology.Builder
+	counter       int
+	sources       map[string]SourceBinding
+	sinks         map[string]SinkBinding
+	repartitions  map[string]bool
+	stores        map[string]StoreBinding
+	windowStores  map[string]WindowStoreBinding
+	sessionStores map[string]SessionStoreBinding
 }
 
 // NewStreamBuilder creates and returns a new StreamBuilder.
 func NewStreamBuilder() *StreamBuilder {
 	return &StreamBuilder{
-		internal:     topology.NewBuilder(),
-		sources:      make(map[string]SourceBinding),
-		sinks:        make(map[string]SinkBinding),
-		repartitions: make(map[string]bool),
-		stores:       make(map[string]StoreBinding),
-		windowStores: make(map[string]WindowStoreBinding),
+		internal:      topology.NewBuilder(),
+		sources:       make(map[string]SourceBinding),
+		sinks:         make(map[string]SinkBinding),
+		repartitions:  make(map[string]bool),
+		stores:        make(map[string]StoreBinding),
+		windowStores:  make(map[string]WindowStoreBinding),
+		sessionStores: make(map[string]SessionStoreBinding),
 	}
 }
 
@@ -115,6 +117,17 @@ type WindowStoreBinding struct {
 	GraceMs int64
 }
 
+// SessionStoreBinding extends StoreBinding with session-specific metadata.
+// GapMs is the inactivity gap that closes a session; GraceMs is the late-record
+// grace period. Both are in milliseconds.
+type SessionStoreBinding struct {
+	StoreBinding
+	// GapMs is the session inactivity gap in milliseconds.
+	GapMs int64
+	// GraceMs is the late-record grace period in milliseconds.
+	GraceMs int64
+}
+
 // BuiltTopology is the immutable, sealed output of StreamBuilder.Build().
 // After Build() the StreamBuilder must not be used further.
 type BuiltTopology struct {
@@ -132,6 +145,9 @@ type BuiltTopology struct {
 
 	// WindowStoreBindings maps window store names to their serde + window metadata bindings.
 	WindowStoreBindings map[string]WindowStoreBinding
+
+	// SessionStoreBindings maps session store names to their serde + session metadata bindings.
+	SessionStoreBindings map[string]SessionStoreBinding
 }
 
 // Stream registers a typed source node in the topology and returns a KStream[K,V].
@@ -190,10 +206,11 @@ func (s KStream[K, V]) To(topic, sinkName string, keySerde Serde[K], valSerde Se
 // in b.repartitions but not yet wired; repartition topic management is deferred.
 func (b *StreamBuilder) Build() *BuiltTopology {
 	return &BuiltTopology{
-		Topology:            b.internal.Build(),
-		Sources:             b.sources,
-		Sinks:               b.sinks,
-		StoreBindings:       b.stores,
-		WindowStoreBindings: b.windowStores,
+		Topology:             b.internal.Build(),
+		Sources:              b.sources,
+		Sinks:                b.sinks,
+		StoreBindings:        b.stores,
+		WindowStoreBindings:  b.windowStores,
+		SessionStoreBindings: b.sessionStores,
 	}
 }
