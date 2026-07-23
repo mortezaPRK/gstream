@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"log/slog"
 	"path/filepath"
@@ -120,8 +121,9 @@ func (tm *TaskManager) PostBatch(ctx context.Context) error {
 		}
 
 		// Retention sweep runs before the changelog flush so tombstones for expired
-		// windows are drained and flushed in the same batch (amortized).
-		if len(tm.bt.WindowStoreBindings) > 0 {
+		// windows/sessions are drained and flushed in the same batch (amortized).
+		// [SESSION-FROZEN-EXT] OR-extension: runSweep handles both window + session stores.
+		if len(tm.bt.WindowStoreBindings) > 0 || len(tm.bt.SessionStoreBindings) > 0 {
 			if err := tm.runSweep(t); err != nil {
 				return fmt.Errorf("TaskManager.PostBatch: partition %d: sweep: %w", partition, err)
 			}
@@ -141,7 +143,8 @@ func (tm *TaskManager) PostBatch(ctx context.Context) error {
 			}
 		}
 
-		if len(tm.bt.WindowStoreBindings) > 0 {
+		// [SESSION-FROZEN-EXT] OR-extension: persist stream-time for session topologies too.
+		if len(tm.bt.WindowStoreBindings) > 0 || len(tm.bt.SessionStoreBindings) > 0 {
 			if err := state.WriteStreamTime(t.db, t.streamTime); err != nil {
 				// Non-fatal: on crash, stream-time will be rebuilt from redelivered records.
 				tm.logger.Warn("PostBatch: WriteStreamTime failed",
@@ -196,7 +199,8 @@ func (tm *TaskManager) Executor(partition int32) *topology.Executor {
 	if t, ok := tm.tasks[partition]; ok {
 		return t.executor
 	}
-	if len(tm.bt.StoreBindings) == 0 && len(tm.bt.WindowStoreBindings) == 0 {
+	// [SESSION-FROZEN-EXT] OR-extension: session-only topology also has stores.
+	if len(tm.bt.StoreBindings) == 0 && len(tm.bt.WindowStoreBindings) == 0 && len(tm.bt.SessionStoreBindings) == 0 {
 		t := &task{
 			db:         nil,
 			collectors: make(map[string]*state.MutationCollector),
@@ -213,13 +217,17 @@ func (tm *TaskManager) Executor(partition int32) *topology.Executor {
 }
 
 // allChangelogTopics returns a map of storeName → full changelog topic for all
-// store bindings (regular + windowed). Used by WriteCheckpoints and closeTask.
+// store bindings (regular + windowed + session). Used by WriteCheckpoints and closeTask.
 func (tm *TaskManager) allChangelogTopics() map[string]string {
-	out := make(map[string]string, len(tm.bt.StoreBindings)+len(tm.bt.WindowStoreBindings))
+	out := make(map[string]string, len(tm.bt.StoreBindings)+len(tm.bt.WindowStoreBindings)+len(tm.bt.SessionStoreBindings))
 	for storeName, binding := range tm.bt.StoreBindings {
 		out[storeName] = tm.appID + "-" + binding.ChangelogTopic + "-changelog"
 	}
 	for storeName, binding := range tm.bt.WindowStoreBindings {
+		out[storeName] = tm.appID + "-" + binding.ChangelogTopic + "-changelog"
+	}
+	// [SESSION-FROZEN-EXT] OR-extension: add session store changelog topics.
+	for storeName, binding := range tm.bt.SessionStoreBindings {
 		out[storeName] = tm.appID + "-" + binding.ChangelogTopic + "-changelog"
 	}
 	return out
@@ -228,7 +236,8 @@ func (tm *TaskManager) allChangelogTopics() map[string]string {
 // openTask creates and restores a single per-partition task. Called from OnAssigned.
 // Zero-store topologies skip Pebble entirely; an Executor is still created.
 func (tm *TaskManager) openTask(ctx context.Context, partition int32) error {
-	totalStores := len(tm.bt.StoreBindings) + len(tm.bt.WindowStoreBindings)
+	// [SESSION-FROZEN-EXT] OR-extension: include session stores in total count.
+	totalStores := len(tm.bt.StoreBindings) + len(tm.bt.WindowStoreBindings) + len(tm.bt.SessionStoreBindings)
 	stores := make(map[string]any, totalStores)
 	collectors := make(map[string]*state.MutationCollector, totalStores)
 	producers := make(map[string]*state.ChangelogProducer, totalStores)
@@ -334,8 +343,48 @@ func (tm *TaskManager) openTask(ctx context.Context, partition int32) error {
 		producers[storeName] = producer
 	}
 
+	// [SESSION-FROZEN-EXT] Session store wiring — mirrors window store loop above.
+	for storeName, binding := range tm.bt.SessionStoreBindings {
+		changelogTopic := tm.appID + "-" + binding.ChangelogTopic + "-changelog"
+
+		checkpoint, found, err := state.ReadCheckpoint(db, storeName)
+		if err != nil {
+			_ = db.Close()
+			return fmt.Errorf("ReadCheckpoint session store %q: %w", storeName, err)
+		}
+		if !found {
+			checkpoint = -1
+		}
+
+		_, err = state.RestoreFromChangelog(ctx, tm.cfg.Brokers, changelogTopic, partition, checkpoint, db, storeName)
+		if err != nil {
+			_ = db.Close()
+			return fmt.Errorf("RestoreFromChangelog session store %q partition %d: %w", storeName, partition, err)
+		}
+
+		collector := &state.MutationCollector{}
+		producer, err := state.NewChangelogProducer(tm.cfg.Brokers, changelogTopic)
+		if err != nil {
+			_ = db.Close()
+			return fmt.Errorf("NewChangelogProducer session store %q: %w", storeName, err)
+		}
+
+		store := state.NewKeyValueStoreWithChangelog[[]byte, []byte](
+			storeName,
+			db,
+			gstream.BytesSerde{},
+			gstream.BytesSerde{},
+			collector,
+		)
+
+		stores[storeName] = store
+		collectors[storeName] = collector
+		producers[storeName] = producer
+	}
+
 	var streamTime int64
-	if len(tm.bt.WindowStoreBindings) > 0 {
+	// [SESSION-FROZEN-EXT] OR-extension: use stream-time executor for session stores too.
+	if len(tm.bt.WindowStoreBindings) > 0 || len(tm.bt.SessionStoreBindings) > 0 {
 		ts, _, err := state.ReadStreamTime(db)
 		if err != nil {
 			for _, p := range producers {
@@ -358,7 +407,8 @@ func (tm *TaskManager) openTask(ctx context.Context, partition int32) error {
 		streamTime: streamTime,
 	}
 
-	if len(tm.bt.WindowStoreBindings) > 0 {
+	// [SESSION-FROZEN-EXT] OR-extension: NewExecutorWithStreamTime when session stores present.
+	if len(tm.bt.WindowStoreBindings) > 0 || len(tm.bt.SessionStoreBindings) > 0 {
 		t.executor = topology.NewExecutorWithStreamTime(tm.bt.Topology, stores, &t.streamTime)
 	} else {
 		t.executor = topology.NewExecutor(tm.bt.Topology, stores)
@@ -372,6 +422,7 @@ func (tm *TaskManager) openTask(ctx context.Context, partition int32) error {
 		slog.Int("partition", int(partition)),
 		slog.Int("stores", len(tm.bt.StoreBindings)),
 		slog.Int("windowStores", len(tm.bt.WindowStoreBindings)),
+		slog.Int("sessionStores", len(tm.bt.SessionStoreBindings)),
 	)
 	return nil
 }
@@ -407,7 +458,8 @@ func (tm *TaskManager) closeTask(ctx context.Context, partition int32) {
 		}
 	}
 
-	if len(tm.bt.WindowStoreBindings) > 0 {
+	// [SESSION-FROZEN-EXT] OR-extension: persist stream-time when session stores present.
+	if len(tm.bt.WindowStoreBindings) > 0 || len(tm.bt.SessionStoreBindings) > 0 {
 		if err := state.WriteStreamTime(t.db, t.streamTime); err != nil {
 			tm.logger.Warn("closeTask: WriteStreamTime failed",
 				slog.Int("partition", int(partition)),
@@ -443,11 +495,19 @@ func (tm *TaskManager) closeTask(ctx context.Context, partition int32) {
 	tm.logger.Info("task closed", slog.Int("partition", int(partition)))
 }
 
-// computeSweepInterval returns the maximum MaxSizeMs across all window store bindings.
+// computeSweepInterval returns the maximum retention interval across all window
+// and session store bindings. For sessions, GapMs is the candidate (the inactivity
+// gap drives the retention clock, not grace alone).
 func (tm *TaskManager) computeSweepInterval() int64 {
 	var maxSize int64
 	for _, binding := range tm.bt.WindowStoreBindings {
 		if s := binding.WindowDef.MaxSizeMs(); s > maxSize {
+			maxSize = s
+		}
+	}
+	// [SESSION-FROZEN-EXT] OR-extension: include session GapMs as a candidate.
+	for _, binding := range tm.bt.SessionStoreBindings {
+		if s := binding.GapMs; s > maxSize {
 			maxSize = s
 		}
 	}
@@ -474,6 +534,16 @@ func (tm *TaskManager) runSweep(t *task) error {
 		}
 		if _, err := sweepWindowStore(store, binding.WindowDef, binding.GraceMs, t.streamTime); err != nil {
 			return fmt.Errorf("runSweep: store %q: %w", storeName, err)
+		}
+	}
+	// [SESSION-FROZEN-EXT] Session sweep — appended loop, no change to window path.
+	for storeName, binding := range tm.bt.SessionStoreBindings {
+		store, ok := t.stores[storeName].(*state.KeyValueStore[[]byte, []byte])
+		if !ok {
+			return fmt.Errorf("runSweep: session store %q: unexpected type %T", storeName, t.stores[storeName])
+		}
+		if _, err := sweepSessionStore(store, binding.GapMs, binding.GraceMs, t.streamTime); err != nil {
+			return fmt.Errorf("runSweep: session store %q: %w", storeName, err)
 		}
 	}
 	t.lastSweepTime = t.streamTime
@@ -531,6 +601,68 @@ func sweepWindowStore(
 	for _, ck := range expired {
 		if err := store.Delete(ck); err != nil {
 			return 0, fmt.Errorf("sweepWindowStore: delete expired window key: %w", err)
+		}
+	}
+	return len(expired), nil
+}
+
+// sweepSessionStore scans every entry in store and deletes those whose session END
+// is before the expiry boundary (streamTime - gapMs - graceMs).
+// Returns the number of entries deleted.
+//
+// SESSION VALUE FORMAT: int64(sessionEnd) big-endian (8 bytes) ‖ accumulatorBytes.
+// We decode sessionEnd inline (binary.BigEndian, len-guarded) rather than calling
+// gstream.DecodeSessionValue to decouple T4 from T3's timing — the format is fixed.
+//
+// ITERATE-ALL (not a front-scan): session composite keys sort by
+//
+//	(uint32(len(kBytes)), kBytes, int64(sessionStart))
+//
+// so expired sessions (identified by END, not start) are scattered across the full
+// key space. Only a full store scan and per-value sEnd check is correct.
+//
+// Each store.WindowDelete appends a tombstone Mutation to the store's MutationCollector.
+// The caller (PostBatch) drains the collector and flushes tombstones to the changelog.
+func sweepSessionStore(
+	store *state.KeyValueStore[[]byte, []byte],
+	gapMs, graceMs, streamTime int64,
+) (int, error) {
+	expiryBoundary := streamTime - gapMs - graceMs
+	if expiryBoundary <= 0 {
+		return 0, nil
+	}
+
+	type expiredEntry struct {
+		kBytes     []byte
+		sessionStart int64
+	}
+
+	var expired []expiredEntry
+	if err := store.Range(func(compositeKey, val []byte) bool {
+		kBytes, sessionStart, decErr := state.DecodeWindowCompositeKey(compositeKey)
+		if decErr != nil {
+			// Malformed composite key: skip.
+			return true
+		}
+		// Decode sessionEnd from the first 8 bytes of val (BE int64).
+		if len(val) < 8 {
+			// Malformed value: skip.
+			return true
+		}
+		sEnd := int64(binary.BigEndian.Uint64(val[:8]))
+		if sEnd < expiryBoundary {
+			kCopy := make([]byte, len(kBytes))
+			copy(kCopy, kBytes)
+			expired = append(expired, expiredEntry{kBytes: kCopy, sessionStart: sessionStart})
+		}
+		return true // always continue — all entries must be examined
+	}); err != nil {
+		return 0, fmt.Errorf("sweepSessionStore: full-store range scan: %w", err)
+	}
+
+	for _, e := range expired {
+		if err := store.WindowDelete(e.kBytes, e.sessionStart); err != nil {
+			return 0, fmt.Errorf("sweepSessionStore: delete expired session key: %w", err)
 		}
 	}
 	return len(expired), nil

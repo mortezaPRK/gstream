@@ -84,7 +84,7 @@ func NewAdapter(bt *gstream.BuiltTopology, cfg gstream.Config, logger *slog.Logg
 
 	// Internal sinks (absent from bt.Sinks — e.g. ktable-out-N) are valid for
 	// stateful topologies; for zero-store topologies all sinks must have bindings.
-	hasStores := len(bt.StoreBindings) > 0 || len(bt.WindowStoreBindings) > 0
+	hasStores := len(bt.StoreBindings) > 0 || len(bt.WindowStoreBindings) > 0 || len(bt.SessionStoreBindings) > 0
 	for _, sinkName := range bt.Topology.SinkNames() {
 		if _, ok := bt.Sinks[sinkName]; !ok {
 			if !hasStores {
