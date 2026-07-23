@@ -169,11 +169,11 @@ func TestOpenTask_SessionOnly_UsesStreamTimeExecutor(t *testing.T) {
 	// Build a BuiltTopology with a session store binding only (no window stores).
 	// We build it manually since the session DSL (T3) may not be landed yet.
 	bt := &gstream.BuiltTopology{
-		Topology:             nil, // not needed for these assertions
-		Sources:              map[string]gstream.SourceBinding{},
-		Sinks:                map[string]gstream.SinkBinding{},
-		StoreBindings:        map[string]gstream.StoreBinding{},
-		WindowStoreBindings:  map[string]gstream.WindowStoreBinding{},
+		Topology:            nil, // not needed for these assertions
+		Sources:             map[string]gstream.SourceBinding{},
+		Sinks:               map[string]gstream.SinkBinding{},
+		StoreBindings:       map[string]gstream.StoreBinding{},
+		WindowStoreBindings: map[string]gstream.WindowStoreBinding{},
 		SessionStoreBindings: map[string]gstream.SessionStoreBinding{
 			"my-sess": {
 				StoreBinding: gstream.StoreBinding{

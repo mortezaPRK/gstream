@@ -219,6 +219,7 @@ func (s TimeWindowedStream[K, V]) Aggregate[A any](
 		GraceMs:   graceMs,
 	}
 
+	// keySerde unset: windowed/session KTables are not stream-joinable in P4a (key is Windowed[K]).
 	return KTable[Windowed[K], A]{
 		builder:   s.builder,
 		nodeName:  name,

@@ -633,7 +633,7 @@ func sweepSessionStore(
 	}
 
 	type expiredEntry struct {
-		kBytes     []byte
+		kBytes       []byte
 		sessionStart int64
 	}
 

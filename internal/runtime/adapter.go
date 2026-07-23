@@ -33,10 +33,10 @@ import (
 // Adapter is NOT safe for concurrent use. kafka.Client calls ProcessFunc
 // sequentially from a single goroutine.
 type Adapter struct {
-	taskManager *TaskManager
-	bt          *gstream.BuiltTopology
-	logger      *slog.Logger
-	sourceName  string
+	taskManager   *TaskManager
+	bt            *gstream.BuiltTopology
+	logger        *slog.Logger
+	topicToSource map[string]string // Kafka topic → topology source-node name
 }
 
 // NewAdapter constructs an Adapter driven by a *gstream.BuiltTopology.
@@ -46,15 +46,15 @@ type Adapter struct {
 //
 // Constraints:
 //   - bt must not be nil.
-//   - bt.Topology must have exactly one source node.
+//   - bt.Topology must have at least one source node.
 //   - Every source in bt.Topology.SourceNames() must have a matching entry in bt.Sources.
 //   - For zero-store topologies every sink must have a matching entry in bt.Sinks.
 //   - For stateful topologies internal sinks (e.g. ktable-out-N) absent from bt.Sinks
 //     are silently skipped.
 //
-// Wire LifecycleCallbacks and PostBatchHook into the kafka.Client:
+// Wire LifecycleCallbacks, PostBatchHook, and SourceTopics into the kafka.Client:
 //
-//	client, _ := kafka.New(cfg, topics, logger,
+//	client, _ := kafka.New(cfg, adapter.SourceTopics(), logger,
 //	    kafka.WithLifecycle(adapter.LifecycleCallbacks()),
 //	    kafka.WithPostBatch(adapter.PostBatchHook()),
 //	)
@@ -67,19 +67,27 @@ func NewAdapter(bt *gstream.BuiltTopology, cfg gstream.Config, logger *slog.Logg
 	}
 
 	srcs := bt.Topology.SourceNames()
-	if len(srcs) != 1 {
-		return nil, fmt.Errorf(
-			"runtime.NewAdapter: requires exactly one source node, got %d: %v",
-			len(srcs), srcs,
-		)
+	if len(srcs) == 0 {
+		return nil, fmt.Errorf("runtime.NewAdapter: topology has no source nodes")
 	}
-	sourceName := srcs[0]
 
-	if _, ok := bt.Sources[sourceName]; !ok {
-		return nil, fmt.Errorf(
-			"runtime.NewAdapter: source %q has no entry in bt.Sources",
-			sourceName,
-		)
+	// Build topic → source-node-name map; validate every source has a binding.
+	topicToSource := make(map[string]string, len(srcs))
+	for _, name := range srcs {
+		binding, ok := bt.Sources[name]
+		if !ok {
+			return nil, fmt.Errorf(
+				"runtime.NewAdapter: source %q has no entry in bt.Sources",
+				name,
+			)
+		}
+		if existing, dup := topicToSource[binding.Topic]; dup {
+			return nil, fmt.Errorf(
+				"runtime.NewAdapter: sources %q and %q map to the same topic %q",
+				existing, name, binding.Topic,
+			)
+		}
+		topicToSource[binding.Topic] = name
 	}
 
 	// Internal sinks (absent from bt.Sinks — e.g. ktable-out-N) are valid for
@@ -98,11 +106,22 @@ func NewAdapter(bt *gstream.BuiltTopology, cfg gstream.Config, logger *slog.Logg
 	}
 
 	return &Adapter{
-		taskManager: NewTaskManager(bt, cfg, logger),
-		bt:          bt,
-		logger:      logger,
-		sourceName:  sourceName,
+		taskManager:   NewTaskManager(bt, cfg, logger),
+		bt:            bt,
+		logger:        logger,
+		topicToSource: topicToSource,
 	}, nil
+}
+
+// SourceTopics returns the list of Kafka topics this Adapter consumes — one per
+// source node in the topology. Pass this to kafka.New as the topics argument so
+// the client subscribes to all source topics.
+func (a *Adapter) SourceTopics() []string {
+	topics := make([]string, 0, len(a.topicToSource))
+	for topic := range a.topicToSource {
+		topics = append(topics, topic)
+	}
+	return topics
 }
 
 // LifecycleCallbacks returns the onAssigned and onRevoked callbacks for wiring
@@ -129,7 +148,11 @@ func (a *Adapter) ProcessFunc() kafka.ProcessFunc {
 }
 
 func (a *Adapter) process(ctx context.Context, in kafka.InRecord) ([]kafka.OutRecord, error) {
-	binding := a.bt.Sources[a.sourceName]
+	sourceName, ok := a.topicToSource[in.Topic]
+	if !ok {
+		return nil, fmt.Errorf("runtime: no source for topic %q", in.Topic)
+	}
+	binding := a.bt.Sources[sourceName]
 
 	key, err := binding.DecodeKey(in.Key)
 	if err != nil {
@@ -163,7 +186,7 @@ func (a *Adapter) process(ctx context.Context, in kafka.InRecord) ([]kafka.OutRe
 	if exec == nil {
 		return nil, fmt.Errorf("runtime: no task for partition %d (not yet assigned or already revoked)", in.Partition)
 	}
-	if err := exec.Process(ctx, a.sourceName, rec); err != nil {
+	if err := exec.Process(ctx, sourceName, rec); err != nil {
 		return nil, fmt.Errorf("runtime: topology: %w", err)
 	}
 	return a.drainSinks(func(sinkName string) ([]topology.Record, error) {

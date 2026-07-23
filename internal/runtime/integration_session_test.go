@@ -116,14 +116,14 @@ func TestE2E_SessionCountRestoreAfterRestart(t *testing.T) {
 
 	// Session boundaries for assertions.
 	const (
-		sessionAStart1    = int64(1_000)  // merged session start after bridge
-		sessionAEnd1      = int64(16_000) // merged session end after bridge
-		sessionAStart2    = int64(14_000) // merged-away session (must be tombstoned)
-		sessionBStart     = int64(50_000)
-		phaseACount       = int64(5) // count for merged session a[1000,16000]
-		phaseBCount       = int64(1) // count for b[50000,50000]
-		postRestoreCount  = int64(6) // count for a[1000,17000] after restore + a@17000
-		postRestoreTsMs   = int64(17_000)
+		sessionAStart1   = int64(1_000)  // merged session start after bridge
+		sessionAEnd1     = int64(16_000) // merged session end after bridge
+		sessionAStart2   = int64(14_000) // merged-away session (must be tombstoned)
+		sessionBStart    = int64(50_000)
+		phaseACount      = int64(5) // count for merged session a[1000,16000]
+		phaseBCount      = int64(1) // count for b[50000,50000]
+		postRestoreCount = int64(6) // count for a[1000,17000] after restore + a@17000
+		postRestoreTsMs  = int64(17_000)
 	)
 
 	// 2. Temp state dir.

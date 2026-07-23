@@ -158,8 +158,9 @@ func TestSessionCount_Basic(t *testing.T) {
 // streamTime=70000, lateBoundary=70000-15000-30000=25000.
 //
 // Out-of-order bridge record at ts=45000 (> lateBoundary=25000 → ACCEPTED):
-//   A=[20000,30000]: sEnd(30000)+15000=45000>=45000 ✓; sStart(20000)-15000=5000<=45000 ✓ → MATCH
-//   B=[60000,70000]: sEnd(70000)+15000=85000>=45000 ✓; sStart(60000)-15000=45000<=45000 ✓ → MATCH
+//
+//	A=[20000,30000]: sEnd(30000)+15000=45000>=45000 ✓; sStart(20000)-15000=5000<=45000 ✓ → MATCH
+//	B=[60000,70000]: sEnd(70000)+15000=85000>=45000 ✓; sStart(60000)-15000=45000<=45000 ✓ → MATCH
 //
 // Both match → merged into [20000,70000], count=5.
 func TestSessionCount_Bridging(t *testing.T) {
@@ -391,20 +392,25 @@ func readSessionA[A any](t *testing.T, byteStore *state.KeyValueStore[[]byte, []
 // streamTime=50000, lateBoundary=50000-10000-30000=10000.
 //
 // Bridge record at ts=30000 (>lateBoundary=10000 → accepted):
-//   A=[1000,1000]:   sEnd(1000)+10000=11000 >= 30000? NO → does NOT match A.
-//   B=[50000,50000]: sEnd(50000)+10000=60000>=30000 ✓; sStart(50000)-10000=40000<=30000? NO → does NOT match B.
+//
+//	A=[1000,1000]:   sEnd(1000)+10000=11000 >= 30000? NO → does NOT match A.
+//	B=[50000,50000]: sEnd(50000)+10000=60000>=30000 ✓; sStart(50000)-10000=40000<=30000? NO → does NOT match B.
 //
 // Hmm, need to reconsider the gap to make them both match.  Use gap=30s=30000ms:
-//   A=[1000,1000]:   sEnd(1000)+30000=31000>=30000 ✓; sStart(1000)-30000=-29000<=30000 ✓ → MATCH
-//   B=[50000,50000]: sEnd(50000)+30000=80000>=30000 ✓; sStart(50000)-30000=20000<=30000 ✓ → MATCH
-//   lateBoundary = 50000-30000-30000 = -10000 < 30000 → accepted.
+//
+//	A=[1000,1000]:   sEnd(1000)+30000=31000>=30000 ✓; sStart(1000)-30000=-29000<=30000 ✓ → MATCH
+//	B=[50000,50000]: sEnd(50000)+30000=80000>=30000 ✓; sStart(50000)-30000=20000<=30000 ✓ → MATCH
+//	lateBoundary = 50000-30000-30000 = -10000 < 30000 → accepted.
 //
 // Merge with old (buggy) code: mergedAcc = min(100, A.acc=101) = 100,
-//                              mergedAcc = min(100, B.acc=101) = 100,
-//                              mergedAcc = aggFn("k","v",100) = 101.
+//
+//	mergedAcc = min(100, B.acc=101) = 100,
+//	mergedAcc = aggFn("k","v",100) = 101.
+//
 // Merge with new (correct) code: mergedAcc = A.acc = 101,
-//                                mergedAcc = min(101, B.acc=101) = 101,
-//                                mergedAcc = aggFn("k","v",101) = 102.
+//
+//	mergedAcc = min(101, B.acc=101) = 101,
+//	mergedAcc = aggFn("k","v",101) = 102.
 //
 // Assert merged acc == 102.
 func TestSessionAggregate_NonIdentityMerge(t *testing.T) {
@@ -423,8 +429,8 @@ func TestSessionAggregate_NonIdentityMerge(t *testing.T) {
 
 	_, _, exec, byteStore := newSessionAggregate(
 		t,
-		30*time.Second,  // gap
-		30*time.Second,  // grace
+		30*time.Second, // gap
+		30*time.Second, // grace
 		"non-identity",
 		initFn,
 		aggFn,

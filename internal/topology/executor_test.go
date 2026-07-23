@@ -283,6 +283,123 @@ func TestExecutorConcurrencySafety(t *testing.T) {
 	}
 }
 
+// TestExecutor_MultiSource_SharedStore is the P4a-C0 spike test.
+// It proves that a single Executor can drive TWO source nodes sharing ONE stores
+// map, so a processor on source-A can see state written by a processor on source-B.
+// This de-risks the load-bearing assumption for stream-table join (P4a).
+//
+// Topology shape:
+//
+//	source-B → table-agg (puts key→value into store "t")
+//	source-A → join      (gets key from store "t"; forwards joined if hit)  → out
+func TestExecutor_MultiSource_SharedStore(t *testing.T) {
+	b := topology.NewBuilder()
+	srcA := b.AddSource("source-A")
+	srcB := b.AddSource("source-B")
+
+	// table-agg: on every source-B record, write key→value into the "t" store.
+	tableAgg := topology.StatefulProcessFunc(func(_ context.Context, r topology.Record, pctx topology.ProcessorContext) error {
+		store := pctx.Store("t").(map[string]string)
+		store[fmt.Sprintf("%v", r.Key)] = fmt.Sprintf("%v", r.Value)
+		// table-agg is not wired to any sink; no Forward needed.
+		return nil
+	})
+	b.AddStatefulProcessor("table-agg", tableAgg, []string{"t"}, srcB)
+
+	// join: on every source-A record, look up key in store "t".
+	// On hit: forward a record whose Value is "<a-value>+<table-value>".
+	// On miss: drop silently (inner-join semantics).
+	join := topology.StatefulProcessFunc(func(_ context.Context, r topology.Record, pctx topology.ProcessorContext) error {
+		store := pctx.Store("t").(map[string]string)
+		key := fmt.Sprintf("%v", r.Key)
+		tableVal, hit := store[key]
+		if !hit {
+			return nil // inner-join miss — drop
+		}
+		pctx.Forward(topology.Record{
+			Key:       r.Key,
+			Value:     fmt.Sprintf("%v+%v", r.Value, tableVal),
+			Timestamp: r.Timestamp,
+		})
+		return nil
+	})
+	joinNode := b.AddStatefulProcessor("join", join, []string{"t"}, srcA)
+	b.AddSink("out", joinNode)
+
+	topo := b.Build()
+
+	// Shared store: a plain map[string]string visible to both sub-graphs.
+	tableStore := map[string]string{}
+	exec := topology.NewExecutor(topo, map[string]any{"t": tableStore})
+	ctx := context.Background()
+
+	// ── Case 1: miss-first ─────────────────────────────────────────────────────
+	// Drive source-A before any source-B record exists → join must miss → no output.
+	if err := exec.Process(ctx, "source-A", topology.Record{Key: "k", Value: "v1", Timestamp: 1}); err != nil {
+		t.Fatalf("case1 Process source-A: %v", err)
+	}
+	out, err := exec.DrainSink("out")
+	if err != nil {
+		t.Fatalf("case1 DrainSink: %v", err)
+	}
+	if len(out) != 0 {
+		t.Errorf("case1 (miss-first): expected 0 records, got %d: %+v", len(out), out)
+	}
+
+	// ── Case 2: populate-then-join ─────────────────────────────────────────────
+	// source-B writes "k"→"table-val" into the shared store.
+	if err := exec.Process(ctx, "source-B", topology.Record{Key: "k", Value: "table-val", Timestamp: 2}); err != nil {
+		t.Fatalf("case2 Process source-B: %v", err)
+	}
+	// Confirm store was mutated by table-agg.
+	if tableStore["k"] != "table-val" {
+		t.Fatalf("case2: store[k]=%q, want %q", tableStore["k"], "table-val")
+	}
+	// Now source-A drives join; key "k" is in the store → hit → joined output.
+	if err := exec.Process(ctx, "source-A", topology.Record{Key: "k", Value: "v2", Timestamp: 3}); err != nil {
+		t.Fatalf("case2 Process source-A: %v", err)
+	}
+	out, err = exec.DrainSink("out")
+	if err != nil {
+		t.Fatalf("case2 DrainSink: %v", err)
+	}
+	if len(out) != 1 {
+		t.Fatalf("case2 (hit): expected 1 record, got %d: %+v", len(out), out)
+	}
+	wantVal := "v2+table-val"
+	if out[0].Value != wantVal {
+		t.Errorf("case2 joined value: got %v, want %v", out[0].Value, wantVal)
+	}
+	if out[0].Key != "k" {
+		t.Errorf("case2 joined key: got %v, want k", out[0].Key)
+	}
+
+	// ── Case 3: independent keys ───────────────────────────────────────────────
+	// B writes key "k1"; A reads key "k2" (miss) then key "k1" (hit).
+	if err := exec.Process(ctx, "source-B", topology.Record{Key: "k1", Value: "t1", Timestamp: 4}); err != nil {
+		t.Fatalf("case3 Process source-B: %v", err)
+	}
+	// A reads k2 — not in store → miss → no output.
+	if err := exec.Process(ctx, "source-A", topology.Record{Key: "k2", Value: "a2", Timestamp: 5}); err != nil {
+		t.Fatalf("case3 Process source-A k2: %v", err)
+	}
+	out, _ = exec.DrainSink("out")
+	if len(out) != 0 {
+		t.Errorf("case3 (k2 miss): expected 0 records, got %d", len(out))
+	}
+	// A reads k1 — in store → hit.
+	if err := exec.Process(ctx, "source-A", topology.Record{Key: "k1", Value: "a1", Timestamp: 6}); err != nil {
+		t.Fatalf("case3 Process source-A k1: %v", err)
+	}
+	out, _ = exec.DrainSink("out")
+	if len(out) != 1 {
+		t.Fatalf("case3 (k1 hit): expected 1 record, got %d", len(out))
+	}
+	if out[0].Value != "a1+t1" {
+		t.Errorf("case3 joined value: got %v, want a1+t1", out[0].Value)
+	}
+}
+
 // TestExecutor_UnknownSourceReturnsError ensures Process returns an error for
 // missing source names.
 func TestExecutor_UnknownSourceReturnsError(t *testing.T) {
