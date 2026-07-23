@@ -301,6 +301,182 @@ func TestDecodeSessionValue_TooShort(t *testing.T) {
 	}
 }
 
+// newSessionAggregate builds a pipeline:
+//
+//	KStream[string,string] → GroupByKey → SessionWindowedBy(gap).WithGrace(grace).Aggregate(...)
+//
+// Returns the built topology, the stream-time pointer, the executor, the byte store.
+func newSessionAggregate[A any](
+	t *testing.T,
+	gap, grace time.Duration,
+	storeName string,
+	initFn func() A,
+	aggFn func(string, string, A) A,
+	mergeFn func(string, A, A) A,
+	accSerde gstream.Serde[A],
+) (*gstream.BuiltTopology, *int64, *topology.Executor, *state.KeyValueStore[[]byte, []byte]) {
+	t.Helper()
+
+	b := gstream.NewStreamBuilder()
+	src := gstream.Stream[string, string](b, "input", "src",
+		gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{})
+
+	_ = src.GroupByKey(gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{}).
+		SessionWindowedBy(gstream.SessionWindow(gap)).
+		WithGrace(grace).
+		Aggregate(storeName, initFn, aggFn, mergeFn, accSerde)
+
+	bt := b.Build()
+
+	db, err := state.OpenMemDB()
+	if err != nil {
+		t.Fatalf("OpenMemDB: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	byteStore := state.NewKeyValueStoreWithChangelog[[]byte, []byte](
+		storeName, db, gstream.BytesSerde{}, gstream.BytesSerde{}, nil,
+	)
+
+	var streamTime int64
+	exec := topology.NewExecutorWithStreamTime(bt.Topology,
+		map[string]any{storeName: byteStore}, &streamTime)
+
+	return bt, &streamTime, exec, byteStore
+}
+
+// readSessionA is like readSession but for a generic accumulator A.
+func readSessionA[A any](t *testing.T, byteStore *state.KeyValueStore[[]byte, []byte], key string, expectedStart int64, accSerde gstream.Serde[A]) (acc A, sessionStart int64, sessionEnd int64, found bool) {
+	t.Helper()
+
+	keySerde := gstream.JSONSerde[string]{}
+	kBytes, err := keySerde.Serialize(key)
+	if err != nil {
+		t.Fatalf("serialize key %q: %v", key, err)
+	}
+
+	valBytes, ok, err := byteStore.WindowGet(kBytes, expectedStart)
+	if err != nil {
+		t.Fatalf("WindowGet sStart=%d: %v", expectedStart, err)
+	}
+	if !ok {
+		var zero A
+		return zero, 0, 0, false
+	}
+
+	sEnd, accBytes, err := gstream.DecodeSessionValue(valBytes)
+	if err != nil {
+		t.Fatalf("DecodeSessionValue: %v", err)
+	}
+
+	result, err := accSerde.Deserialize(accBytes)
+	if err != nil {
+		t.Fatalf("deserialize acc: %v", err)
+	}
+	return result, expectedStart, sEnd, true
+}
+
+// TestSessionAggregate_NonIdentityMerge verifies that the session merge seeds from
+// the first matched accumulator rather than from initFn().
+//
+// If the code incorrectly folds initFn() into the merge (the pre-fix behaviour),
+// a mergeFn where initFn() is NOT an identity element corrupts the result.
+//
+// Setup: init=100, mergeFn=min(a,b), aggFn(k,v,acc)=acc+1.
+//
+// Build two separate sessions (gap=10s, grace=30s):
+//   - ts=1000  → acc = aggFn("k","v",initFn()) = 100+1 = 101  session A=[1000,1000]
+//   - ts=50000 → acc = 101                                      session B=[50000,50000]
+//
+// streamTime=50000, lateBoundary=50000-10000-30000=10000.
+//
+// Bridge record at ts=30000 (>lateBoundary=10000 → accepted):
+//   A=[1000,1000]:   sEnd(1000)+10000=11000 >= 30000? NO → does NOT match A.
+//   B=[50000,50000]: sEnd(50000)+10000=60000>=30000 ✓; sStart(50000)-10000=40000<=30000? NO → does NOT match B.
+//
+// Hmm, need to reconsider the gap to make them both match.  Use gap=30s=30000ms:
+//   A=[1000,1000]:   sEnd(1000)+30000=31000>=30000 ✓; sStart(1000)-30000=-29000<=30000 ✓ → MATCH
+//   B=[50000,50000]: sEnd(50000)+30000=80000>=30000 ✓; sStart(50000)-30000=20000<=30000 ✓ → MATCH
+//   lateBoundary = 50000-30000-30000 = -10000 < 30000 → accepted.
+//
+// Merge with old (buggy) code: mergedAcc = min(100, A.acc=101) = 100,
+//                              mergedAcc = min(100, B.acc=101) = 100,
+//                              mergedAcc = aggFn("k","v",100) = 101.
+// Merge with new (correct) code: mergedAcc = A.acc = 101,
+//                                mergedAcc = min(101, B.acc=101) = 101,
+//                                mergedAcc = aggFn("k","v",101) = 102.
+//
+// Assert merged acc == 102.
+func TestSessionAggregate_NonIdentityMerge(t *testing.T) {
+	t.Parallel()
+
+	// init=100 is NOT an identity for min (identity for min over int64 would be MaxInt64).
+	initFn := func() int64 { return 100 }
+	aggFn := func(_ string, _ string, acc int64) int64 { return acc + 1 }
+	mergeFn := func(_ string, a, b int64) int64 {
+		if a < b {
+			return a
+		}
+		return b
+	}
+	accSerde := gstream.JSONSerde[int64]{}
+
+	_, _, exec, byteStore := newSessionAggregate(
+		t,
+		30*time.Second,  // gap
+		30*time.Second,  // grace
+		"non-identity",
+		initFn,
+		aggFn,
+		mergeFn,
+		accSerde,
+	)
+
+	// Record 1 at ts=1000 → creates session A=[1000,1000], acc=101.
+	if err := exec.Process(context.Background(), "src",
+		topology.Record{Key: "k", Value: "v", Timestamp: 1000}); err != nil {
+		t.Fatalf("Process ts=1000: %v", err)
+	}
+	// Record 2 at ts=50000 → creates session B=[50000,50000], acc=101.
+	if err := exec.Process(context.Background(), "src",
+		topology.Record{Key: "k", Value: "v", Timestamp: 50000}); err != nil {
+		t.Fatalf("Process ts=50000: %v", err)
+	}
+
+	// Sanity: two separate sessions before bridge.
+	if n := countSessions(t, byteStore, "k"); n != 2 {
+		t.Fatalf("before bridge: expected 2 sessions, got %d", n)
+	}
+
+	// Bridge record at ts=30000: lateBoundary=50000-30000-30000=-10000 → accepted.
+	// Both A and B match (see predicate analysis in doc above).
+	if err := exec.Process(context.Background(), "src",
+		topology.Record{Key: "k", Value: "v", Timestamp: 30000}); err != nil {
+		t.Fatalf("Process ts=30000: %v", err)
+	}
+
+	// Expect exactly one merged session.
+	if n := countSessions(t, byteStore, "k"); n != 1 {
+		t.Fatalf("after bridge: expected 1 session, got %d", n)
+	}
+
+	// Correct result: seed from A.acc=101, min(101,B.acc=101)=101, +1=102.
+	// Old (buggy) result: min(initFn()=100, A.acc=101)=100, min(100, B.acc=101)=100, +1=101.
+	acc, sStart, sEnd, found := readSessionA(t, byteStore, "k", 1000, accSerde)
+	if !found {
+		t.Fatal("merged session starting at 1000 not found")
+	}
+	if sStart != 1000 {
+		t.Errorf("merged session start: got %d, want 1000", sStart)
+	}
+	if sEnd != 50000 {
+		t.Errorf("merged session end: got %d, want 50000", sEnd)
+	}
+	if acc != 102 {
+		t.Errorf("merged acc: got %d, want 102 (buggy pre-fix value would be 101)", acc)
+	}
+}
+
 // TestEncodeDecodeSessionValue_Roundtrip verifies round-trip encode/decode.
 func TestEncodeDecodeSessionValue_Roundtrip(t *testing.T) {
 	t.Parallel()

@@ -508,8 +508,8 @@ func pollSessionChangelog(
 			if !ok {
 				return
 			}
-			var strKey string
-			if err := json.Unmarshal(kBytes, &strKey); err != nil {
+			strKey, err := serde.Deserialize(kBytes)
+			if err != nil {
 				return
 			}
 			sk := sessionStateKey{strKey, sStart}
@@ -529,11 +529,6 @@ func pollSessionChangelog(
 			latest[sk] = sessionStateEntry{sEnd: sEnd, count: count}
 		})
 
-		// Re-serialize latest state as a new consumer because we started from
-		// offset 0 and need to see ALL records including tombstones. Since we
-		// start at offset 0 on every iteration, we need a single-pass consumer.
-		// (The consumer above starts at offset 0 and is reused across polls.)
-		_ = serde // used above for JSON unmarshal
 	}
 	return latest
 }

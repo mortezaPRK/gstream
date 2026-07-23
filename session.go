@@ -218,7 +218,21 @@ func (s SessionWindowedStream[K, V]) Aggregate[A any](
 		// Compute merged bounds: min of all sStarts and ts, max of all sEnds and ts.
 		mergedStart := ts
 		mergedEnd := ts
-		mergedAcc := initFn()
+
+		// Seed the accumulator from matched sessions.  Only use initFn() when
+		// there are no matched sessions (brand-new session), because initFn() is
+		// not guaranteed to be an identity element for mergeFn.  For example,
+		// init=100 with mergeFn=min would wrongly fold 100 into the result if we
+		// always start from initFn().
+		var mergedAcc A
+		if len(matched) == 0 {
+			mergedAcc = initFn()
+		} else {
+			mergedAcc = matched[0].acc
+			for _, m := range matched[1:] {
+				mergedAcc = mergeFn(k, mergedAcc, m.acc)
+			}
+		}
 
 		for _, m := range matched {
 			if m.start < mergedStart {
@@ -227,7 +241,6 @@ func (s SessionWindowedStream[K, V]) Aggregate[A any](
 			if m.end > mergedEnd {
 				mergedEnd = m.end
 			}
-			mergedAcc = mergeFn(k, mergedAcc, m.acc)
 		}
 
 		// Fold in new record.

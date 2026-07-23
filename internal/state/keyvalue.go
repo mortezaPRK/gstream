@@ -492,16 +492,16 @@ func (s *KeyValueStore[K, V]) RangeCompositeBytes(lower, upper []byte, fn func(c
 	return nil
 }
 
-// WindowDelete removes the entry for the composite (kBytes, sessionStart) key.
+// WindowDelete removes the entry for the composite (kBytes, windowStart) key.
 // It is not an error to delete a key that does not exist. If a MutationCollector
 // is attached, a Delete{Key} mutation is appended after the Pebble write succeeds.
 // The Mutation.Key is the full Pebble key (prefix + composite), matching the key
 // form used by WindowPut's Put mutation and Delete's Delete mutation.
-func (s *KeyValueStore[K, V]) WindowDelete(kBytes []byte, sessionStart int64) error {
+func (s *KeyValueStore[K, V]) WindowDelete(kBytes []byte, windowStart int64) error {
 	if err := s.checkOpen(); err != nil {
 		return err
 	}
-	ck := WindowCompositeKey(kBytes, sessionStart)
+	ck := WindowCompositeKey(kBytes, windowStart)
 	pk := make([]byte, len(s.prefix)+len(ck))
 	copy(pk, s.prefix)
 	copy(pk[len(s.prefix):], ck)
