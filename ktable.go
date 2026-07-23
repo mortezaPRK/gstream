@@ -31,3 +31,24 @@ type KTable[K, V any] struct {
 	// windowed/session KTables (key is Windowed[K], not stream-joinable in P4a).
 	valSerde Serde[V]
 }
+
+// GlobalKTable[K,V] is a fully-replicated table: every application instance
+// reads all partitions of the backing topic from offset 0 at startup and
+// materializes the latest value per key into a local key-value store. Because
+// every instance holds the complete dataset, joins via KStream.JoinGlobal
+// require no co-partitioning — the lookup key does not need to match the stream
+// partition key.
+//
+// storeName identifies the store registered in BuiltTopology.GlobalTableBindings.
+// GlobalKTable is NOT a DAG source node: it does not appear in
+// Topology.SourceNames() and does not affect per-partition task assignment.
+// The backing topic is consumed by a dedicated all-partitions consumer (C3).
+type GlobalKTable[K, V any] struct {
+	builder   *StreamBuilder
+	nodeName  string
+	storeName string
+	// keySerde encodes the lookup key for store Get calls in JoinGlobal (C2).
+	keySerde Serde[K]
+	// valSerde decodes stored value bytes back into the concrete V type.
+	valSerde Serde[V]
+}

@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 
@@ -28,6 +29,20 @@ import (
 // the committed source offset. On restart the batch is redelivered and aggFn
 // is applied again (at-least-once). ExactlyOnce (P5) closes this window.
 //
+// # Global KTable lifecycle (C5)
+//
+// When the topology contains GlobalKTable bindings the caller MUST invoke these
+// methods in order BEFORE calling kafka.New / kafka.Client.Run:
+//
+//  1. adapter.BootstrapGlobalStores(ctx) — blocks until every global store is
+//     caught up to its high-watermark.  Calls TaskManager.RegisterGlobalStore
+//     for each store so per-partition tasks see global lookups.
+//  2. adapter.RunGlobalConsumers(ctx)   — starts tail-consume goroutines for
+//     ongoing updates.
+//
+// Teardown: call adapter.Close() after kafka.Client.Run returns to stop the
+// tail goroutines and release Pebble DBs.
+//
 // # Thread safety
 //
 // Adapter is NOT safe for concurrent use. kafka.Client calls ProcessFunc
@@ -35,10 +50,15 @@ import (
 type Adapter struct {
 	taskManager     *TaskManager
 	bt              *gstream.BuiltTopology
+	cfg             gstream.Config
 	logger          *slog.Logger
 	topicToSource   map[string]string                // Kafka topic → topology source-node name
 	resolvedSources map[string]gstream.SourceBinding // source-node name → SourceBinding (includes repartition)
 	resolvedSinks   map[string]gstream.SinkBinding   // sink-node name → SinkBinding (includes repartition)
+
+	// globalConsumers holds one GlobalConsumer per GlobalTableBinding. Nil until
+	// BootstrapGlobalStores is called. Closed by Close().
+	globalConsumers []*GlobalConsumer
 }
 
 // NewAdapter constructs an Adapter driven by a *gstream.BuiltTopology.
@@ -139,7 +159,10 @@ func NewAdapter(bt *gstream.BuiltTopology, cfg gstream.Config, logger *slog.Logg
 
 	// Internal sinks (absent from resolvedSinks — e.g. ktable-out-N) are valid for
 	// stateful topologies; for zero-store topologies all sinks must have bindings.
-	hasStores := len(bt.StoreBindings) > 0 || len(bt.WindowStoreBindings) > 0 || len(bt.SessionStoreBindings) > 0
+	// Include GlobalTableBindings: when only a global table exists the stateful
+	// sink-skip logic must still activate (internal-sink drainage).
+	hasStores := len(bt.StoreBindings) > 0 || len(bt.WindowStoreBindings) > 0 ||
+		len(bt.SessionStoreBindings) > 0 || len(bt.GlobalTableBindings) > 0
 	for _, sinkName := range bt.Topology.SinkNames() {
 		if _, ok := resolvedSinks[sinkName]; !ok {
 			if !hasStores {
@@ -155,11 +178,93 @@ func NewAdapter(bt *gstream.BuiltTopology, cfg gstream.Config, logger *slog.Logg
 	return &Adapter{
 		taskManager:     NewTaskManager(bt, cfg, logger),
 		bt:              bt,
+		cfg:             cfg,
 		logger:          logger,
 		topicToSource:   topicToSource,
 		resolvedSources: resolvedSources,
 		resolvedSinks:   resolvedSinks,
 	}, nil
+}
+
+// BootstrapGlobalStores initializes all GlobalKTable consumers: for each binding it
+// opens a Pebble DB (via NewGlobalConsumer), performs a blocking catch-up consume
+// (Bootstrap) until every partition reaches its high-watermark, and registers the
+// populated store with the TaskManager (RegisterGlobalStore) so per-partition tasks
+// can resolve global lookups via ctx.Store(storeName).
+//
+// Ordering contract (R2): BootstrapGlobalStores MUST be called BEFORE kafka.New /
+// kafka.Client.Run. RegisterGlobalStore is NOT thread-safe; all registrations happen
+// here, before any OnAssigned callback fires.
+//
+// Returns nil and is a no-op when the topology has no GlobalTableBindings.
+// Returns the first error encountered; already-opened consumers are closed on error.
+func (a *Adapter) BootstrapGlobalStores(ctx context.Context) error {
+	if len(a.bt.GlobalTableBindings) == 0 {
+		return nil
+	}
+
+	var opened []*GlobalConsumer
+	cleanup := func() {
+		for _, gc := range opened {
+			if err := gc.Close(); err != nil {
+				a.logger.Warn("BootstrapGlobalStores: cleanup close failed",
+					slog.String("store", gc.storeName),
+					slog.Any("error", err),
+				)
+			}
+		}
+	}
+
+	for _, binding := range a.bt.GlobalTableBindings {
+		gc, err := NewGlobalConsumer(a.cfg, binding, a.logger)
+		if err != nil {
+			cleanup()
+			return fmt.Errorf("runtime.Adapter.BootstrapGlobalStores: NewGlobalConsumer(%q): %w",
+				binding.StoreName, err)
+		}
+		opened = append(opened, gc)
+
+		if err := gc.Bootstrap(ctx); err != nil {
+			cleanup()
+			return fmt.Errorf("runtime.Adapter.BootstrapGlobalStores: Bootstrap(%q): %w",
+				binding.StoreName, err)
+		}
+
+		a.taskManager.RegisterGlobalStore(binding.StoreName, gc.Store())
+	}
+
+	a.globalConsumers = opened
+	return nil
+}
+
+// RunGlobalConsumers starts a background tail-consume goroutine for each global
+// consumer that was bootstrapped by BootstrapGlobalStores. Must be called AFTER
+// BootstrapGlobalStores and BEFORE kafka.Client.Run.
+//
+// Returns nil and is a no-op when there are no global consumers.
+func (a *Adapter) RunGlobalConsumers(ctx context.Context) error {
+	for _, gc := range a.globalConsumers {
+		if err := gc.TailConsume(ctx); err != nil {
+			return fmt.Errorf("runtime.Adapter.RunGlobalConsumers: TailConsume(%q): %w",
+				gc.storeName, err)
+		}
+	}
+	return nil
+}
+
+// Close stops all global tail-consume goroutines and closes their Pebble DBs.
+// Follows GlobalConsumer.Close CONTRACT: cancel → wg.Wait → client.Close → db.Close.
+//
+// Returns the first error encountered; all consumers are closed regardless of
+// intermediate errors (best-effort).
+func (a *Adapter) Close() error {
+	var errs []error
+	for _, gc := range a.globalConsumers {
+		if err := gc.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("close global store %q: %w", gc.storeName, err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // SourceTopics returns the list of Kafka topics this Adapter consumes — one per

@@ -267,6 +267,276 @@ func TestJoinTable_NodeAndStore(t *testing.T) {
 	}
 }
 
+// ---- JoinGlobal tests -------------------------------------------------------
+
+// buildJoinGlobalTopology constructs the test topology:
+//
+//	stream-source[string,Order] → JoinGlobal(gkt, keyMapper, joiner, outSerde) → out-sink
+//
+// The GlobalKTable is keyed by userID (string) and holds user profiles (string).
+// The stream key is an order ID; keyMapper extracts the userID from the Order value.
+// This proves that stream key != derived lookup key — the defining GlobalKTable behavior.
+//
+// Returns the BuiltTopology and the global store name so callers can pre-seed it.
+//
+// Order is a minimal struct: ID string, UserID string.
+type Order struct {
+	ID     string
+	UserID string
+}
+
+func buildJoinGlobalTopology(t *testing.T) (*gstream.BuiltTopology, string) {
+	t.Helper()
+
+	b := gstream.NewStreamBuilder()
+
+	// GlobalKTable: keyed by userID (string) → userProfile (string)
+	gkt := gstream.GlobalTable[string, string](
+		b, "profiles-topic", "profiles-node",
+		gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{},
+	)
+
+	// Stream: keyed by orderID (string), value is Order
+	streamSrc := gstream.Stream[string, Order](
+		b, "orders-topic", "orders-src",
+		gstream.JSONSerde[string]{}, gstream.JSONSerde[Order]{},
+	)
+
+	// keyMapper extracts userID from Order — stream key "order-1" != lookup key "u5"
+	joined := streamSrc.JoinGlobal[string, string, string](
+		gkt,
+		func(_ string, order Order) string { return order.UserID },
+		func(order Order, profile string) string { return order.ID + ":" + profile },
+		gstream.JSONSerde[string]{},
+	)
+	joined.To("join-out", "join-out-sink", gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{})
+
+	bt := b.Build()
+
+	// Resolve global store name from GlobalTableBindings.
+	var globalStoreName string
+	for _, binding := range bt.GlobalTableBindings {
+		globalStoreName = binding.StoreName
+		break
+	}
+	if globalStoreName == "" {
+		t.Fatal("no GlobalTableBinding found after Build()")
+	}
+
+	return bt, globalStoreName
+}
+
+// openGlobalStore opens an in-memory kvBytesStore and pre-seeds it with the
+// given key→value pairs. Key/value are serialized with JSONSerde[string].
+func openGlobalStore(t *testing.T, storeName string, pairs map[string]string) (any, func()) {
+	t.Helper()
+
+	db, err := state.OpenMemDB()
+	if err != nil {
+		t.Fatalf("OpenMemDB: %v", err)
+	}
+
+	byteStore := state.NewKeyValueStoreWithChangelog[[]byte, []byte](
+		storeName, db, gstream.BytesSerde{}, gstream.BytesSerde{}, nil,
+	)
+
+	keySerde := gstream.JSONSerde[string]{}
+	valSerde := gstream.JSONSerde[string]{}
+
+	for k, v := range pairs {
+		kBytes, err := keySerde.Serialize(k)
+		if err != nil {
+			t.Fatalf("pre-seed Serialize key %q: %v", k, err)
+		}
+		vBytes, err := valSerde.Serialize(v)
+		if err != nil {
+			t.Fatalf("pre-seed Serialize val %q: %v", v, err)
+		}
+		if err := byteStore.Put(kBytes, vBytes); err != nil {
+			t.Fatalf("pre-seed Put %q: %v", k, err)
+		}
+	}
+
+	return byteStore, func() { db.Close() }
+}
+
+// TestJoinGlobal_Miss verifies that a stream record whose keyMapper output is
+// absent in the global store produces no output (inner-join miss).
+func TestJoinGlobal_Miss(t *testing.T) {
+	t.Parallel()
+
+	bt, globalStoreName := buildJoinGlobalTopology(t)
+	store, cleanup := openGlobalStore(t, globalStoreName, nil) // empty store
+	defer cleanup()
+
+	exec := topology.NewExecutor(bt.Topology, map[string]any{globalStoreName: store})
+
+	if err := exec.Process(context.Background(), "orders-src", topology.Record{
+		Key:       "order-1",
+		Value:     Order{ID: "order-1", UserID: "u5"},
+		Timestamp: 1,
+	}); err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+
+	out, err := exec.DrainSink("join-out-sink")
+	if err != nil {
+		t.Fatalf("DrainSink: %v", err)
+	}
+	if len(out) != 0 {
+		t.Errorf("miss: expected 0 records, got %d: %+v", len(out), out)
+	}
+}
+
+// TestJoinGlobal_Hit verifies that a stream record whose keyMapper-derived key
+// is present in the global store triggers the joiner and produces output.
+// Critically: the stream key is "order-1" but the lookup key is "u5" (UserID) —
+// different keys, proving the derived-key mapping works correctly.
+func TestJoinGlobal_Hit(t *testing.T) {
+	t.Parallel()
+
+	bt, globalStoreName := buildJoinGlobalTopology(t)
+	store, cleanup := openGlobalStore(t, globalStoreName, map[string]string{
+		"u5": "Alice",
+	})
+	defer cleanup()
+
+	exec := topology.NewExecutor(bt.Topology, map[string]any{globalStoreName: store})
+
+	if err := exec.Process(context.Background(), "orders-src", topology.Record{
+		Key:       "order-1",
+		Value:     Order{ID: "order-1", UserID: "u5"},
+		Timestamp: 42,
+	}); err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+
+	out, err := exec.DrainSink("join-out-sink")
+	if err != nil {
+		t.Fatalf("DrainSink: %v", err)
+	}
+	if len(out) != 1 {
+		t.Fatalf("hit: expected 1 record, got %d: %+v", len(out), out)
+	}
+	if out[0].Key != "order-1" {
+		t.Errorf("hit: Key: got %v, want order-1", out[0].Key)
+	}
+	if out[0].Value != "order-1:Alice" {
+		t.Errorf("hit: Value: got %v, want order-1:Alice", out[0].Value)
+	}
+	if out[0].Timestamp != 42 {
+		t.Errorf("hit: Timestamp: got %v, want 42", out[0].Timestamp)
+	}
+}
+
+// TestJoinGlobal_DerivedKeyDiffersFromStreamKey explicitly proves that JoinGlobal
+// uses the keyMapper output (UserID) for the lookup, NOT the stream record key
+// (orderID). Seed "u9" but not "order-2"; using r.Key would miss, but using
+// keyMapper(k,v) = "u9" must hit.
+func TestJoinGlobal_DerivedKeyDiffersFromStreamKey(t *testing.T) {
+	t.Parallel()
+
+	bt, globalStoreName := buildJoinGlobalTopology(t)
+	// Seed user "u9" → "Bob". The stream key is "order-2" which is NOT in the store.
+	store, cleanup := openGlobalStore(t, globalStoreName, map[string]string{
+		"u9": "Bob",
+	})
+	defer cleanup()
+
+	exec := topology.NewExecutor(bt.Topology, map[string]any{globalStoreName: store})
+
+	if err := exec.Process(context.Background(), "orders-src", topology.Record{
+		Key:       "order-2", // NOT in global store — would be a miss if lookup used r.Key
+		Value:     Order{ID: "order-2", UserID: "u9"},
+		Timestamp: 10,
+	}); err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+
+	out, err := exec.DrainSink("join-out-sink")
+	if err != nil {
+		t.Fatalf("DrainSink: %v", err)
+	}
+	if len(out) != 1 {
+		t.Fatalf("derived-key hit: expected 1 record, got %d (lookup must use keyMapper, not r.Key)", len(out))
+	}
+	if out[0].Value != "order-2:Bob" {
+		t.Errorf("derived-key hit: Value: got %v, want order-2:Bob", out[0].Value)
+	}
+}
+
+// TestJoinGlobal_MultiKey verifies that two independent stream records with
+// different userIDs are each joined correctly against the global store.
+func TestJoinGlobal_MultiKey(t *testing.T) {
+	t.Parallel()
+
+	bt, globalStoreName := buildJoinGlobalTopology(t)
+	store, cleanup := openGlobalStore(t, globalStoreName, map[string]string{
+		"u1": "Carol",
+		"u2": "Dave",
+	})
+	defer cleanup()
+
+	exec := topology.NewExecutor(bt.Topology, map[string]any{globalStoreName: store})
+	ctx := context.Background()
+
+	for _, tc := range []struct {
+		orderID string
+		userID  string
+		want    string
+	}{
+		{"o1", "u1", "o1:Carol"},
+		{"o2", "u2", "o2:Dave"},
+		{"o3", "u3", ""}, // miss — u3 not seeded
+	} {
+		if err := exec.Process(ctx, "orders-src", topology.Record{
+			Key:   tc.orderID,
+			Value: Order{ID: tc.orderID, UserID: tc.userID},
+		}); err != nil {
+			t.Fatalf("Process %s: %v", tc.orderID, err)
+		}
+		out, _ := exec.DrainSink("join-out-sink")
+		if tc.want == "" {
+			if len(out) != 0 {
+				t.Errorf("%s: expected miss (0 records), got %d", tc.orderID, len(out))
+			}
+		} else {
+			if len(out) != 1 {
+				t.Fatalf("%s: expected 1 record, got %d", tc.orderID, len(out))
+			}
+			if out[0].Value != tc.want {
+				t.Errorf("%s: Value: got %v, want %v", tc.orderID, out[0].Value, tc.want)
+			}
+		}
+	}
+}
+
+// TestJoinGlobal_NodeAndStore verifies that the join-global node is a child of
+// the stream source and reads from the global store name.
+func TestJoinGlobal_NodeAndStore(t *testing.T) {
+	t.Parallel()
+
+	bt, globalStoreName := buildJoinGlobalTopology(t)
+
+	// The global store name must appear in GlobalTableBindings.
+	if _, ok := bt.GlobalTableBindings[globalStoreName]; !ok {
+		t.Errorf("GlobalTableBindings[%q] not found", globalStoreName)
+	}
+
+	// Must have at least one sink wired.
+	sinkNames := bt.Topology.SinkNames()
+	found := false
+	for _, n := range sinkNames {
+		if n == "join-out-sink" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("sink 'join-out-sink' not found in topology sinks: %v", sinkNames)
+	}
+}
+
 // TestJoinTable_UpdatedTableValue verifies that the join sees the latest table
 // value: if a key is updated in the table before a stream record arrives, the
 // joiner receives the updated value.

@@ -836,3 +836,200 @@ func outTopics(outs []kafka.OutRecord) []string {
 	}
 	return topics
 }
+
+// ---------------------------------------------------------------------------
+// GlobalTableBinding exclusion tests (R1/R3)
+// ---------------------------------------------------------------------------
+
+// buildGlobalTableBuiltTopology builds a BuiltTopology with a single stream
+// source and a GlobalTableBinding whose topic is distinct from the stream source.
+// Used to assert R1/R3: global topic must NOT appear in SourceTopics().
+func buildGlobalTableBuiltTopology(t *testing.T) (*gstream.BuiltTopology, string /*globalTopic*/) {
+	t.Helper()
+
+	b := topology.NewBuilder()
+	src := b.AddSource("source")
+	b.AddSink("sink", src)
+	topo := b.Build()
+
+	const globalTopic = "global-user-table"
+	const globalStore = "user-store"
+
+	strSerde := gstream.JSONSerde[string]{}
+
+	bt := &gstream.BuiltTopology{
+		Topology: topo,
+		Sources: map[string]gstream.SourceBinding{
+			"source": {
+				Topic:     "stream-input",
+				DecodeKey: func(raw []byte) (any, error) { return string(raw), nil },
+				DecodeVal: func(raw []byte) (any, error) { return strSerde.Deserialize(raw) },
+			},
+		},
+		Sinks: map[string]gstream.SinkBinding{
+			"sink": {
+				Topic:     "stream-output",
+				EncodeKey: func(x any) ([]byte, error) { return []byte(x.(string)), nil },
+				EncodeVal: func(x any) ([]byte, error) { return strSerde.Serialize(x.(string)) },
+			},
+		},
+		GlobalTableBindings: map[string]gstream.GlobalTableBinding{
+			globalStore: {
+				StoreName: globalStore,
+				Topic:     globalTopic,
+				EncodeKey: func(x any) ([]byte, error) { return []byte(x.(string)), nil },
+				DecodeKey: func(raw []byte) (any, error) { return string(raw), nil },
+				EncodeVal: func(x any) ([]byte, error) { return strSerde.Serialize(x.(string)) },
+				DecodeVal: func(raw []byte) (any, error) { return strSerde.Deserialize(raw) },
+			},
+		},
+	}
+	return bt, globalTopic
+}
+
+// TestAdapter_GlobalTopicExcludedFromSourceTopics is the R1/R3 regression guard:
+// the global topic must NOT appear in SourceTopics() and must NOT be in
+// topicToSource. If it did, the task consumer group would subscribe to it,
+// shard it across instances, and silently break the "full replica" invariant.
+func TestAdapter_GlobalTopicExcludedFromSourceTopics(t *testing.T) {
+	bt, globalTopic := buildGlobalTableBuiltTopology(t)
+	adapter, err := runtime.NewAdapter(bt, unitTestCfg(t), nil)
+	if err != nil {
+		t.Fatalf("NewAdapter: %v", err)
+	}
+
+	topics := adapter.SourceTopics()
+	for _, tp := range topics {
+		if tp == globalTopic {
+			t.Errorf("R1/R3 violation: global topic %q found in SourceTopics() %v — "+
+				"global topics must NOT join the task consumer group", globalTopic, topics)
+		}
+	}
+	// Stream source must still be present.
+	found := false
+	for _, tp := range topics {
+		if tp == "stream-input" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("stream source topic %q missing from SourceTopics() %v", "stream-input", topics)
+	}
+}
+
+// TestAdapter_GlobalTopicExcludedFromTopicToSource verifies the internal
+// topicToSource map does not contain the global topic. We drive this indirectly:
+// ProcessFunc returns an error for unknown topics, so feeding the global topic
+// as an incoming record must return an error (not route it to a source node).
+func TestAdapter_GlobalTopicExcludedFromTopicToSource(t *testing.T) {
+	bt, globalTopic := buildGlobalTableBuiltTopology(t)
+	adapter, err := runtime.NewAdapter(bt, unitTestCfg(t), nil)
+	if err != nil {
+		t.Fatalf("NewAdapter: %v", err)
+	}
+
+	strSerde := gstream.JSONSerde[string]{}
+	val, _ := strSerde.Serialize("some-value")
+
+	_, procErr := adapter.ProcessFunc()(context.Background(), kafka.InRecord{
+		Topic:     globalTopic,
+		Partition: 0,
+		Key:       []byte("k"),
+		Value:     val,
+		Timestamp: time.Now(),
+	})
+	if procErr == nil {
+		t.Errorf("R1/R3 violation: ProcessFunc accepted a record on global topic %q — "+
+			"topicToSource must not contain global topics", globalTopic)
+	}
+}
+
+// TestAdapter_HasStoresTrueWhenOnlyGlobalTable verifies that hasStores is true
+// when the topology contains only GlobalTableBindings (no regular/window/session
+// stores). This ensures internal-sink drain logic activates correctly.
+func TestAdapter_HasStoresTrueWhenOnlyGlobalTable(t *testing.T) {
+	// Build a topology with an internal-only sink (no SinkBinding) and a global table.
+	// NewAdapter should NOT return an error about a missing sink binding.
+	b := topology.NewBuilder()
+	src := b.AddSource("source")
+	b.AddSink("internal-sink", src) // no SinkBinding — would error without hasStores
+	topo := b.Build()
+
+	strSerde := gstream.JSONSerde[string]{}
+
+	bt := &gstream.BuiltTopology{
+		Topology: topo,
+		Sources: map[string]gstream.SourceBinding{
+			"source": {
+				Topic:     "stream-input",
+				DecodeKey: func(raw []byte) (any, error) { return string(raw), nil },
+				DecodeVal: func(raw []byte) (any, error) { return strSerde.Deserialize(raw) },
+			},
+		},
+		Sinks: map[string]gstream.SinkBinding{
+			// "internal-sink" intentionally absent — simulates a DAG-internal sink.
+		},
+		GlobalTableBindings: map[string]gstream.GlobalTableBinding{
+			"user-store": {
+				StoreName: "user-store",
+				Topic:     "global-users",
+				EncodeKey: func(x any) ([]byte, error) { return []byte(x.(string)), nil },
+				DecodeKey: func(raw []byte) (any, error) { return string(raw), nil },
+				EncodeVal: func(x any) ([]byte, error) { return strSerde.Serialize(x.(string)) },
+				DecodeVal: func(raw []byte) (any, error) { return strSerde.Deserialize(raw) },
+			},
+		},
+	}
+
+	_, err := runtime.NewAdapter(bt, unitTestCfg(t), nil)
+	if err != nil {
+		t.Errorf("hasStores: NewAdapter returned error for topology with only GlobalTableBindings "+
+			"(internal sink should be silently skipped): %v", err)
+	}
+}
+
+// TestAdapter_ZeroGlobalBindings_NoOp verifies that BootstrapGlobalStores and
+// RunGlobalConsumers are pure no-ops when GlobalTableBindings is empty, and that
+// Close returns nil. Existing behavior (SourceTopics, ProcessFunc) must be
+// identical to pre-C5 Adapter.
+func TestAdapter_ZeroGlobalBindings_NoOp(t *testing.T) {
+	bt := buildSimpleBuiltTopology(t)
+	// Explicitly empty.
+	bt.GlobalTableBindings = nil
+
+	adapter, err := runtime.NewAdapter(bt, unitTestCfg(t), nil)
+	if err != nil {
+		t.Fatalf("NewAdapter: %v", err)
+	}
+
+	// BootstrapGlobalStores must be a no-op.
+	if err := adapter.BootstrapGlobalStores(context.Background()); err != nil {
+		t.Fatalf("BootstrapGlobalStores (zero bindings) returned error: %v", err)
+	}
+
+	// RunGlobalConsumers must be a no-op.
+	if err := adapter.RunGlobalConsumers(context.Background()); err != nil {
+		t.Fatalf("RunGlobalConsumers (zero bindings) returned error: %v", err)
+	}
+
+	// Close must be a no-op.
+	if err := adapter.Close(); err != nil {
+		t.Fatalf("Close (zero bindings) returned error: %v", err)
+	}
+
+	// SourceTopics unchanged.
+	topics := adapter.SourceTopics()
+	if len(topics) != 1 || topics[0] != "input-topic" {
+		t.Errorf("zero global: expected SourceTopics=[input-topic], got %v", topics)
+	}
+
+	// ProcessFunc works identically.
+	outs, err := adapter.ProcessFunc()(context.Background(), inRecord(t, "k", "hello"))
+	if err != nil {
+		t.Fatalf("ProcessFunc (zero global): %v", err)
+	}
+	if len(outs) != 1 || outs[0].Topic != "output-topic" {
+		t.Errorf("zero global: expected 1 output on output-topic, got %v", outTopics(outs))
+	}
+}
