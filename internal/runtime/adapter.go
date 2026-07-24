@@ -8,6 +8,7 @@ import (
 
 	gstream "github.com/mortezaPRK/gstream"
 	"github.com/mortezaPRK/gstream/internal/kafka"
+	"github.com/mortezaPRK/gstream/internal/state"
 	"github.com/mortezaPRK/gstream/internal/topology"
 )
 
@@ -59,6 +60,11 @@ type Adapter struct {
 	// globalConsumers holds one GlobalConsumer per GlobalTableBinding. Nil until
 	// BootstrapGlobalStores is called. Closed by Close().
 	globalConsumers []*GlobalConsumer
+
+	// health is the shared fatal-error signal.  Allocated in NewAdapter; shared
+	// between global consumers (tail loop) and the kafka.Client run loop via
+	// HealthGateHook.
+	health *PipelineHealth
 }
 
 // NewAdapter constructs an Adapter driven by a *gstream.BuiltTopology.
@@ -193,6 +199,7 @@ func NewAdapter(bt *gstream.BuiltTopology, cfg gstream.Config, logger *slog.Logg
 		topicToSource:   topicToSource,
 		resolvedSources: resolvedSources,
 		resolvedSinks:   resolvedSinks,
+		health:          &PipelineHealth{},
 	}, nil
 }
 
@@ -251,9 +258,14 @@ func (a *Adapter) BootstrapGlobalStores(ctx context.Context) error {
 // consumer that was bootstrapped by BootstrapGlobalStores. Must be called AFTER
 // BootstrapGlobalStores and BEFORE kafka.Client.Run.
 //
+// Each consumer is wired with the shared PipelineHealth so a fatal store-write
+// error in any tail goroutine trips health and is surfaced to the run loop via
+// HealthGateHook.
+//
 // Returns nil and is a no-op when there are no global consumers.
 func (a *Adapter) RunGlobalConsumers(ctx context.Context) error {
 	for _, gc := range a.globalConsumers {
+		gc.SetHealth(a.health)
 		if err := gc.TailConsume(ctx); err != nil {
 			return fmt.Errorf("runtime.Adapter.RunGlobalConsumers: TailConsume(%q): %w",
 				gc.storeName, err)
@@ -326,6 +338,22 @@ func (a *Adapter) ChangelogFlusherHook() func(ctx context.Context) ([]kafka.OutR
 	}
 }
 
+// HealthGateHook returns a function that kafka.Client.Run can call at the start
+// of each batch iteration to detect a fatal pipeline error (e.g. an un-retryable
+// Pebble store-write failure from the global tail consumer or from a per-partition
+// process step).  If the pipeline is unhealthy, the returned function returns the
+// fatal error so the run loop exits and the process can restart (changelog restore).
+//
+// Wire into kafka.WithHealthGate (ALO and EOS run loops check it before processing
+// each batch):
+//
+//	kafka.WithHealthGate(adapter.HealthGateHook())
+func (a *Adapter) HealthGateHook() func() error {
+	return func() error {
+		return a.health.Err()
+	}
+}
+
 // ProcessFunc returns a kafka.ProcessFunc that can be passed to kafka.Client.Run.
 // On success it returns all output records; on any error it returns nil so the
 // kafka.Client skips produce and commit (whole-batch redelivery).
@@ -375,6 +403,13 @@ func (a *Adapter) process(ctx context.Context, in kafka.InRecord) ([]kafka.OutRe
 		return nil, fmt.Errorf("runtime: no task for partition %d (not yet assigned or already revoked)", in.Partition)
 	}
 	if err := exec.Process(ctx, sourceName, rec); err != nil {
+		// A store-write error (ErrStoreWrite) is un-retryable: retrying will
+		// livelock forever on the same disk error.  Trip health so the run loop
+		// halts after this batch and the process can restart (changelog restore).
+		// Non-store errors (serde / user-logic) use the existing abort path.
+		if errors.Is(err, state.ErrStoreWriteSentinel) {
+			a.health.Fail(err)
+		}
 		return nil, fmt.Errorf("runtime: topology: %w", err)
 	}
 	return a.drainSinks(func(sinkName string) ([]topology.Record, error) {
