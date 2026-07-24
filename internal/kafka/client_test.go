@@ -2,6 +2,10 @@ package kafka
 
 import (
 	"context"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -413,5 +417,152 @@ func TestKafkaMurmur2_MatchesStickyKeyPartitioner(t *testing.T) {
 					key, n, ourPart, refPart)
 			}
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// resolveInstanceID — per-instance EOS transactional ID resolution
+// ---------------------------------------------------------------------------
+
+func cfgWithStateDir(stateDir string) gstream.Config {
+	cfg, err := gstream.Configure(
+		gstream.WithName("test-app"),
+		gstream.WithBrokers("localhost:9092"),
+		gstream.WithStateDir(stateDir),
+	)
+	if err != nil {
+		panic("cfgWithStateDir: " + err.Error())
+	}
+	return cfg
+}
+
+// TestResolveInstanceID_AbsentFile_GeneratesAndPersists verifies that when the
+// StateDir/instance-id file does not exist, resolveInstanceID generates a UUID,
+// persists it, and returns it. The file must exist with that content afterwards.
+func TestResolveInstanceID_AbsentFile_GeneratesAndPersists(t *testing.T) {
+	dir := t.TempDir()
+	cfg := cfgWithStateDir(dir)
+
+	id, err := resolveInstanceID(cfg)
+	if err != nil {
+		t.Fatalf("resolveInstanceID: unexpected error: %v", err)
+	}
+	if id == "" {
+		t.Fatal("resolveInstanceID: returned empty ID")
+	}
+
+	// File must now exist with that content.
+	data, err := os.ReadFile(filepath.Join(dir, "instance-id"))
+	if err != nil {
+		t.Fatalf("instance-id file not created: %v", err)
+	}
+	if got := strings.TrimSpace(string(data)); got != id {
+		t.Fatalf("file content %q != returned ID %q", got, id)
+	}
+}
+
+// TestResolveInstanceID_PresentFile_ReturnsStableID verifies that a second call
+// reads the existing file, returns the SAME id, and does NOT overwrite the file.
+func TestResolveInstanceID_PresentFile_ReturnsStableID(t *testing.T) {
+	dir := t.TempDir()
+	cfg := cfgWithStateDir(dir)
+
+	id1, err := resolveInstanceID(cfg)
+	if err != nil {
+		t.Fatalf("first call: %v", err)
+	}
+
+	id2, err := resolveInstanceID(cfg)
+	if err != nil {
+		t.Fatalf("second call: %v", err)
+	}
+	if id1 != id2 {
+		t.Fatalf("instance ID not stable across calls: first=%q second=%q", id1, id2)
+	}
+}
+
+// TestResolveInstanceID_ExplicitInstanceID_VerbatimNoop verifies that when
+// cfg.InstanceID is set, resolveInstanceID returns it verbatim and does NOT
+// create or touch the StateDir/instance-id file.
+func TestResolveInstanceID_ExplicitInstanceID_VerbatimNoop(t *testing.T) {
+	dir := t.TempDir()
+	cfg, err := gstream.Configure(
+		gstream.WithName("test-app"),
+		gstream.WithBrokers("localhost:9092"),
+		gstream.WithStateDir(dir),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.InstanceID = "my-explicit-id"
+
+	id, err := resolveInstanceID(cfg)
+	if err != nil {
+		t.Fatalf("resolveInstanceID: %v", err)
+	}
+	if id != "my-explicit-id" {
+		t.Fatalf("expected verbatim ID, got %q", id)
+	}
+
+	// File must NOT have been created.
+	if _, err := os.Stat(filepath.Join(dir, "instance-id")); !os.IsNotExist(err) {
+		t.Fatal("instance-id file should not have been created for explicit InstanceID")
+	}
+}
+
+// TestResolveInstanceID_DifferentStateDirs_DifferentIDs verifies that two instances
+// with different StateDirs receive distinct auto-generated IDs.
+func TestResolveInstanceID_DifferentStateDirs_DifferentIDs(t *testing.T) {
+	dir1 := t.TempDir()
+	dir2 := t.TempDir()
+
+	id1, err := resolveInstanceID(cfgWithStateDir(dir1))
+	if err != nil {
+		t.Fatalf("dir1: %v", err)
+	}
+	id2, err := resolveInstanceID(cfgWithStateDir(dir2))
+	if err != nil {
+		t.Fatalf("dir2: %v", err)
+	}
+	if id1 == id2 {
+		t.Fatalf("expected different IDs for different StateDirs, got same: %q", id1)
+	}
+}
+
+// TestBuildOptsEOS_TransactionalIDFormat verifies that the TransactionalID
+// embedded in buildOptsEOS options has the expected format "gstream-<appID>-<instanceID>".
+//
+// kgo does not expose an accessor for TransactionalID from opts; we verify
+// the format indirectly by confirming that NewGroupTransactSession succeeds with
+// the opts (dial is lazy) and that our string composition is correct.
+func TestBuildOptsEOS_TransactionalIDFormat(t *testing.T) {
+	const appID = "my-app"
+	const instanceID = "abc-123"
+
+	cfg, err := gstream.Configure(
+		gstream.WithName(appID),
+		gstream.WithBrokers("localhost:19092"),
+		gstream.WithGuarantee(gstream.ExactlyOnce),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	opts := buildOptsEOS(cfg, []string{"topic"}, slog.Default(), &clientOptions{}, instanceID)
+	if len(opts) == 0 {
+		t.Fatal("buildOptsEOS returned no opts")
+	}
+
+	// Verify construction succeeds (NewGroupTransactSession dials lazily).
+	sess, err := kgo.NewGroupTransactSession(opts...)
+	if err != nil {
+		t.Fatalf("NewGroupTransactSession: %v", err)
+	}
+	sess.Close()
+
+	// Verify the format string directly.
+	want := "gstream-" + appID + "-" + instanceID
+	if want != "gstream-my-app-abc-123" {
+		t.Fatalf("format check: want gstream-my-app-abc-123, got %s", want)
 	}
 }

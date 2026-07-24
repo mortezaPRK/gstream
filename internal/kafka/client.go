@@ -4,9 +4,13 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	gstream "github.com/mortezaPRK/gstream"
+	"github.com/google/uuid"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
@@ -178,7 +182,11 @@ func New(cfg gstream.Config, topics []string, logger *slog.Logger, opts ...Clien
 	}
 
 	if cfg.Guarantee == gstream.ExactlyOnce {
-		eosOpts := buildOptsEOS(cfg, topics, logger, co)
+		instanceID, err := resolveInstanceID(cfg)
+		if err != nil {
+			return nil, fmt.Errorf("kafka.New: failed to resolve EOS instance ID: %w", err)
+		}
+		eosOpts := buildOptsEOS(cfg, topics, logger, co, instanceID)
 		sess, err := kgo.NewGroupTransactSession(eosOpts...)
 		if err != nil {
 			return nil, fmt.Errorf("kafka.New: failed to create EOS session: %w", err)
@@ -231,6 +239,47 @@ func buildOpts(cfg gstream.Config, topics []string, logger *slog.Logger, co *cli
 	}
 }
 
+// resolveInstanceID determines the per-instance ID for EOS TransactionalID construction.
+//
+// CORRECTNESS INVARIANT: the instance ID MUST be stable across restarts of the same
+// instance (same StateDir). Stability is what makes EOS crash-safe: a restarted process
+// must reuse its TransactionalID so the broker can fence its own zombie producer and
+// recover/abort the prior pending transaction. Generating a fresh UUID on every start
+// would break this invariant.
+//
+// Resolution order:
+//  1. If cfg.InstanceID != "" → use it verbatim (operator override; no file I/O).
+//  2. Read StateDir/instance-id:
+//     - file exists and non-empty → use trimmed contents (stable restart).
+//     - file absent/empty → generate uuid.NewString(), mkdir StateDir (0o755),
+//       write the file (0o600), use the new ID.
+//  3. Any read/write/mkdir error → return error; startup fails. No silent fallback.
+func resolveInstanceID(cfg gstream.Config) (string, error) {
+	if cfg.InstanceID != "" {
+		return cfg.InstanceID, nil
+	}
+
+	path := filepath.Join(cfg.StateDir, "instance-id")
+	data, err := os.ReadFile(path)
+	if err == nil {
+		if id := strings.TrimSpace(string(data)); id != "" {
+			return id, nil
+		}
+	} else if !os.IsNotExist(err) {
+		return "", fmt.Errorf("resolveInstanceID: read %s: %w", path, err)
+	}
+
+	// File absent or empty: generate a new UUID and persist it.
+	id := uuid.NewString()
+	if err := os.MkdirAll(cfg.StateDir, 0o755); err != nil {
+		return "", fmt.Errorf("resolveInstanceID: mkdir %s: %w", cfg.StateDir, err)
+	}
+	if err := os.WriteFile(path, []byte(id), 0o600); err != nil {
+		return "", fmt.Errorf("resolveInstanceID: write %s: %w", path, err)
+	}
+	return id, nil
+}
+
 // buildOptsEOS builds kgo options for ExactlyOnce mode (kgo.NewGroupTransactSession).
 //
 // Key differences from buildOpts (ALO):
@@ -246,10 +295,13 @@ func buildOpts(cfg gstream.Config, topics []string, logger *slog.Logger, co *cli
 //     commits are part of End(TryCommit); committing on revoke outside the transaction
 //     would break the atomic guarantee (R4). The session aborts the in-flight txn on
 //     rebalance automatically.
-func buildOptsEOS(cfg gstream.Config, topics []string, logger *slog.Logger, co *clientOptions) []kgo.Opt {
+//
+// instanceID is the resolved per-instance suffix (from resolveInstanceID); it forms
+// the full TransactionalID "gstream-<ApplicationID>-<instanceID>".
+func buildOptsEOS(cfg gstream.Config, topics []string, logger *slog.Logger, co *clientOptions, instanceID string) []kgo.Opt {
 	return []kgo.Opt{
 		kgo.SeedBrokers(cfg.Brokers...),
-		kgo.TransactionalID("gstream-" + cfg.ApplicationID),
+		kgo.TransactionalID("gstream-" + cfg.ApplicationID + "-" + instanceID),
 		kgo.ConsumerGroup(cfg.ApplicationID),
 		kgo.ConsumeTopics(topics...),
 		kgo.Balancers(kgo.CooperativeStickyBalancer()),
