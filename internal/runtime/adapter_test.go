@@ -828,6 +828,92 @@ func TestAdapter_RepartitionNoBindings_RegressionZero(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// P5-C5: EOS hook wiring tests
+// ---------------------------------------------------------------------------
+
+// unitTestEOSCfg returns a minimal valid Config with ExactlyOnce for unit tests
+// that do not contact a real broker.
+func unitTestEOSCfg(t *testing.T) gstream.Config {
+	t.Helper()
+	cfg, err := gstream.Configure(
+		gstream.WithName("unit-test-eos"),
+		gstream.WithBrokers("localhost:9092"),
+		gstream.WithGuarantee(gstream.ExactlyOnce),
+	)
+	if err != nil {
+		t.Fatalf("unitTestEOSCfg: %v", err)
+	}
+	return cfg
+}
+
+// TestAdapter_ALO_PostBatchHook_IsFullFlush verifies that an ALO adapter exposes
+// PostBatchHook (full flush) and NO changelog flusher, matching the ALO write order.
+func TestAdapter_ALO_PostBatchHook_IsFullFlush(t *testing.T) {
+	bt := buildSimpleBuiltTopology(t)
+	adapter, err := runtime.NewAdapter(bt, unitTestCfg(t), nil)
+	if err != nil {
+		t.Fatalf("NewAdapter(ALO): %v", err)
+	}
+
+	// ALO: PostBatchHook must be non-nil (full-flush path).
+	if hook := adapter.PostBatchHook(); hook == nil {
+		t.Error("ALO: PostBatchHook() returned nil; expected non-nil full-flush hook")
+	}
+
+	// ALO: ChangelogFlusherHook must be nil (no EOS changelog drain).
+	if flusher := adapter.ChangelogFlusherHook(); flusher != nil {
+		t.Error("ALO: ChangelogFlusherHook() must return nil for ALO; got non-nil")
+	}
+}
+
+// TestAdapter_EOS_PostBatchSweepHook_AndChangelogFlusher verifies that an EOS adapter
+// exposes PostBatchSweepHook (no Kafka I/O) and a non-nil ChangelogFlusherHook
+// (DrainChangelogRecords), confirming the EOS wiring contract (P5-C5).
+func TestAdapter_EOS_PostBatchSweepHook_AndChangelogFlusher(t *testing.T) {
+	bt := buildSimpleBuiltTopology(t)
+	adapter, err := runtime.NewAdapter(bt, unitTestEOSCfg(t), nil)
+	if err != nil {
+		t.Fatalf("NewAdapter(EOS): %v", err)
+	}
+
+	// EOS: PostBatchSweepHook must be non-nil (sweep-only, no Kafka flush).
+	if hook := adapter.PostBatchSweepHook(); hook == nil {
+		t.Error("EOS: PostBatchSweepHook() returned nil; expected non-nil sweep hook")
+	}
+
+	// EOS: ChangelogFlusherHook must be non-nil (DrainChangelogRecords).
+	flusher := adapter.ChangelogFlusherHook()
+	if flusher == nil {
+		t.Fatal("EOS: ChangelogFlusherHook() returned nil; expected non-nil drain hook")
+	}
+
+	// Call the flusher on a stateless topology (zero collectors): must return empty
+	// slice and no error. This exercises DrainChangelogRecords on the zero-store path.
+	recs, err := flusher(context.Background())
+	if err != nil {
+		t.Fatalf("EOS: ChangelogFlusherHook()(ctx) returned error on zero-store topology: %v", err)
+	}
+	if len(recs) != 0 {
+		t.Errorf("EOS: ChangelogFlusherHook() on zero-store topology: expected 0 records, got %d", len(recs))
+	}
+}
+
+// TestAdapter_ALO_PostBatchSweepHook_AlwaysAvailable verifies that PostBatchSweepHook
+// is callable on an ALO adapter too (no panic). The returned function is the same
+// non-Kafka-flush path; this is a regression guard ensuring the hook exists regardless
+// of Guarantee.
+func TestAdapter_ALO_PostBatchSweepHook_AlwaysAvailable(t *testing.T) {
+	bt := buildSimpleBuiltTopology(t)
+	adapter, err := runtime.NewAdapter(bt, unitTestCfg(t), nil)
+	if err != nil {
+		t.Fatalf("NewAdapter(ALO): %v", err)
+	}
+	if hook := adapter.PostBatchSweepHook(); hook == nil {
+		t.Error("ALO: PostBatchSweepHook() returned nil; method must always return non-nil")
+	}
+}
+
 // outTopics extracts topic names from OutRecords for error messages.
 func outTopics(outs []kafka.OutRecord) []string {
 	topics := make([]string, len(outs))

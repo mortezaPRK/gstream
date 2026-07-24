@@ -2,13 +2,36 @@ package state
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"time"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
+
+// pollLSOConfirmTimeout is the deadline given to each PollFetches call after
+// lsoReachedHW is true (LastStableOffset >= hw seen in a fetch response).
+// LSO >= hw is a deterministic signal: all transactions up to hw are resolved,
+// so no more committed records will ever arrive for this partition. After LSO
+// fires, the only reason to keep polling is to drain any committed records that
+// arrived in the same response cycle but haven't been delivered yet (kgo
+// pre-fetches eagerly; any such records arrive within one broker RTT, typically
+// <50ms). 500ms gives 10x RTT headroom while eliminating the old 2s tax on the
+// aborted-tail termination path.
+//
+// This timeout is the fallback for two cases:
+//  1. Aborted tail: LSO fires when committed records arrive (which also report
+//     LSO == HW), the bounded poll expires, and we break — typically in <500ms
+//     rather than the old 2s.
+//  2. All-aborted (no committed records at all): kgo does not buffer empty-record
+//     responses (source.go:hasErrorsOrRecords), so LSO is never observed via a
+//     delivered response. PollFetches blocks indefinitely on the caller context;
+//     this timeout is never reached. Callers must supply a context with a deadline
+//     to bound this pathological edge.
+const pollLSOConfirmTimeout = 500 * time.Millisecond
 
 // RestoreFromChangelog replays a changelog topic partition into db, rebuilding
 // local state from [checkpointOffset+1, highWatermark). It uses a short-lived
@@ -36,6 +59,50 @@ import (
 // committed once with pebble.Sync. The checkpoint is written in the same batch
 // atomically. For very large changelogs callers should consider snapshotting
 // multiple checkpoints; this implementation is correct-first.
+//
+// EOS / aborted-tail: With ReadCommitted isolation, aborted-transaction records
+// are never delivered by PollFetches. If the changelog tail (offset hw-1) is an
+// aborted record (the normal EOS crash-mid-transaction scenario), waiting for a
+// delivered record at offset hw-1 hangs forever. Instead, termination uses a
+// two-signal strategy:
+//
+//  1. lsoReachedHW: set when any fetch response reports LastStableOffset >= hw.
+//     LSO >= hw means all transactions up to the high-watermark are resolved
+//     (committed or aborted), so no more committed records will ever arrive.
+//     Unlike HighWatermark, LSO does NOT imply "all committed records already
+//     delivered" — it only implies "no new ones are coming". For committed
+//     changelogs (including large multi-response), LSO == hw is reported as
+//     early as the first fetch response, while the actual committed records may
+//     span many subsequent responses. Therefore lsoReachedHW alone is NOT a
+//     safe break condition.
+//
+//  2. Bounded-poll confirm: after lsoReachedHW is true, switch to
+//     pollLSOConfirmTimeout for each subsequent PollFetches call. kgo
+//     pre-fetches eagerly; any committed records still in flight arrive within
+//     one broker RTT (typically <50ms), well under the timeout. A deadline
+//     expiry after lsoReachedHW means the cursor is at HW with no more
+//     committed records — deterministic termination with at most 500ms overhead
+//     on the aborted-tail path (down from 2s).
+//
+// Termination cases:
+//   - ALO / committed-tail fast path: lastAppliedOffset reaches hw-1. Break
+//     immediately; no bounded poll needed.
+//   - Aborted tail (committed records + aborted tail): lsoReachedHW fires on
+//     the response delivering committed records (LSO==hw once abort marker
+//     written). The bounded confirm-poll expires quickly (cursor at HW, no
+//     more committed records) and we break. Typically <500ms.
+//   - Large multi-response (committed only): lsoReachedHW fires on response 1
+//     (LSO==hw for committed-only changelogs). The bounded confirm-polls
+//     continue to drain responses 2..N (each arrives within RTT). Eventually
+//     lastAppliedOffset reaches hw-1 and the ALO fast-path fires, or the final
+//     confirm-poll expires after all committed records are consumed.
+//   - All-aborted (no committed records): kgo does not buffer empty-record
+//     responses (hasErrorsOrRecords returns false). PollFetches never returns,
+//     lsoReachedHW is never set, and the loop blocks on the caller context.
+//     The caller must supply a context with a deadline for this edge.
+//
+// extraOpts are appended to the internal kgo consumer options; tests may use
+// them to override fetch limits (e.g. kgo.FetchMaxPartitionBytes).
 func RestoreFromChangelog(
 	ctx context.Context,
 	brokers []string,
@@ -44,7 +111,12 @@ func RestoreFromChangelog(
 	checkpointOffset int64,
 	db *pebble.DB,
 	storeName string,
+	catchUpTimeout time.Duration,
+	extraOpts ...kgo.Opt,
 ) (highWatermark int64, err error) {
+	if catchUpTimeout <= 0 {
+		catchUpTimeout = pollLSOConfirmTimeout
+	}
 	if len(brokers) == 0 {
 		return 0, fmt.Errorf("state.RestoreFromChangelog: brokers must not be empty")
 	}
@@ -66,14 +138,16 @@ func RestoreFromChangelog(
 		return hw, nil
 	}
 
-	consumer, err := kgo.NewClient(
+	consumerOpts := append([]kgo.Opt{
 		kgo.SeedBrokers(brokers...),
 		kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{
 			changelogTopic: {
 				partition: kgo.NewOffset().At(startOffset),
 			},
 		}),
-	)
+		kgo.FetchIsolationLevel(kgo.ReadCommitted()),
+	}, extraOpts...)
+	consumer, err := kgo.NewClient(consumerOpts...)
 	if err != nil {
 		return 0, fmt.Errorf("state.RestoreFromChangelog: create consumer: %w", err)
 	}
@@ -83,57 +157,124 @@ func RestoreFromChangelog(
 	defer batch.Close() // no-op if already committed
 
 	lastAppliedOffset := int64(-1)
-	targetLastOffset := hw - 1 // last record offset we need to consume
 
-	for {
-		// Check context before each poll to respect cancellation/timeout.
-		select {
-		case <-ctx.Done():
-			return 0, fmt.Errorf("state.RestoreFromChangelog: context done during consume: %w", ctx.Err())
-		default:
-		}
+	// lsoReachedHW is set to true when a fetch response reports
+	// FetchPartition.LastStableOffset >= hw. LSO >= hw is a deterministic
+	// signal that all transactions up to the high-watermark are resolved
+	// (committed or aborted), so no new committed records will ever arrive.
+	// This is superior to HighWatermark as a termination hint because it
+	// directly reflects transaction resolution state. However, LSO >= hw
+	// does NOT mean all committed records have already been delivered
+	// (especially for large changelogs spanning multiple fetch responses),
+	// so it triggers a bounded confirm-poll rather than an immediate break.
+	lsoReachedHW := false
 
-		fetches := consumer.PollFetches(ctx)
-		if fetches.IsClientClosed() {
-			break
+	// applyFetches applies records to the Pebble batch, tracks
+	// lastAppliedOffset, and updates lsoReachedHW via partition metadata.
+	// Returns false (and sets err) on the first Pebble batch error.
+	applyFetches := func(fs kgo.Fetches) bool {
+		if fs.Err() != nil {
+			err = fmt.Errorf("state.RestoreFromChangelog: poll fetches: %w", fs.Err())
+			return false
 		}
-		if err := fetches.Err(); err != nil {
-			return 0, fmt.Errorf("state.RestoreFromChangelog: poll fetches: %w", err)
-		}
-
-		done := false
-		fetches.EachRecord(func(r *kgo.Record) {
-			if done {
+		ok := true
+		fs.EachRecord(func(r *kgo.Record) {
+			if !ok {
 				return
 			}
-			// Tombstone detection: ChangelogProducer.Flush sets Value=nil for
-			// Delete mutations; a Kafka consumer receives nil/empty for a tombstone.
+			// Tombstone detection: nil/empty Value == Pebble delete.
 			if len(r.Value) == 0 {
 				if batchErr := batch.Delete(r.Key, nil); batchErr != nil {
-					// Capture the error via the outer err variable and signal done.
 					err = fmt.Errorf("state.RestoreFromChangelog: batch.Delete offset %d: %w",
 						r.Offset, batchErr)
-					done = true
+					ok = false
 					return
 				}
 			} else {
 				if batchErr := batch.Set(r.Key, r.Value, nil); batchErr != nil {
 					err = fmt.Errorf("state.RestoreFromChangelog: batch.Set offset %d: %w",
 						r.Offset, batchErr)
-					done = true
+					ok = false
 					return
 				}
 			}
 			lastAppliedOffset = r.Offset
-			if r.Offset >= targetLastOffset {
-				done = true
+		})
+		// Check LSO from partition metadata in this fetch response.
+		// LastStableOffset >= hw means all transactions up to HW are
+		// resolved; no more committed records will ever arrive for this
+		// partition. This fires as soon as the broker has resolved all
+		// transactions — for committed-only changelogs this is typically
+		// on the first response (LSO==hw immediately), while for
+		// aborted-tail changelogs it fires after the abort marker is
+		// written (also on the first response delivering committed records,
+		// since the abort was pre-written before restore started).
+		fs.EachPartition(func(ftp kgo.FetchTopicPartition) {
+			if ftp.Topic == changelogTopic && ftp.Partition == partition {
+				if ftp.LastStableOffset >= hw {
+					lsoReachedHW = true
+				}
 			}
 		})
+		return ok
+	}
 
-		if err != nil {
+	for {
+		// Check context before each blocking poll.
+		select {
+		case <-ctx.Done():
+			return 0, fmt.Errorf("state.RestoreFromChangelog: context done during consume: %w", ctx.Err())
+		default:
+		}
+
+		// Choose the poll context:
+		//   - Before lsoReachedHW: use caller ctx (no deadline; we must wait
+		//     for the broker to report LSO >= hw in a fetch response).
+		//   - After lsoReachedHW: use a bounded confirm-poll context
+		//     (pollLSOConfirmTimeout). LSO >= hw means no new committed records
+		//     will arrive, but records from the current fetch cycle may still
+		//     be in flight (kgo pre-fetches eagerly; they arrive within one
+		//     broker RTT, typically <50ms). A deadline expiry after lsoReachedHW
+		//     means the cursor is at HW with no more committed records to drain.
+		var pollCtx context.Context
+		var pollCancel context.CancelFunc
+		if lsoReachedHW {
+			pollCtx, pollCancel = context.WithTimeout(ctx, catchUpTimeout)
+		} else {
+			pollCtx = ctx
+			pollCancel = func() {} // no-op
+		}
+
+		// Blocking poll: waits for the next fetch response (or pollCtx deadline).
+		fetches := consumer.PollFetches(pollCtx)
+		// Capture whether deadline fired before cancelling (pollCancel() would
+		// change pollCtx.Err() to Canceled, masking DeadlineExceeded).
+		pollDeadlineExceeded := lsoReachedHW && errors.Is(pollCtx.Err(), context.DeadlineExceeded)
+		pollCancel()
+
+		if pollDeadlineExceeded {
+			// Deadline expired during post-LSO confirm-poll. This is the
+			// deterministic signal that kgo's cursor is at HW with no more
+			// committed records to deliver (LSO >= hw already confirmed that
+			// no new committed records will arrive). Not an error unless the
+			// caller's ctx was also cancelled.
+			if ctx.Err() != nil {
+				return 0, fmt.Errorf("state.RestoreFromChangelog: context done during consume: %w", ctx.Err())
+			}
+			// LSO confirmed; cursor at HW; all committed records consumed. Done.
+			break
+		}
+
+		if fetches.IsClientClosed() {
+			break
+		}
+		if !applyFetches(fetches) {
 			return 0, err
 		}
-		if done {
+
+		// ALO / committed-tail fast path: last record delivered exactly at hw-1.
+		// No bounded poll needed — nothing more exists.
+		if lastAppliedOffset >= hw-1 {
 			break
 		}
 	}

@@ -69,6 +69,15 @@ type Config struct {
 	// CommitInterval controls how frequently offsets (ALO) or Kafka transactions
 	// (EOS) are committed. Defaults to 100 ms.
 	CommitInterval time.Duration
+
+	// RestoreCatchUpTimeout bounds how long changelog restore waits for straggler
+	// committed records after the partition's stable offset reaches the
+	// high-watermark, before concluding restore is complete. Needed because Kafka
+	// exposes no deterministic "caught up" signal for direct-partition consumers;
+	// restore detects end-of-committed-data past an aborted transaction tail via
+	// this bounded poll. Defaults to 2s. Lower only for low-latency brokers — too
+	// low risks incomplete restore on large multi-response changelogs under load.
+	RestoreCatchUpTimeout time.Duration
 }
 
 // Option is a functional option for Configure.
@@ -114,6 +123,11 @@ func WithCommitInterval(d time.Duration) Option {
 	return func(c *Config) { c.CommitInterval = d }
 }
 
+// WithRestoreCatchUpTimeout sets RestoreCatchUpTimeout.
+func WithRestoreCatchUpTimeout(d time.Duration) Option {
+	return func(c *Config) { c.RestoreCatchUpTimeout = d }
+}
+
 // WithNumTaskThreads sets NumTaskThreads.
 func WithNumTaskThreads(n int) Option {
 	return func(c *Config) { c.NumTaskThreads = n }
@@ -156,6 +170,9 @@ func (c *Config) ApplyDefaults() {
 	if c.CommitInterval == 0 {
 		c.CommitInterval = 100 * time.Millisecond
 	}
+	if c.RestoreCatchUpTimeout == 0 {
+		c.RestoreCatchUpTimeout = 2 * time.Second
+	}
 	if c.StateDir == "" && c.ApplicationID != "" {
 		c.StateDir = filepath.Join(os.TempDir(), "gstream-"+c.ApplicationID)
 	}
@@ -178,6 +195,9 @@ func (c *Config) Validate() error {
 	}
 	if c.CommitInterval <= 0 {
 		errs = append(errs, fmt.Errorf("CommitInterval must be positive, got %s", c.CommitInterval))
+	}
+	if c.RestoreCatchUpTimeout <= 0 {
+		errs = append(errs, fmt.Errorf("RestoreCatchUpTimeout must be positive, got %s", c.RestoreCatchUpTimeout))
 	}
 
 	return errors.Join(errs...)

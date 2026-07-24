@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"hash/fnv"
 
+	"github.com/mortezaPRK/gstream/internal/kafka"
+	"github.com/mortezaPRK/gstream/xtypes"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
@@ -61,38 +63,69 @@ func NewChangelogProducer(brokers []string, topic string) (*ChangelogProducer, e
 	return &ChangelogProducer{kc: kc, topic: topic}, nil
 }
 
-// Flush produces all mutations to the changelog topic, pinned to partition.
-// Each Mutation is mapped to a kgo.Record:
+// Encode converts mutations into []kafka.OutRecord pinned to partition.
+// Each Mutation maps to one OutRecord:
 //   - Key   = Put.Key or Delete.Key (full Pebble key including store prefix)
 //   - Value = Put.Value (non-nil), or nil for Delete (Kafka tombstone)
+//   - Partition is pinned (IsValid=true, Value=partition) so the record is
+//     routed to the exact partition regardless of key hash.
 //
-// Records are produced synchronously (ProduceSync). The first produce error is
-// returned; on error no further records in the batch are attempted.
+// Encode contains all encoding logic; Flush and the EOS path (C1) both
+// delegate encoding here so the mapping lives in one place.
+//
+// Return type is []kafka.OutRecord (not []*kgo.Record) because the runtime
+// layer speaks OutRecord — the kafka transport layer turns OutRecord→kgo.Record
+// at produce time. Encode is the bridge from the state layer's Mutation world
+// to the runtime layer's produce vocabulary. (internal/state already imports
+// internal/kafka for record.go; internal/kafka does not import internal/state,
+// so there is no import cycle.)
+func (p *ChangelogProducer) Encode(partition int32, muts []Mutation) []kafka.OutRecord {
+	if len(muts) == 0 {
+		return nil
+	}
+	out := make([]kafka.OutRecord, len(muts))
+	for i, m := range muts {
+		switch mut := m.(type) {
+		case Put:
+			out[i] = kafka.OutRecord{
+				Topic:     p.topic,
+				Key:       mut.Key,
+				Value:     mut.Value,
+				Partition: xtypes.NilOf(partition),
+			}
+		case Delete:
+			out[i] = kafka.OutRecord{
+				Topic:     p.topic,
+				Key:       mut.Key,
+				Value:     nil, // Kafka tombstone
+				Partition: xtypes.NilOf(partition),
+			}
+		}
+	}
+	return out
+}
+
+// Flush produces all mutations to the changelog topic, pinned to partition.
+// Encoding is delegated to Encode; the ALO semantics are unchanged:
+//   - Records are produced synchronously via ProduceSync.
+//   - The first produce error is returned; no further records are attempted.
+//
+// EOS callers must NOT use Flush — they call Encode and hand the resulting
+// OutRecords to the transactional session's ProduceSync instead.
 func (p *ChangelogProducer) Flush(ctx context.Context, partition int32, muts []Mutation) error {
 	if len(muts) == 0 {
 		return nil
 	}
 
-	records := make([]*kgo.Record, len(muts))
-	for i, m := range muts {
-		var rec *kgo.Record
-		switch mut := m.(type) {
-		case Put:
-			rec = &kgo.Record{
-				Topic:     p.topic,
-				Key:       mut.Key,
-				Value:     mut.Value,
-				Partition: partition,
-			}
-		case Delete:
-			rec = &kgo.Record{
-				Topic:     p.topic,
-				Key:       mut.Key,
-				Value:     nil, // Kafka tombstone
-				Partition: partition,
-			}
+	outs := p.Encode(partition, muts)
+	records := make([]*kgo.Record, len(outs))
+	for i, o := range outs {
+		records[i] = &kgo.Record{
+			Topic:     o.Topic,
+			Key:       o.Key,
+			Value:     o.Value,
+			Partition: o.Partition.Value, // always pinned (IsValid=true from Encode)
 		}
-		records[i] = rec
 	}
 
 	results := p.kc.ProduceSync(ctx, records...)
