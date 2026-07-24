@@ -74,11 +74,21 @@ type Adapter struct {
 //   - For stateful topologies internal sinks (e.g. ktable-out-N) absent from bt.Sinks
 //     are silently skipped.
 //
-// Wire LifecycleCallbacks, PostBatchHook, and SourceTopics into the kafka.Client:
+// Wire LifecycleCallbacks, post-batch hooks, and SourceTopics into the kafka.Client.
+//
+// ALO (default, Guarantee != ExactlyOnce):
 //
 //	client, _ := kafka.New(cfg, adapter.SourceTopics(), logger,
 //	    kafka.WithLifecycle(adapter.LifecycleCallbacks()),
 //	    kafka.WithPostBatch(adapter.PostBatchHook()),
+//	)
+//
+// EOS (Guarantee == ExactlyOnce):
+//
+//	client, _ := kafka.New(cfg, adapter.SourceTopics(), logger,
+//	    kafka.WithLifecycle(adapter.LifecycleCallbacks()),
+//	    kafka.WithPostBatch(adapter.PostBatchSweepHook()),
+//	    kafka.WithChangelogFlusher(adapter.ChangelogFlusherHook()),
 //	)
 func NewAdapter(bt *gstream.BuiltTopology, cfg gstream.Config, logger *slog.Logger) (*Adapter, error) {
 	if bt == nil {
@@ -287,9 +297,33 @@ func (a *Adapter) LifecycleCallbacks() (
 	return a.taskManager.OnAssigned, a.taskManager.OnRevoked
 }
 
-// PostBatchHook returns the post-batch function for wiring into kafka.WithPostBatch.
+// PostBatchHook returns the ALO post-batch function for wiring into
+// kafka.WithPostBatch. It performs sweep + WriteStreamTime + changelog
+// producer.Flush (full flush). Use for ALO only.
 func (a *Adapter) PostBatchHook() func(ctx context.Context) error {
 	return a.taskManager.PostBatch
+}
+
+// PostBatchSweepHook returns the EOS post-batch function for wiring into
+// kafka.WithPostBatch. It performs sweep + WriteStreamTime but NO Kafka I/O.
+// Use together with ChangelogFlusherHook for EOS so changelog records are
+// drained into the transaction by the kafka.Client.
+func (a *Adapter) PostBatchSweepHook() func(ctx context.Context) error {
+	return a.taskManager.PostBatchSweep
+}
+
+// ChangelogFlusherHook returns the changelog flusher for wiring into
+// kafka.WithChangelogFlusher for EOS. It drains encoded changelog records
+// from every live task's MutationCollectors so the kafka.Client can produce
+// them inside the Kafka transaction alongside sink records (R2 atomicity).
+// Returns nil for ALO (caller should not wire it under ALO).
+func (a *Adapter) ChangelogFlusherHook() func(ctx context.Context) ([]kafka.OutRecord, error) {
+	if a.cfg.Guarantee != gstream.ExactlyOnce {
+		return nil
+	}
+	return func(ctx context.Context) ([]kafka.OutRecord, error) {
+		return a.taskManager.DrainChangelogRecords()
+	}
 }
 
 // ProcessFunc returns a kafka.ProcessFunc that can be passed to kafka.Client.Run.

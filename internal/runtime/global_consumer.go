@@ -169,6 +169,7 @@ func (gc *GlobalConsumer) Bootstrap(ctx context.Context) error {
 		kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{
 			gc.topic: partAssign,
 		}),
+		kgo.FetchIsolationLevel(kgo.ReadCommitted()),
 	)
 	if err != nil {
 		return fmt.Errorf("runtime.GlobalConsumer.Bootstrap: create client: %w", err)

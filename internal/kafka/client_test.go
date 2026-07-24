@@ -1,6 +1,7 @@
 package kafka
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -19,6 +20,64 @@ func validConfig() gstream.Config {
 		panic("validConfig: " + err.Error())
 	}
 	return cfg
+}
+
+// ---------------------------------------------------------------------------
+// Guarantee routing — ALO vs EOS path selection
+// ---------------------------------------------------------------------------
+
+// TestNew_ALO_UsesKcNotSess verifies that New with AtLeastOnce guarantee
+// populates Client.kc and leaves Client.sess nil (ALO path).
+func TestNew_ALO_UsesKcNotSess(t *testing.T) {
+	cfg := validConfig() // default = AtLeastOnce
+	c, err := New(cfg, []string{"topic"}, nil)
+	if err != nil {
+		t.Fatalf("New ALO: unexpected error: %v", err)
+	}
+	defer c.Close()
+	if c.kc == nil {
+		t.Fatal("ALO: expected kc to be non-nil")
+	}
+	if c.sess != nil {
+		t.Fatal("ALO: expected sess to be nil")
+	}
+}
+
+// TestNew_EOS_UsesSessNotKc verifies that New with ExactlyOnce guarantee
+// populates Client.sess and leaves Client.kc nil (EOS path).
+// kgo.NewGroupTransactSession dials lazily, so no live broker is needed.
+func TestNew_EOS_UsesSessNotKc(t *testing.T) {
+	cfg, err := gstream.Configure(
+		gstream.WithName("eos-test"),
+		gstream.WithBrokers("localhost:19092"), // unreachable; only construction tested
+		gstream.WithGuarantee(gstream.ExactlyOnce),
+	)
+	if err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	c, err := New(cfg, []string{"topic"}, nil)
+	if err != nil {
+		t.Fatalf("New EOS: unexpected error: %v", err)
+	}
+	defer c.Close()
+	if c.sess == nil {
+		t.Fatal("EOS: expected sess to be non-nil")
+	}
+	if c.kc != nil {
+		t.Fatal("EOS: expected kc to be nil")
+	}
+}
+
+// TestWithChangelogFlusher_StoresHook verifies that WithChangelogFlusher wires
+// the function into clientOptions correctly (compile + apply path).
+func TestWithChangelogFlusher_StoresHook(t *testing.T) {
+	var co clientOptions
+	WithChangelogFlusher(func(_ context.Context) ([]OutRecord, error) {
+		return nil, nil
+	})(&co)
+	if co.changelogFlusher == nil {
+		t.Fatal("expected changelogFlusher to be set after WithChangelogFlusher")
+	}
 }
 
 // ---------------------------------------------------------------------------

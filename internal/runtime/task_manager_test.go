@@ -626,3 +626,208 @@ func TestCloseTask_DoesNotCloseGlobalStore(t *testing.T) {
 		t.Errorf("global store closed by closeTask (Put after revoke failed): %v", err)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// PostBatchSweep — no Kafka I/O, sweep-only path (C3)
+// ---------------------------------------------------------------------------
+
+// TestPostBatchSweep_EmptyIsNoError verifies that PostBatchSweep on a
+// TaskManager with no assigned tasks is a no-op (mirrors PostBatch).
+func TestPostBatchSweep_EmptyIsNoError(t *testing.T) {
+	bt := buildStatefulTopology(t)
+	cfg, err := gstream.Configure(
+		gstream.WithName("test-pbs"),
+		gstream.WithBrokers("localhost:9092"),
+	)
+	if err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	tm := runtime.NewTaskManager(bt, cfg, nil)
+	if err := tm.PostBatchSweep(context.Background()); err != nil {
+		t.Fatalf("PostBatchSweep on empty TaskManager: %v", err)
+	}
+}
+
+// TestPostBatchSweep_DoesNotFlush verifies that PostBatchSweep on a zero-store
+// task (created lazily via Executor) does not attempt any Kafka I/O —
+// the task has db==nil so the body is skipped entirely, meaning no
+// producer.Flush is called even if producers existed.
+func TestPostBatchSweep_DoesNotFlush(t *testing.T) {
+	bt := buildZeroStoreBuiltTopology(t)
+	cfg, err := gstream.Configure(
+		gstream.WithName("test-pbs-noflush"),
+		gstream.WithBrokers("localhost:9092"),
+	)
+	if err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	tm := runtime.NewTaskManager(bt, cfg, nil)
+	// Create a lazy zero-store task (db==nil).
+	exec := tm.Executor(0)
+	if exec == nil {
+		t.Fatal("expected non-nil executor")
+	}
+	// PostBatchSweep must not panic or error — the db==nil guard skips I/O.
+	if err := tm.PostBatchSweep(context.Background()); err != nil {
+		t.Fatalf("PostBatchSweep with zero-store task: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// DrainChangelogRecords — encoded OutRecords (C3)
+// ---------------------------------------------------------------------------
+
+// TestDrainChangelogRecords_EmptyTaskManagerReturnsNil verifies that
+// DrainChangelogRecords returns nil (no error) when there are no live tasks.
+func TestDrainChangelogRecords_EmptyTaskManagerReturnsNil(t *testing.T) {
+	bt := buildStatefulTopology(t)
+	cfg, err := gstream.Configure(
+		gstream.WithName("test-dcr"),
+		gstream.WithBrokers("localhost:9092"),
+	)
+	if err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	tm := runtime.NewTaskManager(bt, cfg, nil)
+	recs, err := tm.DrainChangelogRecords()
+	if err != nil {
+		t.Fatalf("DrainChangelogRecords on empty TaskManager: %v", err)
+	}
+	if recs != nil {
+		t.Errorf("want nil OutRecords, got %d", len(recs))
+	}
+}
+
+// TestDrainChangelogRecords_EncodesAndPinsPartition verifies that
+// DrainChangelogRecords encodes pending mutations via ChangelogProducer.Encode
+// and returns OutRecords with pinned partition and correct topic/key/value.
+//
+// This test manually constructs a task with a real Pebble MemDB so the
+// collector can be populated without a broker. It calls store.Put to append a
+// Put mutation to the collector, then calls DrainChangelogRecords and checks:
+//   - len(recs) == 1
+//   - recs[0].Topic matches the changelog topic
+//   - recs[0].Partition is pinned (IsValid=true, Value=partition)
+//   - recs[0].Value is not nil (Put → non-tombstone)
+func TestDrainChangelogRecords_EncodesAndPinsPartition(t *testing.T) {
+	t.Parallel()
+
+	// Build a stateful topology so bt.StoreBindings is populated.
+	bt := buildStatefulTopology(t)
+	cfg, err := gstream.Configure(
+		gstream.WithName("drain-test"),
+		gstream.WithBrokers("localhost:9092"),
+	)
+	if err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+
+	tm := runtime.NewTaskManager(bt, cfg, nil)
+
+	// Inject a pre-built task with real MemDB + collector + stub producer
+	// via the test helper. The stub producer allows Encode without a broker.
+	db, err := state.OpenMemDB()
+	if err != nil {
+		t.Fatalf("OpenMemDB: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	const partition = int32(2)
+	const storeName = "word-count"
+	const changelogTopic = "drain-test-word-count-changelog"
+
+	collector := &state.MutationCollector{}
+	byteStore := state.NewKeyValueStoreWithChangelog[[]byte, []byte](
+		storeName, db, gstream.BytesSerde{}, gstream.BytesSerde{}, collector,
+	)
+
+	// Write a value so the collector captures a Put mutation.
+	if err := byteStore.Put([]byte(`"key"`), []byte(`42`)); err != nil {
+		t.Fatalf("store.Put: %v", err)
+	}
+
+	// Verify a mutation was collected before drain.
+	if muts := runtime.TaskManagerDrainCollectorPreview(collector); len(muts) == 0 {
+		t.Fatal("expected at least one pending mutation after store.Put")
+	}
+	// Re-append so DrainChangelogRecords sees them (preview drained them).
+	if err := byteStore.Put([]byte(`"key"`), []byte(`42`)); err != nil {
+		t.Fatalf("store.Put (re-add): %v", err)
+	}
+
+	// Register the fabricated task into the TaskManager via the test helper.
+	runtime.TaskManagerInjectTask(tm, partition, storeName, changelogTopic, collector, db)
+
+	recs, err := tm.DrainChangelogRecords()
+	if err != nil {
+		t.Fatalf("DrainChangelogRecords: %v", err)
+	}
+	if len(recs) == 0 {
+		t.Fatal("DrainChangelogRecords: expected at least 1 OutRecord")
+	}
+	for i, r := range recs {
+		if r.Topic != changelogTopic {
+			t.Errorf("[%d] Topic: got %q, want %q", i, r.Topic, changelogTopic)
+		}
+		if !r.Partition.IsValid {
+			t.Errorf("[%d] Partition.IsValid: want true (pinned)", i)
+		}
+		if r.Partition.Value != partition {
+			t.Errorf("[%d] Partition.Value: got %d, want %d", i, r.Partition.Value, partition)
+		}
+		// Put → non-nil value
+		if r.Value == nil {
+			t.Errorf("[%d] Value: want non-nil for Put mutation", i)
+		}
+	}
+}
+
+// TestDrainChangelogRecords_DeleteProducesTombstone verifies that a Delete
+// mutation produces an OutRecord with nil Value (Kafka tombstone).
+func TestDrainChangelogRecords_DeleteProducesTombstone(t *testing.T) {
+	t.Parallel()
+
+	bt := buildStatefulTopology(t)
+	cfg, err := gstream.Configure(
+		gstream.WithName("drain-tombstone"),
+		gstream.WithBrokers("localhost:9092"),
+	)
+	if err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	tm := runtime.NewTaskManager(bt, cfg, nil)
+
+	db, err := state.OpenMemDB()
+	if err != nil {
+		t.Fatalf("OpenMemDB: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	const partition = int32(1)
+	const storeName = "word-count"
+	const changelogTopic = "drain-tombstone-word-count-changelog"
+
+	collector := &state.MutationCollector{}
+	byteStore := state.NewKeyValueStoreWithChangelog[[]byte, []byte](
+		storeName, db, gstream.BytesSerde{}, gstream.BytesSerde{}, collector,
+	)
+
+	// Put then Delete so only the Delete remains in the collector.
+	_ = byteStore.Put([]byte("k"), []byte("v"))
+	// Drain the Put so only the Delete gets encoded.
+	collector.Drain()
+	_ = byteStore.Delete([]byte("k"))
+
+	runtime.TaskManagerInjectTask(tm, partition, storeName, changelogTopic, collector, db)
+
+	recs, err := tm.DrainChangelogRecords()
+	if err != nil {
+		t.Fatalf("DrainChangelogRecords: %v", err)
+	}
+	if len(recs) != 1 {
+		t.Fatalf("want 1 OutRecord for Delete, got %d", len(recs))
+	}
+	if recs[0].Value != nil {
+		t.Errorf("Delete OutRecord Value: want nil (tombstone), got %v", recs[0].Value)
+	}
+}

@@ -1,5 +1,11 @@
 package runtime
 
+import (
+	"github.com/cockroachdb/pebble"
+	"github.com/mortezaPRK/gstream/internal/state"
+	"github.com/mortezaPRK/gstream/internal/topology"
+)
+
 // TaskManagerStoresForPartition returns the stores map for the given partition's
 // task. Returns nil if no task is assigned for that partition. Exported for
 // unit tests only (via the internal test package access pattern).
@@ -17,4 +23,57 @@ func TaskManagerStoresForPartition(tm *TaskManager, partition int32) map[string]
 // Exported for unit tests only.
 func TaskManagerAllChangelogTopics(tm *TaskManager) map[string]string {
 	return tm.allChangelogTopics()
+}
+
+// TaskManagerDrainCollectorPreview drains mutations from a collector and
+// returns them without re-adding. Used by tests to peek at pending mutations.
+func TaskManagerDrainCollectorPreview(c *state.MutationCollector) []state.Mutation {
+	return c.Drain()
+}
+
+// TaskManagerInjectTask registers a pre-built task for the given partition
+// into the TaskManager. The task has:
+//   - A real Pebble DB (db) for state.
+//   - A single store+collector+producer wired by storeName/changelogTopic.
+//   - A stub Executor (no topology needed for drain tests).
+//
+// Used only by unit tests that need DrainChangelogRecords without OnAssigned
+// (which requires a live broker).
+func TaskManagerInjectTask(
+	tm *TaskManager,
+	partition int32,
+	storeName, changelogTopic string,
+	collector *state.MutationCollector,
+	db *pebble.DB,
+) {
+	// NewChangelogProducer requires live brokers; use the stub constructor that
+	// returns a ChangelogProducer with a nil kc. Encode does not use kc, so
+	// this is safe for tests that only call DrainChangelogRecords (never Flush).
+	producer := newTestChangelogProducer(changelogTopic)
+
+	stores := make(map[string]any, 1)
+	t := &task{
+		db:         db,
+		executor:   topology.NewExecutor(tm.bt.Topology, stores),
+		collectors: map[string]*state.MutationCollector{storeName: collector},
+		producers:  map[string]*state.ChangelogProducer{storeName: producer},
+		stores:     stores,
+		partition:  partition,
+		streamTime: 0,
+	}
+	tm.mu.Lock()
+	tm.tasks[partition] = t
+	tm.mu.Unlock()
+}
+
+// newTestChangelogProducer returns a ChangelogProducer pointing at a fake
+// broker address. kgo.NewClient does not dial at construction time, so this
+// succeeds without a live broker. Only Encode is safe to call on the result
+// (Flush will block waiting for a broker that never responds).
+func newTestChangelogProducer(topic string) *state.ChangelogProducer {
+	p, err := state.NewChangelogProducer([]string{"localhost:19092"}, topic)
+	if err != nil {
+		panic("newTestChangelogProducer: " + err.Error())
+	}
+	return p
 }

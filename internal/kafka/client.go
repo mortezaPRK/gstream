@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"time"
 
 	gstream "github.com/mortezaPRK/gstream"
 	"github.com/twmb/franz-go/pkg/kgo"
@@ -74,20 +75,30 @@ func mixedPartitionerFn(_ string) func(*kgo.Record, int) int {
 // (the record will be reprocessed on the next poll — ALO semantics).
 type ProcessFunc func(ctx context.Context, in InRecord) ([]OutRecord, error)
 
-// Client wraps a kgo.Client and owns the consume-transform-produce-commit loop.
+// Client wraps a kgo.Client (ALO) or kgo.GroupTransactSession (EOS) and owns
+// the consume-transform-produce-commit loop.
 // All kgo types are private; callers interact only through New, Run, and Close.
 type Client struct {
-	kc        *kgo.Client
+	// ALO path: kc is non-nil, sess is nil.
+	kc *kgo.Client
+	// EOS path: sess is non-nil, kc is nil.
+	sess *kgo.GroupTransactSession
+
 	cfg       gstream.Config
 	logger    *slog.Logger
-	postBatch func(ctx context.Context) error // nil = no-op
+	postBatch func(ctx context.Context) error // nil = no-op (ALO: PostBatch; EOS: PostBatchSweep)
+
+	// changelogFlusher is called inside the EOS transaction, after PostBatchSweep,
+	// to drain changelog records for in-transaction produce. Nil for ALO.
+	changelogFlusher func(ctx context.Context) ([]OutRecord, error)
 }
 
 // clientOptions holds optional configuration injected via ClientOption functions.
 type clientOptions struct {
-	onAssigned func(ctx context.Context, assigned map[string][]int32) error
-	onRevoked  func(ctx context.Context, revoked map[string][]int32)
-	postBatch  func(ctx context.Context) error
+	onAssigned       func(ctx context.Context, assigned map[string][]int32) error
+	onRevoked        func(ctx context.Context, revoked map[string][]int32)
+	postBatch        func(ctx context.Context) error
+	changelogFlusher func(ctx context.Context) ([]OutRecord, error)
 }
 
 // ClientOption is a functional option for [New].
@@ -128,13 +139,28 @@ func WithPostBatch(fn func(ctx context.Context) error) ClientOption {
 	}
 }
 
+// WithChangelogFlusher registers a function called inside the EOS transaction
+// (after PostBatchSweep and before ProduceSync) to drain encoded changelog
+// records for atomic in-transaction produce. Ignored under ALO.
+//
+// Wire adapter.TaskManager.DrainChangelogRecords here so changelog and sink
+// records are produced in the same transaction (R2 requirement).
+func WithChangelogFlusher(fn func(ctx context.Context) ([]OutRecord, error)) ClientOption {
+	return func(o *clientOptions) {
+		o.changelogFlusher = fn
+	}
+}
+
 // New constructs a Client from a validated gstream.Config. topics is the list of
 // source topics to consume. Validate is called internally.
 //
-// TODO(EOS): For ExactlyOnce, replace kgo.NewClient with kgo.NewGroupTransactSession,
-// add kgo.TransactionalID("gstream-"+cfg.ApplicationID), and set
-// kgo.FetchIsolationLevel(kgo.ReadCommitted()). The ALO commit path in Run must then
-// be replaced by sess.Begin()/sess.End(ctx, kgo.TryCommit).
+// For ExactlyOnce, New builds a kgo.GroupTransactSession instead of a plain
+// kgo.Client. The EOS session adds:
+//   - kgo.TransactionalID("gstream-"+cfg.ApplicationID): single-instance fencing.
+//   - kgo.FetchIsolationLevel(kgo.ReadCommitted()): no aborted changelog replayed.
+//   - kgo.TransactionTimeout(60s): explicit timeout within the broker max.
+//   - OnPartitionsRevoked WITHOUT CommitUncommittedOffsets: the session aborts on
+//     revoke; offset commits happen only via End(TryCommit).
 func New(cfg gstream.Config, topics []string, logger *slog.Logger, opts ...ClientOption) (*Client, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("kafka.New: invalid config: %w", err)
@@ -149,6 +175,21 @@ func New(cfg gstream.Config, topics []string, logger *slog.Logger, opts ...Clien
 	co := &clientOptions{}
 	for _, o := range opts {
 		o(co)
+	}
+
+	if cfg.Guarantee == gstream.ExactlyOnce {
+		eosOpts := buildOptsEOS(cfg, topics, logger, co)
+		sess, err := kgo.NewGroupTransactSession(eosOpts...)
+		if err != nil {
+			return nil, fmt.Errorf("kafka.New: failed to create EOS session: %w", err)
+		}
+		return &Client{
+			sess:             sess,
+			cfg:              cfg,
+			logger:           logger,
+			postBatch:        co.postBatch,
+			changelogFlusher: co.changelogFlusher,
+		}, nil
 	}
 
 	kgoOpts := buildOpts(cfg, topics, logger, co)
@@ -190,13 +231,70 @@ func buildOpts(cfg gstream.Config, topics []string, logger *slog.Logger, co *cli
 	}
 }
 
+// buildOptsEOS builds kgo options for ExactlyOnce mode (kgo.NewGroupTransactSession).
+//
+// Key differences from buildOpts (ALO):
+//   - kgo.TransactionalID: enables producer transactions; triggers InitProducerID
+//     on Begin(), which fences any zombie instance holding the same ID.
+//   - kgo.FetchIsolationLevel(ReadCommitted): changelog restore and input polling
+//     skip aborted transactional records (R3). Without this, a crashed instance's
+//     aborted changelog records would be replayed on task reassignment.
+//   - kgo.TransactionTimeout(60s): explicit; must be <= broker's
+//     transaction.max.timeout.ms. The kgo default is 40s; 60s gives more headroom
+//     for slower batches without risking broker rejection on well-configured clusters.
+//   - OnPartitionsRevoked does NOT call CommitUncommittedOffsets: under EOS, offset
+//     commits are part of End(TryCommit); committing on revoke outside the transaction
+//     would break the atomic guarantee (R4). The session aborts the in-flight txn on
+//     rebalance automatically.
+func buildOptsEOS(cfg gstream.Config, topics []string, logger *slog.Logger, co *clientOptions) []kgo.Opt {
+	return []kgo.Opt{
+		kgo.SeedBrokers(cfg.Brokers...),
+		kgo.TransactionalID("gstream-" + cfg.ApplicationID),
+		kgo.ConsumerGroup(cfg.ApplicationID),
+		kgo.ConsumeTopics(topics...),
+		kgo.Balancers(kgo.CooperativeStickyBalancer()),
+		kgo.DisableAutoCommit(),
+		kgo.FetchIsolationLevel(kgo.ReadCommitted()),
+		kgo.TransactionTimeout(60 * time.Second),
+		kgo.WithLogger(newKgoLogger(logger)),
+		kgo.RecordPartitioner(kgo.BasicConsistentPartitioner(mixedPartitionerFn)),
+		kgo.OnPartitionsAssigned(func(ctx context.Context, _ *kgo.Client, assigned map[string][]int32) {
+			logger.Info("EOS: partitions assigned", slog.Any("partitions", assigned))
+			if co.onAssigned != nil {
+				if err := co.onAssigned(ctx, assigned); err != nil {
+					logger.Error("EOS: onAssigned hook failed", slog.Any("error", err))
+				}
+			}
+		}),
+		// OnPartitionsRevoked: user callback only — NO CommitUncommittedOffsets.
+		// EOS offset commits happen atomically inside End(TryCommit); committing
+		// outside the transaction on revoke would expose partial state (R4 violation).
+		// The session internally aborts the in-flight txn when a rebalance occurs.
+		kgo.OnPartitionsRevoked(func(ctx context.Context, _ *kgo.Client, revoked map[string][]int32) {
+			logger.Info("EOS: partitions revoked", slog.Any("partitions", revoked))
+			if co.onRevoked != nil {
+				co.onRevoked(ctx, revoked)
+			}
+		}),
+	}
+}
+
 // Run is the main consume-transform-produce-commit loop. It blocks until ctx is
 // cancelled or a fatal error is encountered.
 //
-// ALO commit ordering: for each polled batch — process → produce → commit offsets.
-// If process returns an error the batch is aborted (at-least-once redelivery).
+// ALO commit ordering: process → produce → commit offsets.
+// EOS commit ordering: Begin → process → PostBatchSweep → ProduceSync(sinks+changelog) → End(TryCommit).
 func (c *Client) Run(ctx context.Context, process ProcessFunc) error {
-	c.logger.Info("kafka client run started",
+	if c.cfg.Guarantee == gstream.ExactlyOnce {
+		return c.runEOS(ctx, process)
+	}
+	return c.runALO(ctx, process)
+}
+
+// runALO is the original at-least-once loop. It is byte-for-byte identical to
+// the previous Run implementation; gated by cfg.Guarantee != ExactlyOnce.
+func (c *Client) runALO(ctx context.Context, process ProcessFunc) error {
+	c.logger.Info("kafka client ALO run started",
 		slog.String("applicationID", c.cfg.ApplicationID),
 		slog.Duration("commitInterval", c.cfg.CommitInterval),
 	)
@@ -301,9 +399,217 @@ func (c *Client) Run(ctx context.Context, process ProcessFunc) error {
 	}
 }
 
-// Close shuts down the underlying kgo client gracefully. It flushes any pending
-// produce requests and commits pending offsets before returning.
+// outRecordsToKgo encodes []OutRecord to []*kgo.Record using the same sentinel
+// convention as runALO: IsValid=false → Partition=-1 (key-hash); IsValid=true →
+// pinned partition (changelog co-partitioning).
+func outRecordsToKgo(outs []OutRecord) []*kgo.Record {
+	krs := make([]*kgo.Record, len(outs))
+	for i, o := range outs {
+		kr := &kgo.Record{
+			Topic: o.Topic,
+			Key:   o.Key,
+			Value: o.Value,
+		}
+		if !o.Partition.IsValid {
+			kr.Partition = -1
+		} else {
+			kr.Partition = o.Partition.Value
+		}
+		krs[i] = kr
+	}
+	return krs
+}
+
+// runEOS is the exactly-once consume-transform-produce loop. It uses
+// kgo.GroupTransactSession to make sink writes, changelog writes, and
+// source-offset commits atomic (one Kafka transaction per batch).
+//
+// Loop invariant: for every polled batch exactly one of the following is true
+// on loop iteration exit:
+//   - End(TryCommit) returned (committed=true, err=nil): state + sinks advanced.
+//   - End(TryAbort) returned or rebalance aborted (committed=false, err=nil):
+//     input will be redelivered; local Pebble state may be ahead of the
+//     committed changelog (transient divergence — see note below).
+//   - err!=nil returned from End(TryCommit): fatal/unknown txn state; loop exits
+//     and the caller should restart the application.
+//
+// # Drain/abort consistency (local-Pebble-ahead-of-changelog)
+//
+// On abort, local Pebble already has the mutations applied (process fn writes
+// to Pebble via store.Put before runEOS can call DrainChangelogRecords).
+// DrainChangelogRecords then drains the collector — mutations are removed from
+// the collector but NOT rolled back from Pebble. So after an abort:
+//   - Committed changelog: no new record (aborted by transaction).
+//   - Local Pebble: has the change.
+//
+// Is this a problem? Only if restore trusts local Pebble without reconciling
+// with the committed changelog. In openTask, RestoreFromChangelog is called
+// on EVERY assignment and replays committed changelog records from the last
+// checkpoint into Pebble (overwriting local state). Since RestoreFromChangelog
+// uses a plain kgo.NewClient (not ReadCommitted — see C4 note below), AND the
+// changelog record was never committed, it will NOT appear in the replay.
+// On task reassignment after crash/rebalance, Pebble is REBUILT from the
+// committed changelog: the local-ahead state is discarded.
+//
+// Therefore: local-Pebble-ahead-on-abort is SAFE because task reassignment
+// always discards local state and rebuilds from the committed changelog.
+// The divergence is transient and self-correcting.
+//
+// # C4 Note (for next task)
+//
+// RestoreFromChangelog uses kgo.NewClient WITHOUT FetchIsolationLevel(ReadCommitted).
+// This means: if a transaction is in-flight when restore runs, aborted changelog
+// records COULD be replayed (FetchIsolationLevel defaults to ReadUncommitted on
+// a plain kgo client). Under normal EOS operation this window is small (restore
+// only runs during OnAssigned, which follows a rebalance that aborts the txn),
+// but it is a latent correctness bug. C4 must add ReadCommitted to
+// RestoreFromChangelog's consumer to close this gap fully.
+func (c *Client) runEOS(ctx context.Context, process ProcessFunc) error {
+	c.logger.Info("kafka client EOS run started",
+		slog.String("applicationID", c.cfg.ApplicationID),
+		slog.Duration("commitInterval", c.cfg.CommitInterval),
+	)
+
+	for {
+		// --- Begin transaction ---
+		if err := c.sess.Begin(); err != nil {
+			// Begin failure is fatal: cannot start a new transaction.
+			c.logger.Error("EOS: Begin failed; stopping loop", slog.Any("error", err))
+			return fmt.Errorf("runEOS: Begin: %w", err)
+		}
+
+		// --- Poll ---
+		fetches := c.sess.PollFetches(ctx)
+		if fetches.IsClientClosed() {
+			c.logger.Info("EOS: kafka client closed; stopping run loop")
+			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			// Context cancelled: abort open transaction cleanly, then exit.
+			_, _ = c.sess.End(ctx, kgo.TryAbort)
+			c.logger.Info("EOS: context cancelled; stopping run loop", slog.Any("reason", err))
+			return nil
+		}
+
+		fetches.EachError(func(topic string, partition int32, err error) {
+			c.logger.Error("EOS: fetch error",
+				slog.String("topic", topic),
+				slog.Int("partition", int(partition)),
+				slog.Any("error", err),
+			)
+		})
+
+		if fetches.Empty() {
+			// No records: abort the empty transaction cleanly and continue.
+			if _, err := c.sess.End(ctx, kgo.TryAbort); err != nil {
+				c.logger.Warn("EOS: End(TryAbort) on empty batch failed", slog.Any("error", err))
+			}
+			continue
+		}
+
+		// --- Build InRecord slice ---
+		var inRecords []InRecord
+		fetches.EachRecord(func(r *kgo.Record) {
+			inRecords = append(inRecords, InRecord{
+				Topic:     r.Topic,
+				Partition: r.Partition,
+				Offset:    r.Offset,
+				Key:       r.Key,
+				Value:     r.Value,
+				Timestamp: r.Timestamp,
+			})
+		})
+
+		// --- Process ---
+		sinkOuts, ok := processBatch(ctx, c.logger, inRecords, process)
+		if !ok {
+			if _, err := c.sess.End(ctx, kgo.TryAbort); err != nil {
+				c.logger.Warn("EOS: End(TryAbort) after process failure failed", slog.Any("error", err))
+			}
+			continue
+		}
+
+		// --- PostBatchSweep (sweep + WriteStreamTime; no Kafka I/O) ---
+		if c.postBatch != nil {
+			if err := c.postBatch(ctx); err != nil {
+				c.logger.Error("EOS: PostBatchSweep failed; aborting txn",
+					slog.Any("error", err),
+				)
+				if _, err2 := c.sess.End(ctx, kgo.TryAbort); err2 != nil {
+					c.logger.Warn("EOS: End(TryAbort) after sweep failure failed", slog.Any("error", err2))
+				}
+				continue
+			}
+		}
+
+		// --- Drain changelog records ---
+		var changelogOuts []OutRecord
+		if c.changelogFlusher != nil {
+			var err error
+			changelogOuts, err = c.changelogFlusher(ctx)
+			if err != nil {
+				c.logger.Error("EOS: changelog drain failed; aborting txn",
+					slog.Any("error", err),
+				)
+				if _, err2 := c.sess.End(ctx, kgo.TryAbort); err2 != nil {
+					c.logger.Warn("EOS: End(TryAbort) after drain failure failed", slog.Any("error", err2))
+				}
+				continue
+			}
+		}
+
+		// --- ProduceSync: sinks + changelog in ONE call (R2 atomicity) ---
+		allOuts := append(sinkOuts, changelogOuts...)
+		if len(allOuts) > 0 {
+			krs := outRecordsToKgo(allOuts)
+			results := c.sess.ProduceSync(ctx, krs...)
+			produceFailed := false
+			for _, res := range results {
+				if res.Err != nil {
+					c.logger.Error("EOS: ProduceSync failed; aborting txn",
+						slog.String("topic", res.Record.Topic),
+						slog.Any("error", res.Err),
+					)
+					produceFailed = true
+					break
+				}
+			}
+			if produceFailed {
+				if _, err := c.sess.End(ctx, kgo.TryAbort); err != nil {
+					c.logger.Warn("EOS: End(TryAbort) after ProduceSync failure failed", slog.Any("error", err))
+				}
+				continue
+			}
+		}
+
+		// --- End(TryCommit): commit offsets + flush + EndTransaction atomically ---
+		committed, err := c.sess.End(ctx, kgo.TryCommit)
+		if err != nil {
+			// err!=nil from End(TryCommit): txn state is UNKNOWN (not safe to retry
+			// TryCommit on the same batch — could double-commit). The only safe
+			// action is to stop the loop and restart the application.
+			c.logger.Error("EOS: End(TryCommit) returned error; stopping loop (txn state unknown)",
+				slog.Any("error", err),
+			)
+			return fmt.Errorf("runEOS: End(TryCommit): %w", err)
+		}
+		if !committed {
+			// !committed && err==nil: clean abort by the session (rebalance mid-txn).
+			// The session already aborted internally; input records will be redelivered.
+			c.logger.Warn("EOS: transaction aborted by session (rebalance); records will be redelivered")
+		}
+	}
+}
+
+// Close shuts down the underlying kgo client (ALO) or GroupTransactSession (EOS)
+// gracefully. For ALO it flushes any pending produce requests and commits pending
+// offsets. For EOS it closes the session (no commit; any open txn is left for
+// the broker to abort on timeout — callers should End before Close).
 func (c *Client) Close() {
 	c.logger.Info("closing kafka client")
+	if c.sess != nil {
+		c.sess.Close()
+		return
+	}
 	c.kc.Close()
 }

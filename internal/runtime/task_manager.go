@@ -10,6 +10,7 @@ import (
 
 	"github.com/cockroachdb/pebble"
 	gstream "github.com/mortezaPRK/gstream"
+	"github.com/mortezaPRK/gstream/internal/kafka"
 	"github.com/mortezaPRK/gstream/internal/state"
 	"github.com/mortezaPRK/gstream/internal/topology"
 )
@@ -176,6 +177,83 @@ func (tm *TaskManager) PostBatch(ctx context.Context) error {
 	return nil
 }
 
+// PostBatchSweep is the non-Kafka portion of PostBatch: it runs the retention
+// sweep (windowed/session stores) and persists the stream-time watermark for
+// every live task. No Kafka I/O is performed.
+//
+// EOS callers use PostBatchSweep + DrainChangelogRecords instead of PostBatch.
+// The split allows the EOS runEOS loop to hand the encoded changelog records to
+// the transactional session (ProduceSync alongside sink records) before calling
+// End(TryCommit), keeping changelog and source-offset commit atomic (R2).
+//
+// ALO callers use PostBatch (unchanged), which internally performs the same
+// sweep + WriteStreamTime + producer.Flush sequence.
+func (tm *TaskManager) PostBatchSweep(ctx context.Context) error {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	for partition, t := range tm.tasks {
+		if t.db == nil {
+			continue
+		}
+
+		// Retention sweep: tombstones end up in each store's collector so
+		// DrainChangelogRecords picks them up in the same EOS batch.
+		// [SESSION-FROZEN-EXT] OR-extension: runSweep handles both window + session stores.
+		if len(tm.bt.WindowStoreBindings) > 0 || len(tm.bt.SessionStoreBindings) > 0 {
+			if err := tm.runSweep(t); err != nil {
+				return fmt.Errorf("TaskManager.PostBatchSweep: partition %d: sweep: %w", partition, err)
+			}
+		}
+
+		// [SESSION-FROZEN-EXT] OR-extension: persist stream-time for session topologies too.
+		if len(tm.bt.WindowStoreBindings) > 0 || len(tm.bt.SessionStoreBindings) > 0 {
+			if err := state.WriteStreamTime(t.db, t.streamTime); err != nil {
+				// Non-fatal: on crash, stream-time will be rebuilt from redelivered records.
+				tm.logger.Warn("PostBatchSweep: WriteStreamTime failed",
+					slog.Int("partition", int(partition)),
+					slog.Any("error", err),
+				)
+			}
+		}
+	}
+	return nil
+}
+
+// DrainChangelogRecords drains each live task's MutationCollectors and encodes
+// the pending mutations into []kafka.OutRecord via ChangelogProducer.Encode.
+// The returned records are pinned to their respective task partition.
+//
+// Callers (EOS runEOS) must ProduceSync these records inside the same
+// kgo.GroupTransactSession as the sink records so that changelog writes and
+// source-offset commits are atomic (R2 requirement).
+//
+// DrainChangelogRecords does NOT call Flush; it is safe to call after
+// PostBatchSweep (sweep tombstones are already in the collectors at that point).
+func (tm *TaskManager) DrainChangelogRecords() ([]kafka.OutRecord, error) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	var all []kafka.OutRecord
+	for partition, t := range tm.tasks {
+		if t.db == nil {
+			continue
+		}
+		for storeName, collector := range t.collectors {
+			muts := collector.Drain()
+			if len(muts) == 0 {
+				continue
+			}
+			producer := t.producers[storeName]
+			if producer == nil {
+				return nil, fmt.Errorf("TaskManager.DrainChangelogRecords: partition %d store %q: no producer", partition, storeName)
+			}
+			all = append(all, producer.Encode(t.partition, muts)...)
+		}
+	}
+	return all, nil
+}
+
 // WriteCheckpoints writes the current changelog high-watermark checkpoint for
 // each store on each live task. Must be called AFTER produce+commit.
 func (tm *TaskManager) WriteCheckpoints(ctx context.Context, brokers []string) {
@@ -184,7 +262,7 @@ func (tm *TaskManager) WriteCheckpoints(ctx context.Context, brokers []string) {
 
 	for partition, t := range tm.tasks {
 		for storeName, changelogTopic := range tm.allChangelogTopics() {
-			hw, err := state.RestoreFromChangelog(ctx, brokers, changelogTopic, partition /*checkpointOffset=*/, int64(^uint64(0)>>1), t.db, storeName)
+			hw, err := state.RestoreFromChangelog(ctx, brokers, changelogTopic, partition /*checkpointOffset=*/, int64(^uint64(0)>>1), t.db, storeName, tm.cfg.RestoreCatchUpTimeout)
 			if err != nil {
 				tm.logger.Warn("WriteCheckpoints: fetch HW via restore failed",
 					slog.Int("partition", int(partition)),
@@ -307,7 +385,7 @@ func (tm *TaskManager) openTask(ctx context.Context, partition int32) error {
 			checkpoint = -1 // RestoreFromChangelog: start from beginning
 		}
 
-		_, err = state.RestoreFromChangelog(ctx, tm.cfg.Brokers, changelogTopic, partition, checkpoint, db, storeName)
+		_, err = state.RestoreFromChangelog(ctx, tm.cfg.Brokers, changelogTopic, partition, checkpoint, db, storeName, tm.cfg.RestoreCatchUpTimeout)
 		if err != nil {
 			_ = db.Close()
 			return fmt.Errorf("RestoreFromChangelog store %q partition %d: %w", storeName, partition, err)
@@ -345,7 +423,7 @@ func (tm *TaskManager) openTask(ctx context.Context, partition int32) error {
 			checkpoint = -1
 		}
 
-		_, err = state.RestoreFromChangelog(ctx, tm.cfg.Brokers, changelogTopic, partition, checkpoint, db, storeName)
+		_, err = state.RestoreFromChangelog(ctx, tm.cfg.Brokers, changelogTopic, partition, checkpoint, db, storeName, tm.cfg.RestoreCatchUpTimeout)
 		if err != nil {
 			_ = db.Close()
 			return fmt.Errorf("RestoreFromChangelog window store %q partition %d: %w", storeName, partition, err)
@@ -384,7 +462,7 @@ func (tm *TaskManager) openTask(ctx context.Context, partition int32) error {
 			checkpoint = -1
 		}
 
-		_, err = state.RestoreFromChangelog(ctx, tm.cfg.Brokers, changelogTopic, partition, checkpoint, db, storeName)
+		_, err = state.RestoreFromChangelog(ctx, tm.cfg.Brokers, changelogTopic, partition, checkpoint, db, storeName, tm.cfg.RestoreCatchUpTimeout)
 		if err != nil {
 			_ = db.Close()
 			return fmt.Errorf("RestoreFromChangelog session store %q partition %d: %w", storeName, partition, err)
@@ -505,7 +583,7 @@ func (tm *TaskManager) closeTask(ctx context.Context, partition int32) {
 	}
 
 	for storeName, changelogTopic := range tm.allChangelogTopics() {
-		hw, err := state.RestoreFromChangelog(ctx, tm.cfg.Brokers, changelogTopic, partition, int64(^uint64(0)>>1), t.db, storeName)
+		hw, err := state.RestoreFromChangelog(ctx, tm.cfg.Brokers, changelogTopic, partition, int64(^uint64(0)>>1), t.db, storeName, tm.cfg.RestoreCatchUpTimeout)
 		if err == nil && hw > 0 {
 			if err := state.WriteCheckpointSync(t.db, storeName, hw-1); err != nil {
 				tm.logger.Warn("closeTask: WriteCheckpointSync failed",
