@@ -586,3 +586,332 @@ func TestE2E_EOS(t *testing.T) {
 	client3.Close()
 	t.Log("EOS E2E complete: exactly-once confirmed, no duplicates, restore no-hang")
 }
+
+// TestE2E_EOS_KTableTo proves that KTable.To() emits per-key count updates to a
+// real Kafka sink topic under EOS (exactly-once semantics).
+//
+// Topology: Stream[string,string] → GroupByKey → Count("kto-counts") → KTable.To("kto-sink")
+//
+// Assertions:
+//  1. HAPPY PATH: produce a,a,b → EOS commits → ReadCommitted poll on kto-sink
+//     shows the final committed count for each key (a=2, b=1). Records are visible
+//     only after the transaction commits (ReadCommitted isolation).
+//  2. NO DUPLICATE COUNTS: crash mid-transaction, restart with same txnID. The
+//     aborted transaction's sink records are invisible to ReadCommitted consumers.
+//     After client2 commits, the final value for "a" is 3, not 4.
+func TestE2E_EOS_KTableTo(t *testing.T) {
+	if !dockerAvailable() {
+		t.Skip("Docker not available; skipping KTable.To EOS E2E integration test")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Second)
+	defer cancel()
+
+	// ── 1. Start Kafka broker ────────────────────────────────────────────────
+	kc, err := kafkamodule.Run(ctx, "confluentinc/cp-kafka:7.4.0",
+		kafkamodule.WithClusterID("test-cluster-kto-eos"),
+		testcontainers.WithEnv(map[string]string{
+			"KAFKA_AUTO_CREATE_TOPICS_ENABLE":                "false",
+			"KAFKA_TRANSACTION_STATE_LOG_MIN_ISR":            "1",
+			"KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR": "1",
+			"KAFKA_TRANSACTION_MAX_TIMEOUT_MS":               "60000",
+		}),
+	)
+	if err != nil {
+		t.Skipf("failed to start Kafka container: %v", err)
+	}
+	t.Cleanup(func() { _ = kc.Terminate(context.Background()) })
+
+	brokers, err := kc.Brokers(ctx)
+	if err != nil {
+		t.Fatalf("get brokers: %v", err)
+	}
+	t.Logf("kto: brokers: %v", brokers)
+
+	const (
+		appID          = "kto-eos"
+		srcTopic       = "kto-input"
+		storeName      = "kto-counts"
+		sinkTopic      = "kto-sink"
+		changelogTopic = "kto-eos-kto-counts-changelog"
+	)
+
+	// ── 2. Temp state dir ────────────────────────────────────────────────────
+	stateDir, err := os.MkdirTemp("", "gstream-kto-eos-*")
+	if err != nil {
+		t.Fatalf("mktemp: %v", err)
+	}
+	defer os.RemoveAll(stateDir)
+
+	// ── 3. Create topics ─────────────────────────────────────────────────────
+	if err := kafka.EnsureTopics(ctx, brokers, []kafka.TopicSpec{
+		{Name: srcTopic, Partitions: 1, ReplicationFactor: 1},
+		{Name: sinkTopic, Partitions: 1, ReplicationFactor: 1},
+		{
+			Name: changelogTopic, Partitions: 1, ReplicationFactor: 1,
+			Configs: map[string]string{"cleanup.policy": "compact"},
+		},
+	}); err != nil {
+		t.Fatalf("EnsureTopics: %v", err)
+	}
+
+	// ── 4. EOS config ────────────────────────────────────────────────────────
+	cfg, err := gstream.Configure(
+		gstream.WithName(appID),
+		gstream.WithBrokers(brokers...),
+		gstream.WithGuarantee(gstream.ExactlyOnce),
+		gstream.WithStateDir(stateDir),
+	)
+	if err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+
+	buildKToTopology := func() *gstream.BuiltTopology {
+		b := gstream.NewStreamBuilder()
+		table := gstream.Stream[string, string](b, srcTopic, "source",
+			gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{}).
+			GroupByKey(gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{}).
+			Count(storeName)
+		table.To(sinkTopic, gstream.JSONSerde[string]{}, gstream.JSONSerde[int64]{})
+		return b.Build()
+	}
+
+	// =========================================================================
+	// CASE 1: HAPPY PATH — EOS commits sink records exactly once.
+	// Produce a,a,b → final committed sink shows a=2, b=1.
+	// ReadCommitted: records invisible until the transaction commits.
+	// =========================================================================
+	t.Log("kto case1: HAPPY PATH")
+
+	bt1 := buildKToTopology()
+	adapter1, err := runtime.NewAdapter(bt1, cfg, slog.Default())
+	if err != nil {
+		t.Fatalf("kto NewAdapter c1: %v", err)
+	}
+	client1 := buildEOSClient(t, cfg, adapter1)
+
+	run1Ctx, run1Cancel := context.WithCancel(ctx)
+	done1 := make(chan error, 1)
+	go func() { done1 <- client1.Run(run1Ctx, adapter1.ProcessFunc()) }()
+
+	produceStringKeys(t, ctx, brokers, srcTopic, []string{"a", "a", "b"})
+	t.Log("kto case1: produced a,a,b")
+
+	// Poll the SINK topic (not changelog) with ReadCommitted.
+	// Each update emits a record; we want the latest-per-key values.
+	// Under EOS all three records (a=1, a=2, b=1) commit atomically — only then visible.
+	case1Sink := pollSinkTopicCommitted(t, ctx, brokers, sinkTopic,
+		map[string]int64{"a": 2, "b": 1}, 60*time.Second)
+	t.Logf("kto case1: committed sink counts: %v", case1Sink)
+
+	if case1Sink["a"] != 2 {
+		t.Errorf("kto case1: a=%d, want 2", case1Sink["a"])
+	}
+	if case1Sink["b"] != 1 {
+		t.Errorf("kto case1: b=%d, want 1", case1Sink["b"])
+	}
+	t.Log("kto case1: PASSED — a=2, b=1 committed to sink topic")
+
+	run1Cancel()
+	select {
+	case err := <-done1:
+		if err != nil {
+			t.Errorf("kto client1.Run: %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("kto client1.Run did not stop within 20s")
+	}
+	client1.Close()
+
+	// =========================================================================
+	// CASE 2: CRASH → NO DUPLICATE SINK RECORDS.
+	// Produce one more "a". client2 processes it (a=3 locally), crashes before
+	// commit. The aborted sink record (a=3) is invisible to ReadCommitted.
+	// client3 restarts, reprocesses "a" from Pebble-restored baseline (a=2),
+	// commits a=3 to the sink exactly once.
+	// =========================================================================
+	t.Log("kto case2: CRASH → NO DUPLICATES")
+
+	produceStringKeys(t, ctx, brokers, srcTopic, []string{"a"})
+	t.Log("kto case2: produced one more 'a'")
+
+	bt2 := buildKToTopology()
+	adapter2, err := runtime.NewAdapter(bt2, cfg, slog.Default())
+	if err != nil {
+		t.Fatalf("kto NewAdapter c2: %v", err)
+	}
+
+	restoreDone2 := make(chan struct{}, 1)
+	onAssigned2, onRevoked2 := adapter2.LifecycleCallbacks()
+	wrappedAssigned2 := func(ctx2 context.Context, assigned map[string][]int32) error {
+		err := onAssigned2(ctx2, assigned)
+		if err == nil {
+			select {
+			case restoreDone2 <- struct{}{}:
+			default:
+			}
+		}
+		return err
+	}
+	client2, err := kafka.New(cfg, adapter2.SourceTopics(), slog.Default(),
+		kafka.WithLifecycle(wrappedAssigned2, onRevoked2),
+		kafka.WithPostBatch(adapter2.PostBatchSweepHook()),
+		kafka.WithChangelogFlusher(adapter2.ChangelogFlusherHook()),
+	)
+	if err != nil {
+		t.Fatalf("kto kafka.New c2: %v", err)
+	}
+
+	baseProcess2 := adapter2.ProcessFunc()
+	processFired2 := make(chan struct{}, 1)
+	crashProcess2 := func(ctx2 context.Context, in kafka.InRecord) ([]kafka.OutRecord, error) {
+		outs, err := baseProcess2(ctx2, in)
+		select {
+		case processFired2 <- struct{}{}:
+		default:
+		}
+		return outs, err
+	}
+
+	run2Ctx, run2Cancel := context.WithCancel(ctx)
+	done2 := make(chan error, 1)
+	go func() { done2 <- client2.Run(run2Ctx, crashProcess2) }()
+
+	select {
+	case <-restoreDone2:
+		t.Log("kto case2: client2 restore complete")
+	case <-time.After(30 * time.Second):
+		t.Fatal("kto case2: timed out waiting for restore")
+	}
+
+	go func() {
+		select {
+		case <-processFired2:
+			t.Log("kto case2: processFired — cancelling client2")
+			run2Cancel()
+		case <-run2Ctx.Done():
+		}
+	}()
+
+	select {
+	case err := <-done2:
+		if err != nil {
+			t.Logf("kto case2: client2.Run returned: %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("kto case2: client2 did not stop within 20s")
+	}
+	client2.Close()
+	t.Log("kto case2: client2 crashed")
+
+	// client3: restart, fences client2, commits a=3 exactly once.
+	bt3 := buildKToTopology()
+	adapter3, err := runtime.NewAdapter(bt3, cfg, slog.Default())
+	if err != nil {
+		t.Fatalf("kto NewAdapter c3: %v", err)
+	}
+	client3 := buildEOSClient(t, cfg, adapter3)
+
+	run3Ctx, run3Cancel := context.WithCancel(ctx)
+	defer run3Cancel()
+	done3 := make(chan error, 1)
+	go func() { done3 <- client3.Run(run3Ctx, adapter3.ProcessFunc()) }()
+
+	// Poll sink: final value for "a" must be 3 (not 4 = double-count).
+	case2Sink := pollSinkTopicCommitted(t, ctx, brokers, sinkTopic,
+		map[string]int64{"a": 3, "b": 1}, 60*time.Second)
+	t.Logf("kto case2: final committed sink counts: %v", case2Sink)
+
+	if got := case2Sink["a"]; got != 3 {
+		t.Errorf("kto EOS NO-DUPLICATE: a=%d, want 3 (not 4)", got)
+	} else {
+		t.Log("kto case2: NO-DUPLICATE CONFIRMED: a=3 (not doubled to 4)")
+	}
+	if got := case2Sink["b"]; got != 1 {
+		t.Errorf("kto case2: b=%d, want 1", got)
+	}
+
+	run3Cancel()
+	select {
+	case err := <-done3:
+		if err != nil {
+			t.Errorf("kto client3.Run: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("kto client3.Run did not stop within 15s")
+	}
+	client3.Close()
+	t.Log("kto EOS KTable.To E2E complete: exactly-once sink confirmed, no duplicates")
+}
+
+// pollSinkTopicCommitted consumes the sink topic from offset 0 with ReadCommitted
+// isolation and waits until every key in expected has reached its expected int64
+// value. The sink topic carries JSON-encoded string keys and JSON-encoded int64 values
+// (matching JSONSerde[string] and JSONSerde[int64] used in buildKToTopology).
+//
+// Returns the final latest-value map after all conditions are met.
+// Calls t.Fatalf on timeout.
+func pollSinkTopicCommitted(
+	t *testing.T,
+	ctx context.Context,
+	brokers []string,
+	topic string,
+	expected map[string]int64,
+	timeout time.Duration,
+) map[string]int64 {
+	t.Helper()
+
+	readyCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	consumer, err := kgo.NewClient(
+		kgo.SeedBrokers(brokers...),
+		kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{
+			topic: {0: kgo.NewOffset().AtStart()},
+		}),
+		kgo.FetchIsolationLevel(kgo.ReadCommitted()),
+	)
+	if err != nil {
+		t.Fatalf("pollSinkTopicCommitted: create consumer: %v", err)
+	}
+	defer consumer.Close()
+
+	latest := make(map[string]int64)
+
+	allMatch := func() bool {
+		for k, want := range expected {
+			if got, ok := latest[k]; !ok || got != want {
+				return false
+			}
+		}
+		return true
+	}
+
+	for !allMatch() {
+		fetches := consumer.PollFetches(readyCtx)
+		if fetches.IsClientClosed() {
+			break
+		}
+		if err := readyCtx.Err(); err != nil {
+			t.Fatalf("pollSinkTopicCommitted: timed out (%v) waiting for %v; latest: %v", timeout, expected, latest)
+		}
+		fetches.EachRecord(func(r *kgo.Record) {
+			// Key: JSON-encoded string (e.g. `"a"`)
+			var strKey string
+			if err := json.Unmarshal(r.Key, &strKey); err != nil {
+				return // skip malformed
+			}
+			if len(r.Value) == 0 {
+				delete(latest, strKey)
+				return
+			}
+			var count int64
+			if err := json.Unmarshal(r.Value, &count); err != nil {
+				return
+			}
+			latest[strKey] = count
+		})
+	}
+
+	return latest
+}
