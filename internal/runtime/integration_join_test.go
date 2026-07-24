@@ -142,6 +142,7 @@ func TestE2E_StreamTableJoin(t *testing.T) {
 	client1, err := kafka.New(cfg, srcTopics1, slog.Default(),
 		kafka.WithLifecycle(adapter1.LifecycleCallbacks()),
 		kafka.WithPostBatch(adapter1.PostBatchHook()),
+		kafka.WithHealthGate(adapter1.HealthGateHook()),
 	)
 	if err != nil {
 		t.Fatalf("kafka.New p1: %v", err)
@@ -264,6 +265,7 @@ func TestE2E_StreamTableJoin(t *testing.T) {
 	client2, err := kafka.New(cfg, srcTopics2, slog.Default(),
 		kafka.WithLifecycle(wrappedAssigned, onRevoked2),
 		kafka.WithPostBatch(adapter2.PostBatchHook()),
+		kafka.WithHealthGate(adapter2.HealthGateHook()),
 	)
 	if err != nil {
 		t.Fatalf("kafka.New p2: %v", err)

@@ -172,6 +172,7 @@ func TestE2E_WindowedCountRestoreAfterRestart(t *testing.T) {
 	client1, err := kafka.New(cfg, []string{srcTopic}, slog.Default(),
 		kafka.WithLifecycle(adapter1.LifecycleCallbacks()),
 		kafka.WithPostBatch(adapter1.PostBatchHook()),
+		kafka.WithHealthGate(adapter1.HealthGateHook()),
 	)
 	if err != nil {
 		t.Fatalf("kafka.New p1: %v", err)
@@ -284,6 +285,7 @@ func TestE2E_WindowedCountRestoreAfterRestart(t *testing.T) {
 	client2, err := kafka.New(cfg, []string{srcTopic}, slog.Default(),
 		kafka.WithLifecycle(wrappedAssigned2, onRevoked2),
 		kafka.WithPostBatch(adapter2.PostBatchHook()),
+		kafka.WithHealthGate(adapter2.HealthGateHook()),
 	)
 	if err != nil {
 		t.Fatalf("kafka.New p2: %v", err)

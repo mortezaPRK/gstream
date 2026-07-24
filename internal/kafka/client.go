@@ -2,6 +2,7 @@ package kafka
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -13,6 +14,15 @@ import (
 	"github.com/google/uuid"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
+
+// ErrFatalPipeline is a sentinel error returned by the postBatch hook when the
+// pipeline health has been tripped by an un-retryable store-write failure.
+// The run loop checks errors.Is(err, ErrFatalPipeline) on the postBatch return
+// value; if matched, Run exits with the fatal error rather than aborting the
+// batch and redelivering (which would livelock on an un-retryable disk error).
+//
+// Callers should wrap it with %w, not compare with == .
+var ErrFatalPipeline = errors.New("kafka: fatal pipeline error; restart required")
 
 // kafkaMurmur2 replicates Kafka's default partitioner hash (franz-go's murmur2
 // is unexported). Correctness is pinned by TestKafkaMurmur2_MatchesStickyKeyPartitioner.
@@ -95,6 +105,11 @@ type Client struct {
 	// changelogFlusher is called inside the EOS transaction, after PostBatchSweep,
 	// to drain changelog records for in-transaction produce. Nil for ALO.
 	changelogFlusher func(ctx context.Context) ([]OutRecord, error)
+
+	// healthGate is called at the top of each batch iteration to detect a fatal
+	// pipeline error (e.g. un-retryable Pebble store-write from the global tail
+	// consumer or from a per-partition process step).  Nil = no gate (healthy).
+	healthGate func() error
 }
 
 // clientOptions holds optional configuration injected via ClientOption functions.
@@ -103,6 +118,7 @@ type clientOptions struct {
 	onRevoked        func(ctx context.Context, revoked map[string][]int32)
 	postBatch        func(ctx context.Context) error
 	changelogFlusher func(ctx context.Context) ([]OutRecord, error)
+	healthGate       func() error
 }
 
 // ClientOption is a functional option for [New].
@@ -155,6 +171,24 @@ func WithChangelogFlusher(fn func(ctx context.Context) ([]OutRecord, error)) Cli
 	}
 }
 
+// WithHealthGate registers a function called at the top of each batch
+// iteration (before polling) in both runALO and runEOS.  If it returns a
+// non-nil error the run loop exits immediately with that error, allowing the
+// caller to restart the application and trigger changelog restore.
+//
+// The intended use is to detect fatal un-retryable errors (e.g. a Pebble
+// store-write failure signalled by PipelineHealth) so the loop halts cleanly
+// rather than livelocking on infinite redelivery of an un-processable batch.
+//
+// Wire adapter.HealthGateHook() here for both ALO and EOS:
+//
+//	kafka.WithHealthGate(adapter.HealthGateHook())
+func WithHealthGate(fn func() error) ClientOption {
+	return func(o *clientOptions) {
+		o.healthGate = fn
+	}
+}
+
 // New constructs a Client from a validated gstream.Config. topics is the list of
 // source topics to consume. Validate is called internally.
 //
@@ -197,6 +231,7 @@ func New(cfg gstream.Config, topics []string, logger *slog.Logger, opts ...Clien
 			logger:           logger,
 			postBatch:        co.postBatch,
 			changelogFlusher: co.changelogFlusher,
+			healthGate:       co.healthGate,
 		}, nil
 	}
 
@@ -205,7 +240,7 @@ func New(cfg gstream.Config, topics []string, logger *slog.Logger, opts ...Clien
 	if err != nil {
 		return nil, fmt.Errorf("kafka.New: failed to create kgo client: %w", err)
 	}
-	return &Client{kc: kc, cfg: cfg, logger: logger, postBatch: co.postBatch}, nil
+	return &Client{kc: kc, cfg: cfg, logger: logger, postBatch: co.postBatch, healthGate: co.healthGate}, nil
 }
 
 // buildOpts translates a gstream.Config into a kgo.Opt slice. Pure helper kept
@@ -352,6 +387,19 @@ func (c *Client) runALO(ctx context.Context, process ProcessFunc) error {
 	)
 
 	for {
+		// Health gate: check for a fatal pipeline error before each batch.
+		// A non-nil error means an un-retryable failure (e.g. Pebble store-write)
+		// has been signalled; exit the loop so the process can restart and trigger
+		// changelog restore.  This check is a cheap atomic load on the hot path.
+		if c.healthGate != nil {
+			if err := c.healthGate(); err != nil {
+				c.logger.Error("ALO: pipeline health gate tripped; stopping run loop",
+					slog.Any("error", err),
+				)
+				return fmt.Errorf("runALO: pipeline unhealthy: %w", err)
+			}
+		}
+
 		fetches := c.kc.PollFetches(ctx)
 		if fetches.IsClientClosed() {
 			c.logger.Info("kafka client closed; stopping run loop")
@@ -400,8 +448,17 @@ func (c *Client) runALO(ctx context.Context, process ProcessFunc) error {
 		// ALO caveat: a crash between flush and commit leaves the changelog ahead of
 		// the committed source offset. On restart aggFn may be applied twice.
 		// ExactlyOnce makes the window atomic via a single Kafka transaction.
+		//
+		// ErrFatalPipeline: if the hook signals a fatal un-retryable failure (e.g.
+		// Pebble store-write), exit Run so the caller can restart and restore.
 		if c.postBatch != nil {
 			if err := c.postBatch(ctx); err != nil {
+				if errors.Is(err, ErrFatalPipeline) {
+					c.logger.Error("ALO: post-batch hook returned fatal error; stopping run loop",
+						slog.Any("error", err),
+					)
+					return fmt.Errorf("runALO: fatal post-batch: %w", err)
+				}
 				c.logger.Error("post-batch hook failed; not committing offsets",
 					slog.Any("error", err),
 				)
@@ -523,6 +580,19 @@ func (c *Client) runEOS(ctx context.Context, process ProcessFunc) error {
 	)
 
 	for {
+		// Health gate: check for a fatal pipeline error before each batch.
+		// A non-nil error means an un-retryable failure (e.g. Pebble store-write)
+		// has been signalled; exit the loop so the process can restart and trigger
+		// changelog restore.  This check is a cheap atomic load on the hot path.
+		if c.healthGate != nil {
+			if err := c.healthGate(); err != nil {
+				c.logger.Error("EOS: pipeline health gate tripped; stopping run loop",
+					slog.Any("error", err),
+				)
+				return fmt.Errorf("runEOS: pipeline unhealthy: %w", err)
+			}
+		}
+
 		// --- Begin transaction ---
 		if err := c.sess.Begin(); err != nil {
 			// Begin failure is fatal: cannot start a new transaction.
@@ -582,8 +652,19 @@ func (c *Client) runEOS(ctx context.Context, process ProcessFunc) error {
 		}
 
 		// --- PostBatchSweep (sweep + WriteStreamTime; no Kafka I/O) ---
+		// ErrFatalPipeline: abort the open transaction, then return so the caller
+		// can restart and restore from the changelog.
 		if c.postBatch != nil {
 			if err := c.postBatch(ctx); err != nil {
+				if errors.Is(err, ErrFatalPipeline) {
+					c.logger.Error("EOS: post-batch hook returned fatal error; stopping run loop",
+						slog.Any("error", err),
+					)
+					if _, err2 := c.sess.End(ctx, kgo.TryAbort); err2 != nil {
+						c.logger.Warn("EOS: End(TryAbort) on fatal error failed", slog.Any("error", err2))
+					}
+					return fmt.Errorf("runEOS: fatal post-batch: %w", err)
+				}
 				c.logger.Error("EOS: PostBatchSweep failed; aborting txn",
 					slog.Any("error", err),
 				)

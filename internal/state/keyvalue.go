@@ -11,6 +11,41 @@ import (
 	gstream "github.com/mortezaPRK/gstream"
 )
 
+// ErrStoreWrite is the sentinel error type wrapping any un-retryable Pebble
+// write failure (db.Set / db.Delete).  Callers that need to distinguish a
+// persistent disk error from a recoverable serde/user-logic error use
+// errors.As(err, &state.ErrStoreWrite{}) or errors.Is(err, ErrStoreWriteSentinel).
+//
+// Only Put, Delete, WindowPut, WindowDelete, and DeleteRangeBytes return this
+// type; encode / deserialize errors do NOT.
+type ErrStoreWrite struct {
+	// Op is the store operation that failed ("Put", "Delete", "WindowPut",
+	// "WindowDelete", "DeleteRangeBytes").
+	Op  string
+	Err error // underlying Pebble error
+}
+
+func (e ErrStoreWrite) Error() string {
+	return fmt.Sprintf("state: store-write %s: %v", e.Op, e.Err)
+}
+
+func (e ErrStoreWrite) Unwrap() error { return e.Err }
+
+// ErrStoreWriteSentinel is a zero-value sentinel usable with errors.Is.
+// errors.Is matches it against any ErrStoreWrite in the chain via the
+// Is method below.
+var ErrStoreWriteSentinel = ErrStoreWrite{}
+
+// Is implements errors.Is target matching so that
+// errors.Is(err, state.ErrStoreWriteSentinel) returns true for any ErrStoreWrite
+// anywhere in the error chain.  errors.Is traverses the chain and calls this
+// method when it finds an ErrStoreWrite; we return true if target is also an
+// ErrStoreWrite (including the zero-value sentinel).
+func (ErrStoreWrite) Is(target error) bool {
+	_, ok := target.(ErrStoreWrite)
+	return ok
+}
+
 // separator is the byte used to separate the store name prefix from the encoded key.
 // 0x00 is chosen because a serialized key should never be empty; we also ensure no
 // serialized key can start with 0x00 by construction (the prefix ends with 0x00 and
@@ -186,7 +221,7 @@ func (s *KeyValueStore[K, V]) Put(k K, v V) error {
 	}
 
 	if err := s.db.Set(pk, pv, pebble.Sync); err != nil {
-		return fmt.Errorf("state: Put pebble: %w", err)
+		return ErrStoreWrite{Op: "Put", Err: err}
 	}
 
 	if s.collector != nil {
@@ -213,7 +248,7 @@ func (s *KeyValueStore[K, V]) Delete(k K) error {
 	}
 
 	if err := s.db.Delete(pk, pebble.Sync); err != nil {
-		return fmt.Errorf("state: Delete pebble: %w", err)
+		return ErrStoreWrite{Op: "Delete", Err: err}
 	}
 
 	if s.collector != nil {
@@ -360,7 +395,7 @@ func (s *KeyValueStore[K, V]) DeleteRangeBytes(lower, upper []byte) error {
 
 	for _, fullKey := range keys {
 		if err := s.db.Delete(fullKey, pebble.Sync); err != nil {
-			return fmt.Errorf("state: DeleteRangeBytes delete: %w", err)
+			return ErrStoreWrite{Op: "DeleteRangeBytes", Err: err}
 		}
 		if s.collector != nil {
 			// Delete.Key must be the full Pebble key to match what Put/Delete append.
@@ -422,7 +457,7 @@ func (s *KeyValueStore[K, V]) WindowPut(kBytes []byte, windowStart int64, val []
 	copy(pk[len(s.prefix):], ck)
 
 	if err := s.db.Set(pk, val, pebble.Sync); err != nil {
-		return fmt.Errorf("state: WindowPut pebble: %w", err)
+		return ErrStoreWrite{Op: "WindowPut", Err: err}
 	}
 
 	if s.collector != nil {
@@ -507,7 +542,7 @@ func (s *KeyValueStore[K, V]) WindowDelete(kBytes []byte, windowStart int64) err
 	copy(pk[len(s.prefix):], ck)
 
 	if err := s.db.Delete(pk, pebble.Sync); err != nil {
-		return fmt.Errorf("state: WindowDelete pebble: %w", err)
+		return ErrStoreWrite{Op: "WindowDelete", Err: err}
 	}
 
 	if s.collector != nil {

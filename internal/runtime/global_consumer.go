@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"path/filepath"
@@ -45,6 +46,12 @@ type GlobalConsumer struct {
 	// client is the kgo client created during Bootstrap. TailConsume reuses it.
 	// Nil until Bootstrap completes successfully.
 	client *kgo.Client
+
+	// health receives Fail(err) when TailConsume encounters an un-retryable
+	// store-write error.  Set by SetHealth before TailConsume is called;
+	// nil means health signalling is disabled (safe default for tests that do
+	// not wire up the full run loop).
+	health *PipelineHealth
 
 	// wg tracks the tail goroutine launched by TailConsume.
 	wg sync.WaitGroup
@@ -244,6 +251,17 @@ func (gc *GlobalConsumer) Bootstrap(ctx context.Context) error {
 	return nil
 }
 
+// SetHealth wires a PipelineHealth signal into this consumer.  When TailConsume
+// encounters an un-retryable store-write error it calls health.Fail(err) and
+// stops the tail goroutine so the caller's run loop can detect the failure via
+// health.Err() / health.Healthy().
+//
+// Must be called before TailConsume.  Calling it after TailConsume starts is
+// a data race; the caller (Adapter.RunGlobalConsumers) always sets it first.
+func (gc *GlobalConsumer) SetHealth(health *PipelineHealth) {
+	gc.health = health
+}
+
 // TailConsume starts a background goroutine that continues consuming the global
 // topic from the post-bootstrap offsets, applying updates (Put/Delete raw) until
 // ctx is cancelled. Must be called after Bootstrap.
@@ -299,16 +317,47 @@ func (gc *GlobalConsumer) TailConsume(ctx context.Context) error {
 			})
 
 			// Apply records from non-errored partitions.
+			// A store-write error (ErrStoreWrite) is un-retryable: trip health and
+			// stop the loop so the run loop can detect the failure.  Serde / other
+			// errors are also logged but do not halt — they are non-fatal here since
+			// the global consumer operates independently of the per-partition process
+			// path.  Only store-write failures can cause silent state divergence.
+			var fatalApply error
 			fetches.EachRecord(func(r *kgo.Record) {
-				if err := gc.applyRecord(r); err != nil {
-					gc.logger.Error("GlobalConsumer.TailConsume: apply record failed",
+				if fatalApply != nil {
+					return // already stopping; skip remaining records
+				}
+				err := gc.applyRecord(r)
+				if err == nil {
+					return
+				}
+				if errors.Is(err, state.ErrStoreWriteSentinel) {
+					fatalApply = err
+					gc.logger.Error("GlobalConsumer.TailConsume: fatal store-write; stopping tail",
 						slog.String("topic", r.Topic),
 						slog.Int("partition", int(r.Partition)),
 						slog.Int64("offset", r.Offset),
 						slog.Any("error", err),
 					)
+					return
 				}
+				gc.logger.Error("GlobalConsumer.TailConsume: apply record failed",
+					slog.String("topic", r.Topic),
+					slog.Int("partition", int(r.Partition)),
+					slog.Int64("offset", r.Offset),
+					slog.Any("error", err),
+				)
 			})
+			if fatalApply != nil {
+				if gc.health != nil {
+					gc.health.Fail(fatalApply)
+				}
+				gc.logger.Error("GlobalConsumer.TailConsume: halting tail loop due to fatal store-write error",
+					slog.String("topic", gc.topic),
+					slog.Any("error", fatalApply),
+				)
+				return
+			}
 		}
 	}()
 	return nil

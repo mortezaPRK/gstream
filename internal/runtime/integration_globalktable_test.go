@@ -197,6 +197,7 @@ func TestE2E_GlobalKTableJoin(t *testing.T) {
 	client1, err := kafka.New(cfg, srcTopics1, slog.Default(),
 		kafka.WithLifecycle(adapter1.LifecycleCallbacks()),
 		kafka.WithPostBatch(adapter1.PostBatchHook()),
+		kafka.WithHealthGate(adapter1.HealthGateHook()),
 	)
 	if err != nil {
 		t.Fatalf("kafka.New p1: %v", err)
@@ -344,6 +345,7 @@ func TestE2E_GlobalKTableJoin(t *testing.T) {
 	client2neg, err := kafka.New(cfg, srcTopics2neg, slog.Default(),
 		kafka.WithLifecycle(adapter2neg.LifecycleCallbacks()),
 		kafka.WithPostBatch(adapter2neg.PostBatchHook()),
+		kafka.WithHealthGate(adapter2neg.HealthGateHook()),
 	)
 	if err != nil {
 		t.Fatalf("kafka.New p2neg: %v", err)
@@ -449,6 +451,7 @@ func TestE2E_GlobalKTableJoin(t *testing.T) {
 	client3, err := kafka.New(cfgRestart, srcTopics3, slog.Default(),
 		kafka.WithLifecycle(adapter3.LifecycleCallbacks()),
 		kafka.WithPostBatch(adapter3.PostBatchHook()),
+		kafka.WithHealthGate(adapter3.HealthGateHook()),
 	)
 	if err != nil {
 		t.Fatalf("kafka.New p3: %v", err)

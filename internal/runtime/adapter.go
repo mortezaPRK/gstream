@@ -8,6 +8,7 @@ import (
 
 	gstream "github.com/mortezaPRK/gstream"
 	"github.com/mortezaPRK/gstream/internal/kafka"
+	"github.com/mortezaPRK/gstream/internal/state"
 	"github.com/mortezaPRK/gstream/internal/topology"
 )
 
@@ -59,6 +60,11 @@ type Adapter struct {
 	// globalConsumers holds one GlobalConsumer per GlobalTableBinding. Nil until
 	// BootstrapGlobalStores is called. Closed by Close().
 	globalConsumers []*GlobalConsumer
+
+	// health is the shared fatal-error signal.  Allocated in NewAdapter; shared
+	// between global consumers (tail loop) and the kafka.Client run loop via
+	// HealthGateHook.
+	health *PipelineHealth
 }
 
 // NewAdapter constructs an Adapter driven by a *gstream.BuiltTopology.
@@ -81,6 +87,7 @@ type Adapter struct {
 //	client, _ := kafka.New(cfg, adapter.SourceTopics(), logger,
 //	    kafka.WithLifecycle(adapter.LifecycleCallbacks()),
 //	    kafka.WithPostBatch(adapter.PostBatchHook()),
+//	    kafka.WithHealthGate(adapter.HealthGateHook()), // fail-fast on store-write errors
 //	)
 //
 // EOS (Guarantee == ExactlyOnce):
@@ -89,7 +96,15 @@ type Adapter struct {
 //	    kafka.WithLifecycle(adapter.LifecycleCallbacks()),
 //	    kafka.WithPostBatch(adapter.PostBatchSweepHook()),
 //	    kafka.WithChangelogFlusher(adapter.ChangelogFlusherHook()),
+//	    kafka.WithHealthGate(adapter.HealthGateHook()), // fail-fast on store-write errors
 //	)
+//
+// WithHealthGate is optional but recommended: it provides faster detection of
+// fatal errors between batches (during idle polling).  PostBatchHook and
+// PostBatchSweepHook also embed a health check that halts Run via
+// kafka.ErrFatalPipeline, so store-write failures ALWAYS halt the loop even
+// without WithHealthGate — but WithHealthGate catches failures faster during
+// idle (no records) periods.
 func NewAdapter(bt *gstream.BuiltTopology, cfg gstream.Config, logger *slog.Logger) (*Adapter, error) {
 	if bt == nil {
 		return nil, fmt.Errorf("runtime.NewAdapter: bt must not be nil")
@@ -193,6 +208,7 @@ func NewAdapter(bt *gstream.BuiltTopology, cfg gstream.Config, logger *slog.Logg
 		topicToSource:   topicToSource,
 		resolvedSources: resolvedSources,
 		resolvedSinks:   resolvedSinks,
+		health:          &PipelineHealth{},
 	}, nil
 }
 
@@ -251,9 +267,14 @@ func (a *Adapter) BootstrapGlobalStores(ctx context.Context) error {
 // consumer that was bootstrapped by BootstrapGlobalStores. Must be called AFTER
 // BootstrapGlobalStores and BEFORE kafka.Client.Run.
 //
+// Each consumer is wired with the shared PipelineHealth so a fatal store-write
+// error in any tail goroutine trips health and is surfaced to the run loop via
+// HealthGateHook.
+//
 // Returns nil and is a no-op when there are no global consumers.
 func (a *Adapter) RunGlobalConsumers(ctx context.Context) error {
 	for _, gc := range a.globalConsumers {
+		gc.SetHealth(a.health)
 		if err := gc.TailConsume(ctx); err != nil {
 			return fmt.Errorf("runtime.Adapter.RunGlobalConsumers: TailConsume(%q): %w",
 				gc.storeName, err)
@@ -300,16 +321,38 @@ func (a *Adapter) LifecycleCallbacks() (
 // PostBatchHook returns the ALO post-batch function for wiring into
 // kafka.WithPostBatch. It performs sweep + WriteStreamTime + changelog
 // producer.Flush (full flush). Use for ALO only.
+//
+// Health check (always-on for stateful topologies): if the pipeline health
+// has been tripped (e.g. by an un-retryable Pebble write failure in the global
+// consumer tail loop or per-partition process path), the returned function
+// returns kafka.ErrFatalPipeline before any flush work.  The runALO loop
+// detects ErrFatalPipeline and exits Run so the caller can restart and restore
+// from the changelog.  Stateless topologies never wire PostBatchHook, so this
+// check is co-located with store writes: always-on where needed, absent where not.
 func (a *Adapter) PostBatchHook() func(ctx context.Context) error {
-	return a.taskManager.PostBatch
+	return func(ctx context.Context) error {
+		if err := a.health.Err(); err != nil {
+			return fmt.Errorf("%w: %w", kafka.ErrFatalPipeline, err)
+		}
+		return a.taskManager.PostBatch(ctx)
+	}
 }
 
 // PostBatchSweepHook returns the EOS post-batch function for wiring into
 // kafka.WithPostBatch. It performs sweep + WriteStreamTime but NO Kafka I/O.
 // Use together with ChangelogFlusherHook for EOS so changelog records are
 // drained into the transaction by the kafka.Client.
+//
+// Health check (always-on for stateful EOS topologies): same as PostBatchHook —
+// if health is tripped, returns kafka.ErrFatalPipeline.  runEOS detects this,
+// aborts the open transaction cleanly, and exits Run.
 func (a *Adapter) PostBatchSweepHook() func(ctx context.Context) error {
-	return a.taskManager.PostBatchSweep
+	return func(ctx context.Context) error {
+		if err := a.health.Err(); err != nil {
+			return fmt.Errorf("%w: %w", kafka.ErrFatalPipeline, err)
+		}
+		return a.taskManager.PostBatchSweep(ctx)
+	}
 }
 
 // ChangelogFlusherHook returns the changelog flusher for wiring into
@@ -323,6 +366,22 @@ func (a *Adapter) ChangelogFlusherHook() func(ctx context.Context) ([]kafka.OutR
 	}
 	return func(ctx context.Context) ([]kafka.OutRecord, error) {
 		return a.taskManager.DrainChangelogRecords()
+	}
+}
+
+// HealthGateHook returns a function that kafka.Client.Run can call at the start
+// of each batch iteration to detect a fatal pipeline error (e.g. an un-retryable
+// Pebble store-write failure from the global tail consumer or from a per-partition
+// process step).  If the pipeline is unhealthy, the returned function returns the
+// fatal error so the run loop exits and the process can restart (changelog restore).
+//
+// Wire into kafka.WithHealthGate (ALO and EOS run loops check it before processing
+// each batch):
+//
+//	kafka.WithHealthGate(adapter.HealthGateHook())
+func (a *Adapter) HealthGateHook() func() error {
+	return func() error {
+		return a.health.Err()
 	}
 }
 
@@ -375,6 +434,13 @@ func (a *Adapter) process(ctx context.Context, in kafka.InRecord) ([]kafka.OutRe
 		return nil, fmt.Errorf("runtime: no task for partition %d (not yet assigned or already revoked)", in.Partition)
 	}
 	if err := exec.Process(ctx, sourceName, rec); err != nil {
+		// A store-write error (ErrStoreWrite) is un-retryable: retrying will
+		// livelock forever on the same disk error.  Trip health so the run loop
+		// halts after this batch and the process can restart (changelog restore).
+		// Non-store errors (serde / user-logic) use the existing abort path.
+		if errors.Is(err, state.ErrStoreWriteSentinel) {
+			a.health.Fail(err)
+		}
 		return nil, fmt.Errorf("runtime: topology: %w", err)
 	}
 	return a.drainSinks(func(sinkName string) ([]topology.Record, error) {

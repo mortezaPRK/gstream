@@ -168,6 +168,7 @@ func TestE2E_RepartitionDSL(t *testing.T) {
 		client, err := kafka.New(cfg, srcTopics, slog.Default(),
 			kafka.WithLifecycle(adapter.LifecycleCallbacks()),
 			kafka.WithPostBatch(adapter.PostBatchHook()),
+			kafka.WithHealthGate(adapter.HealthGateHook()),
 		)
 		if err != nil {
 			t.Fatalf("kafka.New: %v", err)
@@ -295,6 +296,7 @@ func TestE2E_RepartitionDSL(t *testing.T) {
 		client1, err := kafka.New(cfg, srcTopics1, slog.Default(),
 			kafka.WithLifecycle(adapter1.LifecycleCallbacks()),
 			kafka.WithPostBatch(adapter1.PostBatchHook()),
+			kafka.WithHealthGate(adapter1.HealthGateHook()),
 		)
 		if err != nil {
 			t.Fatalf("kafka.New run1: %v", err)
@@ -355,6 +357,7 @@ func TestE2E_RepartitionDSL(t *testing.T) {
 		client2, err := kafka.New(cfg, srcTopics2, slog.Default(),
 			kafka.WithLifecycle(wrappedAssigned, onRevoked2),
 			kafka.WithPostBatch(adapter2.PostBatchHook()),
+			kafka.WithHealthGate(adapter2.HealthGateHook()),
 		)
 		if err != nil {
 			t.Fatalf("kafka.New run2: %v", err)
