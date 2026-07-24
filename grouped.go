@@ -127,8 +127,11 @@ func (g KGroupedStream[K, V]) Aggregate[A any](
 			return fmt.Errorf("aggregate %q: store Put: %w", storeName, err)
 		}
 
-		// KTable has no downstream consumer; ctx.Forward is intentionally omitted.
-		// When KTable.To() is introduced, Forward will be re-enabled here.
+		// Forward the updated key/accumulator to any downstream sink registered via
+		// KTable.To(). If no To() was called the internal ktable-out sink receives the
+		// record but drainSinks discards it (no SinkBinding), so the buffer never grows
+		// unboundedly (drainSinks is called per input record by the runtime).
+		ctx.Forward(topology.Record{Key: k, Value: next, Timestamp: r.Timestamp})
 		return nil
 	}, []string{storeName}, g.nodeName)
 
@@ -171,6 +174,7 @@ func (g KGroupedStream[K, V]) Aggregate[A any](
 		builder:   g.builder,
 		nodeName:  name,
 		storeName: storeName,
+		sinkName:  sinkName,
 		keySerde:  g.keySerde,
 		valSerde:  accSerde,
 	}

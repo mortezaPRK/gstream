@@ -115,14 +115,17 @@ func TestGroupByKey_Count(t *testing.T) {
 }
 
 // TestCount_NoBufferLeak verifies that driving 1000 records through a
-// Count-only topology does not accumulate records in the internal ktable-out
-// sink buffer. Because Aggregate never calls ctx.Forward in P2, the
-// Executor's sink buffer for "ktable-out-N" stays nil across all calls.
+// Count-only topology (no KTable.To() call) does not accumulate records in the
+// internal ktable-out sink buffer when the buffer is drained per-call, mirroring
+// the runtime's drainSinks-per-record pattern.
 //
-// topology.Builder.Build() requires >=1 sink (panics on empty), so an internal
-// "ktable-out-N" sink is registered. This test proves that sink is O(1) fixed
-// overhead — not an unbounded accumulator — by draining it after 1000 records
-// and asserting zero buffered records.
+// After KTable.To() was introduced, Aggregate calls ctx.Forward on every update.
+// The internal ktable-out sink receives one record per input, but since the
+// runtime drains after each Process call the buffer never exceeds 1 entry per
+// batch. This test proves the drain-per-call pattern keeps the buffer at O(1).
+//
+// Also asserts that WITHOUT calling To(), bt.Sinks is empty — the SinkBinding is
+// not registered and the runtime discards the forwarded records.
 func TestCount_NoBufferLeak(t *testing.T) {
 	t.Parallel()
 
@@ -131,6 +134,11 @@ func TestCount_NoBufferLeak(t *testing.T) {
 	_ = src.GroupByKey(gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{}).Count("wc-leak")
 
 	bt := b.Build()
+
+	// Without KTable.To(), bt.Sinks must be empty: no SinkBinding registered.
+	if len(bt.Sinks) != 0 {
+		t.Errorf("expected bt.Sinks empty (To() not called), got %v", bt.Sinks)
+	}
 
 	db, err := state.OpenMemDB()
 	if err != nil {
@@ -143,21 +151,29 @@ func TestCount_NoBufferLeak(t *testing.T) {
 	)
 	exec := topology.NewExecutor(bt.Topology, map[string]any{"wc-leak": byteStore})
 
-	// Drive 1000 records through the Count-only topology.
+	// Drive 1000 records through the Count-only topology, draining after each call
+	// (the runtime's per-record drain pattern). After each drain the buffer is empty.
+	sinkNames := bt.Topology.SinkNames()
 	for i := 0; i < 1000; i++ {
 		if err := exec.Process(context.Background(), "src", topology.Record{Key: "k", Value: "v", Timestamp: int64(i)}); err != nil {
 			t.Fatalf("Process[%d]: %v", i, err)
 		}
+		// Drain after each Process, simulating runtime drainSinks.
+		for _, sinkName := range sinkNames {
+			if _, err := exec.DrainSink(sinkName); err != nil {
+				t.Fatalf("DrainSink(%q)[%d]: %v", sinkName, i, err)
+			}
+		}
 	}
 
-	// The internal ktable-out sink must not have accumulated any records.
-	for _, sinkName := range bt.Topology.SinkNames() {
+	// After draining per-call, the buffer must now be empty.
+	for _, sinkName := range sinkNames {
 		records, err := exec.DrainSink(sinkName)
 		if err != nil {
-			t.Fatalf("DrainSink(%q): %v", sinkName, err)
+			t.Fatalf("DrainSink(%q) final: %v", sinkName, err)
 		}
 		if len(records) != 0 {
-			t.Errorf("DrainSink(%q) after 1000 records: got %d records, want 0 (buffer leak)", sinkName, len(records))
+			t.Errorf("DrainSink(%q) after per-call drain: got %d records, want 0", sinkName, len(records))
 		}
 	}
 
@@ -336,5 +352,193 @@ func TestAggregate_ByteStoreAssertionSucceeds(t *testing.T) {
 	rec := topology.Record{Key: "x", Value: "y", Timestamp: 1}
 	if err := exec.Process(context.Background(), "src", rec); err != nil {
 		t.Fatalf("Process: unexpected error (P2-S7fix regression): %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// KTable.To() DSL tests
+// ---------------------------------------------------------------------------
+
+// TestKTable_To_SinkBindingRegistered verifies that calling KTable.To() registers
+// a SinkBinding in bt.Sinks with the correct topic and working encode closures.
+//
+// Pipeline: source[string,string] → GroupByKey → Count → KTable.To("sink-topic", ...)
+func TestKTable_To_SinkBindingRegistered(t *testing.T) {
+	t.Parallel()
+
+	b := gstream.NewStreamBuilder()
+	src := gstream.Stream[string, string](b, "input", "src", gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{})
+	table := src.GroupByKey(gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{}).Count("tosink-store")
+	table.To("my-sink-topic", gstream.JSONSerde[string]{}, gstream.JSONSerde[int64]{})
+
+	bt := b.Build()
+
+	// Exactly one SinkBinding must be registered.
+	if len(bt.Sinks) != 1 {
+		t.Fatalf("expected 1 entry in bt.Sinks, got %d: %v", len(bt.Sinks), bt.Sinks)
+	}
+
+	// Find the binding.
+	var found *gstream.SinkBinding
+	for _, sb := range bt.Sinks {
+		sb := sb
+		found = &sb
+	}
+
+	if found.Topic != "my-sink-topic" {
+		t.Errorf("SinkBinding.Topic: got %q, want %q", found.Topic, "my-sink-topic")
+	}
+	if found.EncodeKey == nil {
+		t.Fatal("SinkBinding.EncodeKey is nil")
+	}
+	if found.EncodeVal == nil {
+		t.Fatal("SinkBinding.EncodeVal is nil")
+	}
+
+	// Round-trip: EncodeKey receives a typed string key.
+	kb, err := found.EncodeKey("hello")
+	if err != nil {
+		t.Fatalf("EncodeKey(%q): %v", "hello", err)
+	}
+	gotKey, err := gstream.JSONSerde[string]{}.Deserialize(kb)
+	if err != nil {
+		t.Fatalf("decode EncodeKey result: %v", err)
+	}
+	if gotKey != "hello" {
+		t.Errorf("EncodeKey round-trip: got %q, want %q", gotKey, "hello")
+	}
+
+	// Round-trip: EncodeVal receives a typed int64 value (Count accumulator).
+	vb, err := found.EncodeVal(int64(42))
+	if err != nil {
+		t.Fatalf("EncodeVal(42): %v", err)
+	}
+	gotVal, err := gstream.JSONSerde[int64]{}.Deserialize(vb)
+	if err != nil {
+		t.Fatalf("decode EncodeVal result: %v", err)
+	}
+	if gotVal != 42 {
+		t.Errorf("EncodeVal round-trip: got %d, want 42", gotVal)
+	}
+
+	// EncodeKey with wrong type must return error (not panic).
+	if _, err := found.EncodeKey(123); err == nil {
+		t.Error("EncodeKey(int): expected error for wrong type, got nil")
+	}
+
+	// EncodeVal with wrong type must return error (not panic).
+	if _, err := found.EncodeVal("not-an-int64"); err == nil {
+		t.Error("EncodeVal(string): expected error for wrong type, got nil")
+	}
+}
+
+// TestKTable_To_Absent verifies that WITHOUT calling To(), bt.Sinks is empty.
+// This is the backward-compatibility contract: existing topologies are unchanged.
+func TestKTable_To_Absent(t *testing.T) {
+	t.Parallel()
+
+	b := gstream.NewStreamBuilder()
+	src := gstream.Stream[string, string](b, "input", "src", gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{})
+	_ = src.GroupByKey(gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{}).Count("no-to-store")
+
+	bt := b.Build()
+
+	if len(bt.Sinks) != 0 {
+		t.Errorf("expected bt.Sinks empty (no To() call), got %d entries: %v", len(bt.Sinks), bt.Sinks)
+	}
+}
+
+// TestKTable_To_RecordsReachSink verifies that records forwarded by the aggregate
+// processor actually reach the registered sink buffer. This is empirical proof that
+// the DAG wiring (aggregate → ktable-out sink node → SinkBinding) is correct.
+//
+// Pipeline: source[string,string] → GroupByKey → Count → KTable.To("out-topic", ...)
+// Input: a, b, a → after processing, the sink must have buffered records for key "a"
+// (count 1 then 2) and key "b" (count 1).
+func TestKTable_To_RecordsReachSink(t *testing.T) {
+	t.Parallel()
+
+	b := gstream.NewStreamBuilder()
+	src := gstream.Stream[string, string](b, "input", "src", gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{})
+	table := src.GroupByKey(gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{}).Count("reach-store")
+	table.To("out-topic", gstream.JSONSerde[string]{}, gstream.JSONSerde[int64]{})
+
+	bt := b.Build()
+
+	db, err := state.OpenMemDB()
+	if err != nil {
+		t.Fatalf("OpenMemDB: %v", err)
+	}
+	defer db.Close()
+
+	byteStore := state.NewKeyValueStoreWithChangelog[[]byte, []byte](
+		"reach-store", db, gstream.BytesSerde{}, gstream.BytesSerde{}, nil,
+	)
+	exec := topology.NewExecutor(bt.Topology, map[string]any{"reach-store": byteStore})
+
+	keySerde := gstream.JSONSerde[string]{}
+	valSerde := gstream.JSONSerde[int64]{}
+
+	// Find sink name for out-topic.
+	var sinkName string
+	for name, sb := range bt.Sinks {
+		if sb.Topic == "out-topic" {
+			sinkName = name
+		}
+	}
+	if sinkName == "" {
+		t.Fatal("no sink registered for 'out-topic'")
+	}
+
+	// Process a, b, a — expect sink to buffer: a=1, b=1, a=2 (one record per update).
+	inputs := []string{"a", "b", "a"}
+	type wantRecord struct{ key string; val int64 }
+	wants := []wantRecord{{"a", 1}, {"b", 1}, {"a", 2}}
+
+	for i, key := range inputs {
+		if err := exec.Process(context.Background(), "src", topology.Record{Key: key, Value: key, Timestamp: 1}); err != nil {
+			t.Fatalf("Process[%d] key=%q: %v", i, key, err)
+		}
+		records, err := exec.DrainSink(sinkName)
+		if err != nil {
+			t.Fatalf("DrainSink[%d]: %v", i, err)
+		}
+		if len(records) != 1 {
+			t.Fatalf("Process[%d]: expected 1 sink record, got %d", i, len(records))
+		}
+		r := records[0]
+		gotKey, ok := r.Key.(string)
+		if !ok {
+			t.Fatalf("record[%d].Key type: got %T, want string", i, r.Key)
+		}
+		gotVal, ok := r.Value.(int64)
+		if !ok {
+			t.Fatalf("record[%d].Value type: got %T, want int64", i, r.Value)
+		}
+		if gotKey != wants[i].key {
+			t.Errorf("record[%d].Key: got %q, want %q", i, gotKey, wants[i].key)
+		}
+		if gotVal != wants[i].val {
+			t.Errorf("record[%d].Value: got %d, want %d", i, gotVal, wants[i].val)
+		}
+
+		// Verify encoding round-trip via the SinkBinding closures.
+		sb := bt.Sinks[sinkName]
+		kb, err := sb.EncodeKey(r.Key)
+		if err != nil {
+			t.Fatalf("EncodeKey record[%d]: %v", i, err)
+		}
+		vb, err := sb.EncodeVal(r.Value)
+		if err != nil {
+			t.Fatalf("EncodeVal record[%d]: %v", i, err)
+		}
+		dk, _ := keySerde.Deserialize(kb)
+		dv, _ := valSerde.Deserialize(vb)
+		if dk != wants[i].key {
+			t.Errorf("encode-decode key record[%d]: got %q, want %q", i, dk, wants[i].key)
+		}
+		if dv != wants[i].val {
+			t.Errorf("encode-decode val record[%d]: got %d, want %d", i, dv, wants[i].val)
+		}
 	}
 }

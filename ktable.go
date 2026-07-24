@@ -1,5 +1,7 @@
 package gstream
 
+import "fmt"
+
 // KGroupedStream[K,V] is a typed, lazy intermediate produced by
 // KStream.GroupByKey and consumed by Count or Aggregate.
 //
@@ -24,12 +26,51 @@ type KTable[K, V any] struct {
 	builder   *StreamBuilder
 	nodeName  string
 	storeName string
+	// sinkName is the name of the internal ktable-out DAG sink node created by
+	// Aggregate. KTable.To() registers a SinkBinding under this name so the runtime
+	// routes forwarded K/V records to the user-specified Kafka topic.
+	sinkName string
 	// keySerde is used by stream-table join to encode the lookup key.
 	keySerde Serde[K]
 	// valSerde is used by stream-table join to decode the stored value bytes
 	// back into the concrete V type. Set by Aggregate (accSerde); nil for
 	// windowed/session KTables (key is Windowed[K], not stream-joinable in P4a).
 	valSerde Serde[V]
+}
+
+// To registers topic as the Kafka sink for the table's update stream.
+//
+// Every time the table is updated (a new aggregated value for a key) the
+// updated key/value is emitted to topic via the normal sink/produce path.
+// Under ALO the produce happens after the state-store write; under EOS the
+// produce is inside the Kafka transaction, giving exactly-once semantics with
+// no additional configuration.
+//
+// keySerde and valSerde encode the typed K/V at the sink boundary. The same
+// serde types used to build the topology should be used here so the on-wire
+// bytes are consistent.
+//
+// To() MAY be called at most once per KTable.  If To() is NOT called the
+// table's internal output sink is left unregistered and drained+discarded by
+// the runtime — behaviour is unchanged from a KTable without a sink.
+func (t KTable[K, V]) To(topic string, keySerde Serde[K], valSerde Serde[V]) {
+	t.builder.sinks[t.sinkName] = SinkBinding{
+		Topic: topic,
+		EncodeKey: func(x any) ([]byte, error) {
+			v, ok := x.(K)
+			if !ok {
+				return nil, fmt.Errorf("gstream: ktable sink %q EncodeKey: expected %T, got %T", t.sinkName, *new(K), x)
+			}
+			return keySerde.Serialize(v)
+		},
+		EncodeVal: func(x any) ([]byte, error) {
+			v, ok := x.(V)
+			if !ok {
+				return nil, fmt.Errorf("gstream: ktable sink %q EncodeVal: expected %T, got %T", t.sinkName, *new(V), x)
+			}
+			return valSerde.Serialize(v)
+		},
+	}
 }
 
 // GlobalKTable[K,V] is a fully-replicated table: every application instance
