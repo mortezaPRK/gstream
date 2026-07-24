@@ -2,6 +2,7 @@ package kafka
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -9,6 +10,15 @@ import (
 	gstream "github.com/mortezaPRK/gstream"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
+
+// ErrFatalPipeline is a sentinel error returned by the postBatch hook when the
+// pipeline health has been tripped by an un-retryable store-write failure.
+// The run loop checks errors.Is(err, ErrFatalPipeline) on the postBatch return
+// value; if matched, Run exits with the fatal error rather than aborting the
+// batch and redelivering (which would livelock on an un-retryable disk error).
+//
+// Callers should wrap it with %w, not compare with == .
+var ErrFatalPipeline = errors.New("kafka: fatal pipeline error; restart required")
 
 // kafkaMurmur2 replicates Kafka's default partitioner hash (franz-go's murmur2
 // is unexported). Correctness is pinned by TestKafkaMurmur2_MatchesStickyKeyPartitioner.
@@ -386,8 +396,17 @@ func (c *Client) runALO(ctx context.Context, process ProcessFunc) error {
 		// ALO caveat: a crash between flush and commit leaves the changelog ahead of
 		// the committed source offset. On restart aggFn may be applied twice.
 		// ExactlyOnce makes the window atomic via a single Kafka transaction.
+		//
+		// ErrFatalPipeline: if the hook signals a fatal un-retryable failure (e.g.
+		// Pebble store-write), exit Run so the caller can restart and restore.
 		if c.postBatch != nil {
 			if err := c.postBatch(ctx); err != nil {
+				if errors.Is(err, ErrFatalPipeline) {
+					c.logger.Error("ALO: post-batch hook returned fatal error; stopping run loop",
+						slog.Any("error", err),
+					)
+					return fmt.Errorf("runALO: fatal post-batch: %w", err)
+				}
 				c.logger.Error("post-batch hook failed; not committing offsets",
 					slog.Any("error", err),
 				)
@@ -581,8 +600,19 @@ func (c *Client) runEOS(ctx context.Context, process ProcessFunc) error {
 		}
 
 		// --- PostBatchSweep (sweep + WriteStreamTime; no Kafka I/O) ---
+		// ErrFatalPipeline: abort the open transaction, then return so the caller
+		// can restart and restore from the changelog.
 		if c.postBatch != nil {
 			if err := c.postBatch(ctx); err != nil {
+				if errors.Is(err, ErrFatalPipeline) {
+					c.logger.Error("EOS: post-batch hook returned fatal error; stopping run loop",
+						slog.Any("error", err),
+					)
+					if _, err2 := c.sess.End(ctx, kgo.TryAbort); err2 != nil {
+						c.logger.Warn("EOS: End(TryAbort) on fatal error failed", slog.Any("error", err2))
+					}
+					return fmt.Errorf("runEOS: fatal post-batch: %w", err)
+				}
 				c.logger.Error("EOS: PostBatchSweep failed; aborting txn",
 					slog.Any("error", err),
 				)

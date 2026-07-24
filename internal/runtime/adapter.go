@@ -87,6 +87,7 @@ type Adapter struct {
 //	client, _ := kafka.New(cfg, adapter.SourceTopics(), logger,
 //	    kafka.WithLifecycle(adapter.LifecycleCallbacks()),
 //	    kafka.WithPostBatch(adapter.PostBatchHook()),
+//	    kafka.WithHealthGate(adapter.HealthGateHook()), // fail-fast on store-write errors
 //	)
 //
 // EOS (Guarantee == ExactlyOnce):
@@ -95,7 +96,15 @@ type Adapter struct {
 //	    kafka.WithLifecycle(adapter.LifecycleCallbacks()),
 //	    kafka.WithPostBatch(adapter.PostBatchSweepHook()),
 //	    kafka.WithChangelogFlusher(adapter.ChangelogFlusherHook()),
+//	    kafka.WithHealthGate(adapter.HealthGateHook()), // fail-fast on store-write errors
 //	)
+//
+// WithHealthGate is optional but recommended: it provides faster detection of
+// fatal errors between batches (during idle polling).  PostBatchHook and
+// PostBatchSweepHook also embed a health check that halts Run via
+// kafka.ErrFatalPipeline, so store-write failures ALWAYS halt the loop even
+// without WithHealthGate — but WithHealthGate catches failures faster during
+// idle (no records) periods.
 func NewAdapter(bt *gstream.BuiltTopology, cfg gstream.Config, logger *slog.Logger) (*Adapter, error) {
 	if bt == nil {
 		return nil, fmt.Errorf("runtime.NewAdapter: bt must not be nil")
@@ -312,16 +321,38 @@ func (a *Adapter) LifecycleCallbacks() (
 // PostBatchHook returns the ALO post-batch function for wiring into
 // kafka.WithPostBatch. It performs sweep + WriteStreamTime + changelog
 // producer.Flush (full flush). Use for ALO only.
+//
+// Health check (always-on for stateful topologies): if the pipeline health
+// has been tripped (e.g. by an un-retryable Pebble write failure in the global
+// consumer tail loop or per-partition process path), the returned function
+// returns kafka.ErrFatalPipeline before any flush work.  The runALO loop
+// detects ErrFatalPipeline and exits Run so the caller can restart and restore
+// from the changelog.  Stateless topologies never wire PostBatchHook, so this
+// check is co-located with store writes: always-on where needed, absent where not.
 func (a *Adapter) PostBatchHook() func(ctx context.Context) error {
-	return a.taskManager.PostBatch
+	return func(ctx context.Context) error {
+		if err := a.health.Err(); err != nil {
+			return fmt.Errorf("%w: %w", kafka.ErrFatalPipeline, err)
+		}
+		return a.taskManager.PostBatch(ctx)
+	}
 }
 
 // PostBatchSweepHook returns the EOS post-batch function for wiring into
 // kafka.WithPostBatch. It performs sweep + WriteStreamTime but NO Kafka I/O.
 // Use together with ChangelogFlusherHook for EOS so changelog records are
 // drained into the transaction by the kafka.Client.
+//
+// Health check (always-on for stateful EOS topologies): same as PostBatchHook —
+// if health is tripped, returns kafka.ErrFatalPipeline.  runEOS detects this,
+// aborts the open transaction cleanly, and exits Run.
 func (a *Adapter) PostBatchSweepHook() func(ctx context.Context) error {
-	return a.taskManager.PostBatchSweep
+	return func(ctx context.Context) error {
+		if err := a.health.Err(); err != nil {
+			return fmt.Errorf("%w: %w", kafka.ErrFatalPipeline, err)
+		}
+		return a.taskManager.PostBatchSweep(ctx)
+	}
 }
 
 // ChangelogFlusherHook returns the changelog flusher for wiring into

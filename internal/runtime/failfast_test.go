@@ -15,6 +15,7 @@ import (
 	"time"
 
 	gstream "github.com/mortezaPRK/gstream"
+	"github.com/mortezaPRK/gstream/internal/kafka"
 	"github.com/mortezaPRK/gstream/internal/state"
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/vfs"
@@ -479,6 +480,90 @@ func TestTailConsume_SkipsRemainingRecordsAfterFatal(t *testing.T) {
 	health.Fail(fatalApply)
 	if health.Healthy() {
 		t.Error("health should be unhealthy")
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (f) Adapter.PostBatchHook always-on health check
+// ─────────────────────────────────────────────────────────────────────────────
+
+// TestPostBatchHook_ReturnsFatalPipelineWhenHealthTripped verifies the
+// always-on path: Adapter.PostBatchHook() returns a function that returns
+// kafka.ErrFatalPipeline when the pipeline health is tripped.
+//
+// This is the mechanism that makes the halt always-on for stateful topologies
+// WITHOUT requiring WithHealthGate at callsites (defence-in-depth layer 2).
+// Before the fix: PostBatchHook() returned taskManager.PostBatch directly —
+// it did NOT check health — so a store-write failure would cause the run loop
+// to abort the batch and redeliver indefinitely (livelock).
+func TestPostBatchHook_ReturnsFatalPipelineWhenHealthTripped(t *testing.T) {
+	bt := minimalBuiltTopology(t)
+	cfg := gstream.Config{
+		ApplicationID: "pb-hook-test",
+		Brokers:       []string{"localhost:19092"},
+		StateDir:      t.TempDir(),
+	}
+	adapter, err := NewAdapter(bt, cfg, nil)
+	if err != nil {
+		t.Fatalf("NewAdapter: %v", err)
+	}
+
+	hook := adapter.PostBatchHook()
+	if hook == nil {
+		t.Fatal("PostBatchHook() returned nil")
+	}
+
+	// Before health is tripped: hook should succeed.
+	if err := hook(context.Background()); err != nil {
+		t.Errorf("PostBatchHook before trip: expected nil, got %v", err)
+	}
+
+	// Trip health via the internal field (same path as adapter.process / TailConsume).
+	fatalErr := errors.New("pebble: disk write failed")
+	adapter.health.Fail(fatalErr)
+
+	// Now the hook must return ErrFatalPipeline.
+	hookErr := hook(context.Background())
+	if hookErr == nil {
+		t.Fatal("PostBatchHook after health.Fail should return non-nil error")
+	}
+	if !errors.Is(hookErr, kafka.ErrFatalPipeline) {
+		t.Errorf("PostBatchHook should wrap kafka.ErrFatalPipeline; got %T: %v", hookErr, hookErr)
+	}
+	if !errors.Is(hookErr, fatalErr) {
+		t.Errorf("PostBatchHook error should also wrap original fatal error; got %v", hookErr)
+	}
+}
+
+// TestPostBatchSweepHook_ReturnsFatalPipelineWhenHealthTripped is the EOS
+// equivalent of TestPostBatchHook_ReturnsFatalPipelineWhenHealthTripped.
+func TestPostBatchSweepHook_ReturnsFatalPipelineWhenHealthTripped(t *testing.T) {
+	bt := minimalBuiltTopology(t)
+	cfg := gstream.Config{
+		ApplicationID: "pbs-hook-test",
+		Brokers:       []string{"localhost:19092"},
+		StateDir:      t.TempDir(),
+	}
+	cfg.ApplyDefaults()
+	adapter, err := NewAdapter(bt, cfg, nil)
+	if err != nil {
+		t.Fatalf("NewAdapter: %v", err)
+	}
+
+	hook := adapter.PostBatchSweepHook()
+	if hook == nil {
+		t.Fatal("PostBatchSweepHook() returned nil")
+	}
+
+	fatalErr := errors.New("pebble: delete failed")
+	adapter.health.Fail(fatalErr)
+
+	hookErr := hook(context.Background())
+	if hookErr == nil {
+		t.Fatal("PostBatchSweepHook after health.Fail should return non-nil error")
+	}
+	if !errors.Is(hookErr, kafka.ErrFatalPipeline) {
+		t.Errorf("PostBatchSweepHook should wrap kafka.ErrFatalPipeline; got %T: %v", hookErr, hookErr)
 	}
 }
 

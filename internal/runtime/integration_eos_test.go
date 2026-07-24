@@ -190,6 +190,7 @@ func buildEOSClient(t *testing.T, cfg gstream.Config, adapter *runtime.Adapter) 
 		kafka.WithLifecycle(adapter.LifecycleCallbacks()),
 		kafka.WithPostBatch(adapter.PostBatchSweepHook()),
 		kafka.WithChangelogFlusher(adapter.ChangelogFlusherHook()),
+		kafka.WithHealthGate(adapter.HealthGateHook()),
 	)
 	if err != nil {
 		t.Fatalf("buildEOSClient: kafka.New: %v", err)
@@ -379,6 +380,7 @@ func TestE2E_EOS(t *testing.T) {
 		kafka.WithLifecycle(wrappedAssigned2, onRevoked2),
 		kafka.WithPostBatch(adapter2.PostBatchSweepHook()),
 		kafka.WithChangelogFlusher(adapter2.ChangelogFlusherHook()),
+		kafka.WithHealthGate(adapter2.HealthGateHook()),
 	)
 	if err != nil {
 		t.Fatalf("kafka.New c2: %v", err)
@@ -490,6 +492,7 @@ func TestE2E_EOS(t *testing.T) {
 		kafka.WithLifecycle(wrappedAssigned3, onRevoked3),
 		kafka.WithPostBatch(adapter3.PostBatchSweepHook()),
 		kafka.WithChangelogFlusher(adapter3.ChangelogFlusherHook()),
+		kafka.WithHealthGate(adapter3.HealthGateHook()),
 	)
 	if err != nil {
 		t.Fatalf("kafka.New c3: %v", err)
