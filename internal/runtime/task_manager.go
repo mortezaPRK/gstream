@@ -51,6 +51,13 @@ type TaskManager struct {
 	mu    sync.Mutex
 	tasks map[int32]*task // keyed by partition
 
+	// globalStores holds shared global-store references keyed by store name.
+	// Populated by RegisterGlobalStore (called by C5 after GlobalConsumer.Bootstrap
+	// completes, before tasks start). openTask merges these into every per-partition
+	// stores map so JoinGlobal processors resolve ctx.Store(name) on the shared store.
+	// The global store is OWNED by GlobalConsumer (C3); TaskManager only reads it.
+	globalStores map[string]any
+
 	bt     *gstream.BuiltTopology
 	cfg    gstream.Config
 	logger *slog.Logger
@@ -67,12 +74,24 @@ func NewTaskManager(bt *gstream.BuiltTopology, cfg gstream.Config, logger *slog.
 		logger = slog.Default()
 	}
 	return &TaskManager{
-		tasks:  make(map[int32]*task),
-		bt:     bt,
-		cfg:    cfg,
-		logger: logger,
-		appID:  cfg.ApplicationID,
+		tasks:        make(map[int32]*task),
+		globalStores: make(map[string]any),
+		bt:           bt,
+		cfg:          cfg,
+		logger:       logger,
+		appID:        cfg.ApplicationID,
 	}
+}
+
+// RegisterGlobalStore registers a shared global store instance keyed by storeName.
+// Must be called by C5 (adapter) AFTER GlobalConsumer.Bootstrap completes and BEFORE
+// any partitions are assigned (OnAssigned). openTask merges globalStores into every
+// per-partition stores map so ctx.Store(storeName) in JoinGlobal resolves it.
+//
+// The store is the SAME shared *state.KeyValueStore[[]byte,[]byte] instance created
+// by GlobalConsumer; TaskManager does not open or close it. Ownership stays with C3.
+func (tm *TaskManager) RegisterGlobalStore(name string, store any) {
+	tm.globalStores[name] = store
 }
 
 // OnAssigned is the partition-assignment lifecycle callback. For each assigned
@@ -201,11 +220,16 @@ func (tm *TaskManager) Executor(partition int32) *topology.Executor {
 	}
 	// [SESSION-FROZEN-EXT] OR-extension: session-only topology also has stores.
 	if len(tm.bt.StoreBindings) == 0 && len(tm.bt.WindowStoreBindings) == 0 && len(tm.bt.SessionStoreBindings) == 0 {
+		stores := make(map[string]any)
+		// Merge global stores so lazy-created tasks also see them.
+		for name, gs := range tm.globalStores {
+			stores[name] = gs
+		}
 		t := &task{
 			db:         nil,
 			collectors: make(map[string]*state.MutationCollector),
 			producers:  make(map[string]*state.ChangelogProducer),
-			stores:     make(map[string]any),
+			stores:     stores,
 			partition:  partition,
 			streamTime: 0,
 		}
@@ -243,6 +267,10 @@ func (tm *TaskManager) openTask(ctx context.Context, partition int32) error {
 	producers := make(map[string]*state.ChangelogProducer, totalStores)
 
 	if totalStores == 0 {
+		// Merge global stores so JoinGlobal processors resolve even in zero-store topologies.
+		for name, gs := range tm.globalStores {
+			stores[name] = gs
+		}
 		t := &task{
 			db:         nil,
 			collectors: collectors,
@@ -380,6 +408,14 @@ func (tm *TaskManager) openTask(ctx context.Context, partition int32) error {
 		stores[storeName] = store
 		collectors[storeName] = collector
 		producers[storeName] = producer
+	}
+
+	// Merge global stores into the per-partition stores map AFTER per-partition stores
+	// are built. The global store is the SAME shared instance registered by C5 via
+	// RegisterGlobalStore — NOT opened here. It must NOT appear in collectors/producers
+	// (no changelog/checkpoint for global tables; they are bootstrapped by C3).
+	for name, gs := range tm.globalStores {
+		stores[name] = gs
 	}
 
 	var streamTime int64

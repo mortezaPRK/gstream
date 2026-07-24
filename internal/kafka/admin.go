@@ -204,6 +204,94 @@ func createTopicSpecs(ctx context.Context, cl *kgo.Client, specs []TopicSpec) er
 	return nil
 }
 
+// FetchPartitionCount returns the number of partitions for the named topic. It
+// opens a short-lived kgo client, queries broker metadata, and closes the
+// client before returning.
+//
+// Returns an error if the topic does not exist or the metadata request fails.
+// Called by C3 (GlobalConsumer) to determine how many partitions to assign for
+// full-topic consumption.
+func FetchPartitionCount(ctx context.Context, brokers []string, topic string) (int32, error) {
+	cl, err := kgo.NewClient(kgo.SeedBrokers(brokers...))
+	if err != nil {
+		return 0, fmt.Errorf("kafka.FetchPartitionCount: create client: %w", err)
+	}
+	defer cl.Close()
+
+	meta, err := fetchTopicMetadata(ctx, cl, []TopicSpec{{Name: topic}})
+	if err != nil {
+		return 0, fmt.Errorf("kafka.FetchPartitionCount: %w", err)
+	}
+	info, ok := meta[topic]
+	if !ok {
+		return 0, fmt.Errorf("kafka.FetchPartitionCount: topic %q does not exist", topic)
+	}
+	return info.partitions, nil
+}
+
+// EnsureGlobalTopics idempotently creates the global table topics declared in
+// bt.GlobalTableBindings. For each binding, the topic name is binding.Topic
+// DIRECTLY (the caller supplies the real topic name — unlike repartition topics
+// which are derived from the application ID).
+//
+// New topics are created with:
+//   - Partitions = 1 (global tables are usually pre-existing / externally managed;
+//     the actual partition count is discovered at runtime via FetchPartitionCount).
+//   - cleanup.policy=compact (global tables are compacted, opposite of repartition
+//     topics which use delete).
+//
+// Idempotency and tolerance: if a topic already exists — regardless of its
+// partition count or current config — it is silently skipped. Global topics are
+// often owned and managed outside gstream; we must not fail if they were created
+// with a different partition count or config.
+//
+// ValidateCoPartitioned is NOT needed for global tables: a global table is fully
+// replicated across all instances (each instance reads all partitions), so there
+// is no co-partition alignment requirement with stream topics.
+//
+// Empty GlobalTableBindings → nil.
+func EnsureGlobalTopics(ctx context.Context, cfg gstream.Config, bt *gstream.BuiltTopology) error {
+	if len(bt.GlobalTableBindings) == 0 {
+		return nil
+	}
+
+	specs := make([]TopicSpec, 0, len(bt.GlobalTableBindings))
+	for _, binding := range bt.GlobalTableBindings {
+		specs = append(specs, TopicSpec{
+			Name:              binding.Topic,
+			Partitions:        1, // sane default; global topics are usually pre-existing
+			ReplicationFactor: 1,
+			Configs:           map[string]string{"cleanup.policy": "compact"},
+		})
+	}
+
+	cl, err := kgo.NewClient(kgo.SeedBrokers(cfg.Brokers...))
+	if err != nil {
+		return fmt.Errorf("kafka.EnsureGlobalTopics: create client: %w", err)
+	}
+	defer cl.Close()
+
+	// Fetch metadata to determine which topics already exist. We intentionally do
+	// NOT validate partition counts here — global topics are often externally
+	// managed and may have any partition count. Existing topics are skipped entirely.
+	existing, err := fetchTopicMetadata(ctx, cl, specs)
+	if err != nil {
+		return fmt.Errorf("kafka.EnsureGlobalTopics: metadata: %w", err)
+	}
+
+	var missing []TopicSpec
+	for _, spec := range specs {
+		if _, ok := existing[spec.Name]; !ok {
+			missing = append(missing, spec)
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+
+	return createTopicSpecs(ctx, cl, missing)
+}
+
 // describeSpec returns a human-readable summary of the TopicSpec with the given
 // name, used in authorization-failure error messages.
 func describeSpec(name string, specs []TopicSpec) string {

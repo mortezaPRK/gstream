@@ -423,3 +423,206 @@ func TestBuildByteStoreAndExecuteCount(t *testing.T) {
 	checkCount("foo", 2) // processed twice
 	checkCount("bar", 1) // processed once
 }
+
+// ---------------------------------------------------------------------------
+// TaskManager global-store injection (C4)
+// ---------------------------------------------------------------------------
+
+// buildZeroStoreBuiltTopology returns a BuiltTopology with no state stores so
+// openTask uses the zero-store path (no Pebble DB, no broker required).
+func buildZeroStoreBuiltTopology(t *testing.T) *gstream.BuiltTopology {
+	t.Helper()
+	b := topology.NewBuilder()
+	src := b.AddSource("source")
+	b.AddSink("sink", src)
+	topo := b.Build()
+	strSerde := gstream.JSONSerde[string]{}
+	return &gstream.BuiltTopology{
+		Topology: topo,
+		Sources: map[string]gstream.SourceBinding{
+			"source": {
+				Topic:     "input-topic",
+				DecodeKey: func(raw []byte) (any, error) { return string(raw), nil },
+				DecodeVal: func(raw []byte) (any, error) { return strSerde.Deserialize(raw) },
+			},
+		},
+		Sinks: map[string]gstream.SinkBinding{
+			"sink": {
+				Topic:     "output-topic",
+				EncodeKey: func(x any) ([]byte, error) { return []byte(x.(string)), nil },
+				EncodeVal: func(x any) ([]byte, error) { return strSerde.Serialize(x.(string)) },
+			},
+		},
+		StoreBindings:        map[string]gstream.StoreBinding{},
+		WindowStoreBindings:  map[string]gstream.WindowStoreBinding{},
+		SessionStoreBindings: map[string]gstream.SessionStoreBinding{},
+		GlobalTableBindings:  map[string]gstream.GlobalTableBinding{},
+	}
+}
+
+// TestRegisterGlobalStore_InjectedIntoTask verifies that a store registered via
+// RegisterGlobalStore appears in the per-partition stores map after openTask runs.
+// Uses the zero-store (stateless) topology path so no broker is needed.
+func TestRegisterGlobalStore_InjectedIntoTask(t *testing.T) {
+	t.Parallel()
+
+	bt := buildZeroStoreBuiltTopology(t)
+	cfg, err := gstream.Configure(
+		gstream.WithName("test-gstore"),
+		gstream.WithBrokers("localhost:9092"),
+	)
+	if err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+
+	tm := runtime.NewTaskManager(bt, cfg, nil)
+
+	// A fake store value — any pointer works; we assert pointer equality.
+	fakeStore := &struct{ name string }{name: "fake-global"}
+
+	tm.RegisterGlobalStore("gstore", fakeStore)
+
+	// Trigger lazy task creation via Executor (zero-store path).
+	exec := tm.Executor(0)
+	if exec == nil {
+		t.Fatal("expected non-nil executor for partition 0")
+	}
+
+	// Verify the injected store is the EXACT same instance.
+	stores := runtime.TaskManagerStoresForPartition(tm, 0)
+	if stores == nil {
+		t.Fatal("expected non-nil stores map for partition 0")
+	}
+	got, ok := stores["gstore"]
+	if !ok {
+		t.Fatal("stores map does not contain 'gstore' key")
+	}
+	if got != fakeStore {
+		t.Errorf("injected store pointer mismatch: got %p, want %p", got, fakeStore)
+	}
+}
+
+// TestRegisterGlobalStore_ZeroGlobalStores_NoChange verifies that with no global
+// stores registered, openTask behaves exactly as before (regression guard).
+func TestRegisterGlobalStore_ZeroGlobalStores_NoChange(t *testing.T) {
+	t.Parallel()
+
+	bt := buildZeroStoreBuiltTopology(t)
+	cfg, err := gstream.Configure(
+		gstream.WithName("test-no-gstore"),
+		gstream.WithBrokers("localhost:9092"),
+	)
+	if err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+
+	tm := runtime.NewTaskManager(bt, cfg, nil)
+	// No RegisterGlobalStore call.
+
+	exec := tm.Executor(0)
+	if exec == nil {
+		t.Fatal("expected non-nil executor for partition 0")
+	}
+
+	stores := runtime.TaskManagerStoresForPartition(tm, 0)
+	if stores == nil {
+		t.Fatal("expected non-nil stores map")
+	}
+	if len(stores) != 0 {
+		t.Errorf("expected empty stores map with no global stores, got %d entries", len(stores))
+	}
+}
+
+// TestAllChangelogTopics_ExcludesGlobalStores verifies that allChangelogTopics
+// does NOT include global store names — global tables have no changelog and must
+// NOT be checkpointed or restored through the changelog path.
+func TestAllChangelogTopics_ExcludesGlobalStores(t *testing.T) {
+	t.Parallel()
+
+	// Build a BuiltTopology with both a regular store AND a global table binding.
+	b := gstream.NewStreamBuilder()
+	src := gstream.Stream[string, string](
+		b, "input-topic", "source",
+		gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{},
+	)
+	src.GroupByKey(gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{}).
+		Count("regular-store")
+	bt := b.Build()
+
+	// Manually inject a GlobalTableBinding into the built topology so the test
+	// covers a topology that has both kinds.
+	bt.GlobalTableBindings["global-store"] = gstream.GlobalTableBinding{
+		StoreName: "global-store",
+		Topic:     "global-topic",
+	}
+
+	cfg, err := gstream.Configure(
+		gstream.WithName("test-changelog"),
+		gstream.WithBrokers("localhost:9092"),
+	)
+	if err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+
+	tm := runtime.NewTaskManager(bt, cfg, nil)
+	topics := runtime.TaskManagerAllChangelogTopics(tm)
+
+	// The regular store must appear.
+	if _, ok := topics["regular-store"]; !ok {
+		t.Error("allChangelogTopics missing regular store 'regular-store'")
+	}
+
+	// The global store must NOT appear.
+	if _, ok := topics["global-store"]; ok {
+		t.Error("allChangelogTopics incorrectly includes global store 'global-store'")
+	}
+}
+
+// TestCloseTask_DoesNotCloseGlobalStore verifies that OnRevoked on a partition
+// that had a global store injected does not panic and leaves the store usable.
+// Uses the zero-store path so no broker is needed.
+func TestCloseTask_DoesNotCloseGlobalStore(t *testing.T) {
+	t.Parallel()
+
+	bt := buildZeroStoreBuiltTopology(t)
+	cfg, err := gstream.Configure(
+		gstream.WithName("test-close-gstore"),
+		gstream.WithBrokers("localhost:9092"),
+	)
+	if err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+
+	tm := runtime.NewTaskManager(bt, cfg, nil)
+
+	db, err := state.OpenMemDB()
+	if err != nil {
+		t.Fatalf("OpenMemDB: %v", err)
+	}
+	defer db.Close()
+
+	sharedStore := state.NewKeyValueStore[[]byte, []byte](
+		"global-store", db, gstream.BytesSerde{}, gstream.BytesSerde{},
+	)
+	tm.RegisterGlobalStore("global-store", sharedStore)
+
+	// Trigger task creation via Executor.
+	exec := tm.Executor(0)
+	if exec == nil {
+		t.Fatal("expected non-nil executor")
+	}
+
+	// Verify the store is in the stores map.
+	stores := runtime.TaskManagerStoresForPartition(tm, 0)
+	if _, ok := stores["global-store"]; !ok {
+		t.Fatal("global store not injected before revoke")
+	}
+
+	// Revoke partition 0. Must NOT close the shared store.
+	tm.OnRevoked(context.Background(), map[string][]int32{"input-topic": {0}})
+
+	// After revoke, the task is gone but sharedStore must still be usable (not closed).
+	if err := sharedStore.Put([]byte("k"), []byte("v")); err != nil {
+		t.Errorf("global store closed by closeTask (Put after revoke failed): %v", err)
+	}
+}

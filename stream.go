@@ -19,6 +19,7 @@ type StreamBuilder struct {
 	stores              map[string]StoreBinding
 	windowStores        map[string]WindowStoreBinding
 	sessionStores       map[string]SessionStoreBinding
+	globalTables        map[string]GlobalTableBinding
 }
 
 // NewStreamBuilder creates and returns a new StreamBuilder.
@@ -31,6 +32,7 @@ func NewStreamBuilder() *StreamBuilder {
 		stores:              make(map[string]StoreBinding),
 		windowStores:        make(map[string]WindowStoreBinding),
 		sessionStores:       make(map[string]SessionStoreBinding),
+		globalTables:        make(map[string]GlobalTableBinding),
 	}
 }
 
@@ -128,6 +130,35 @@ type SessionStoreBinding struct {
 	GraceMs int64
 }
 
+// GlobalTableBinding is the type-erased serde quad for a GlobalKTable. It
+// mirrors the shape of RepartitionBinding (EncodeKey/DecodeKey/EncodeVal/DecodeVal)
+// but carries no SinkName/SourceName/Partitions because the global table is not
+// a DAG node — it is consumed by a dedicated all-partitions reader (C3) that
+// uses Topic directly.
+//
+// StoreName is the logical store identifier. Topic is the Kafka source topic.
+// The four closures are built from keySerde/valSerde at DSL time; their type
+// assertions match GlobalTable[K,V]() call-site types.
+type GlobalTableBinding struct {
+	// StoreName is the logical identifier of the global state store.
+	StoreName string
+
+	// Topic is the Kafka topic that backs this global table.
+	Topic string
+
+	// EncodeKey serializes an any value (underlying concrete type K) to bytes.
+	EncodeKey func(any) ([]byte, error)
+
+	// DecodeKey deserializes bytes back into an any value whose underlying type is K.
+	DecodeKey func([]byte) (any, error)
+
+	// EncodeVal serializes an any value (underlying concrete type V) to bytes.
+	EncodeVal func(any) ([]byte, error)
+
+	// DecodeVal deserializes bytes back into an any value whose underlying type is V.
+	DecodeVal func([]byte) (any, error)
+}
+
 // RepartitionBinding is the type-erased serde pair for a repartition topic that
 // sits between a key-changing operator (Map, SelectKey) and its downstream
 // consumer. It combines the encode shape of SinkBinding with the decode shape of
@@ -193,6 +224,11 @@ type BuiltTopology struct {
 
 	// SessionStoreBindings maps session store names to their serde + session metadata bindings.
 	SessionStoreBindings map[string]SessionStoreBinding
+
+	// GlobalTableBindings maps store names to their type-erased serde bindings for
+	// GlobalKTable instances. Populated by Build(); consumed by C3 (all-partitions
+	// global table consumer) and C2 (JoinGlobal processor).
+	GlobalTableBindings map[string]GlobalTableBinding
 }
 
 // Stream registers a typed source node in the topology and returns a KStream[K,V].
@@ -255,5 +291,6 @@ func (b *StreamBuilder) Build() *BuiltTopology {
 		StoreBindings:        b.stores,
 		WindowStoreBindings:  b.windowStores,
 		SessionStoreBindings: b.sessionStores,
+		GlobalTableBindings:  b.globalTables,
 	}
 }
