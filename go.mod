@@ -4,6 +4,7 @@ go 1.27
 
 require (
 	github.com/cockroachdb/pebble v1.1.5
+	github.com/google/uuid v1.6.0
 	github.com/testcontainers/testcontainers-go v0.43.0
 	github.com/testcontainers/testcontainers-go/modules/kafka v0.43.0
 	github.com/twmb/franz-go v1.21.5
@@ -41,7 +42,6 @@ require (
 	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/golang/protobuf v1.5.3 // indirect
 	github.com/golang/snappy v0.0.4 // indirect
-	github.com/google/uuid v1.6.0 // indirect
 	github.com/klauspost/compress v1.18.6 // indirect
 	github.com/kr/pretty v0.3.1 // indirect
 	github.com/kr/text v0.2.0 // indirect

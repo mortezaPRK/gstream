@@ -62,6 +62,28 @@ type Config struct {
 	// Defaults to os.TempDir()/gstream-<ApplicationID>.
 	StateDir string
 
+	// InstanceID is an optional operator-supplied identifier for this specific
+	// process instance. When non-empty it is used verbatim as the per-instance
+	// suffix in the EOS TransactionalID ("gstream-<ApplicationID>-<InstanceID>").
+	//
+	// When empty (the common case) gstream auto-derives the instance ID at EOS
+	// startup: it reads StateDir/instance-id, creating and persisting a new UUID
+	// if the file does not exist. Persisting the ID ensures the same instance
+	// reuses its TransactionalID across restarts, which is required for EOS
+	// crash-safety: a restarted process must present the same TransactionalID so
+	// the broker can fence its own zombie producer and recover/abort any prior
+	// pending transaction.
+	//
+	// Note: if StateDir is ephemeral (wiped on restart) the persisted ID is also
+	// lost, so a new UUID is generated. This is acceptable because local Pebble
+	// state is likewise lost; the instance restores from changelog on startup,
+	// and the old zombie transactional producer times out via TransactionTimeout.
+	// Operators running on ephemeral storage who want a stable ID should set
+	// InstanceID explicitly (e.g. from a pod name or environment variable).
+	//
+	// Ignored for AtLeastOnce (ALO) guarantee; only used in ExactlyOnce (EOS) mode.
+	InstanceID string
+
 	// NumTaskThreads is the maximum number of concurrent task-processing goroutines.
 	// Defaults to runtime.GOMAXPROCS(0). Must be non-negative after defaults.
 	NumTaskThreads int
