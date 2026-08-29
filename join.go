@@ -87,8 +87,9 @@ func (s KStream[K, V]) JoinGlobal[GK, GV, VR any](
 	}, []string{gktStoreName}, s.nodeName)
 
 	return KStream[K, VR]{
-		builder:  s.builder,
-		nodeName: name,
+		builder:             s.builder,
+		nodeName:            name,
+		repartitionRequired: s.repartitionRequired,
 	}
 }
 
@@ -106,16 +107,19 @@ func (s KStream[K, V]) JoinGlobal[GK, GV, VR any](
 // aggregation sub-graph (source → aggregate → store) is already wired and
 // continues to run independently.
 //
-// outValSerde serializes VR output values so the returned KStream can be sunk
-// via .To().
+// streamValSerde serializes V when a preceding key-changing operator requires
+// automatic repartitioning. outValSerde serializes VR output values so returned
+// KStream can be sunk via .To().
 //
 // Constraint: table must carry a non-nil valSerde (produced by Aggregate or Count
 // on a flat KGroupedStream, not a windowed/session KTable whose key is Windowed[K]).
 func (s KStream[K, V]) JoinTable[VT, VR any](
 	table KTable[K, VT],
 	joiner func(V, VT) VR,
+	streamValSerde Serde[V],
 	outValSerde Serde[VR],
 ) KStream[K, VR] {
+	s = s.ensureRepartition(table.keySerde, streamValSerde)
 	name := s.builder.nextName("join-table")
 
 	tableStoreName := table.storeName

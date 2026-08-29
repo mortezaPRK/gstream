@@ -21,6 +21,17 @@ import "fmt"
 // closures stored in the RepartitionBinding.  They mirror how Stream[K,V]() and
 // KStream[K,V].To() build SourceBinding/SinkBinding closures.
 func (s KStream[K, V]) Repartition(name string, partitions int32, keySerde Serde[K], valSerde Serde[V]) KStream[K, V] {
+	return s.repartition(name, partitions, keySerde, valSerde)
+}
+
+func (s KStream[K, V]) ensureRepartition(keySerde Serde[K], valSerde Serde[V]) KStream[K, V] {
+	if !s.repartitionRequired {
+		return s
+	}
+	return s.repartition(s.builder.nextName("auto"), 0, keySerde, valSerde)
+}
+
+func (s KStream[K, V]) repartition(name string, partitions int32, keySerde Serde[K], valSerde Serde[V]) KStream[K, V] {
 	sinkName := s.builder.nextName("repartition-sink")
 	sourceName := s.builder.nextName("repartition-source")
 
@@ -76,7 +87,8 @@ func (s KStream[K, V]) Repartition(name string, partitions int32, keySerde Serde
 	// Return a fresh KStream rooted at the new source so downstream operators
 	// (.Filter, .GroupByKey, .To, …) chain from the re-partitioned stream.
 	return KStream[K, V]{
-		builder:  s.builder,
-		nodeName: sourceName,
+		builder:             s.builder,
+		nodeName:            sourceName,
+		repartitionRequired: false,
 	}
 }
