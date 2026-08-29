@@ -112,6 +112,14 @@ type Client struct {
 	// consumer or from a per-partition process step).  Nil = no gate (healthy).
 	healthGate func() error
 	aloOffsets *aloOffsetCommitter
+	observer   Observer
+}
+
+// Observer receives runtime measurements without exposing franz-go types.
+type Observer struct {
+	Commit           func(time.Duration)
+	TransactionAbort func()
+	Lag              func(int64)
 }
 
 type aloOffsetCommitter struct {
@@ -119,6 +127,7 @@ type aloOffsetCommitter struct {
 	pending  map[string]map[int32]*kgo.Record
 	last     time.Time
 	interval time.Duration
+	onCommit func(time.Duration)
 }
 
 func newALOOffsetCommitter(interval time.Duration) *aloOffsetCommitter {
@@ -171,8 +180,12 @@ func (c *aloOffsetCommitter) commit(ctx context.Context, client *kgo.Client) err
 	if len(records) == 0 {
 		return nil
 	}
+	started := time.Now()
 	if err := client.CommitRecords(ctx, records...); err != nil {
 		return err
+	}
+	if c.onCommit != nil {
+		c.onCommit(time.Since(started))
 	}
 	clear(c.pending)
 	c.last = time.Now()
@@ -186,6 +199,7 @@ type clientOptions struct {
 	postBatch        func(ctx context.Context) error
 	changelogFlusher func(ctx context.Context) ([]OutRecord, error)
 	healthGate       func() error
+	observer         Observer
 }
 
 // ClientOption is a functional option for [New].
@@ -256,6 +270,11 @@ func WithHealthGate(fn func() error) ClientOption {
 	}
 }
 
+// WithObserver registers runtime metric callbacks.
+func WithObserver(observer Observer) ClientOption {
+	return func(options *clientOptions) { options.observer = observer }
+}
+
 // New constructs a Client from a validated gstream.Config. topics is the list of
 // source topics to consume. Validate is called internally.
 //
@@ -299,10 +318,12 @@ func New(cfg gstream.Config, topics []string, logger *slog.Logger, opts ...Clien
 			postBatch:        co.postBatch,
 			changelogFlusher: co.changelogFlusher,
 			healthGate:       co.healthGate,
+			observer:         co.observer,
 		}, nil
 	}
 
 	offsets := newALOOffsetCommitter(cfg.CommitInterval)
+	offsets.onCommit = co.observer.Commit
 	kgoOpts := buildOpts(cfg, topics, logger, co, offsets)
 	kc, err := kgo.NewClient(kgoOpts...)
 	if err != nil {
@@ -310,7 +331,7 @@ func New(cfg gstream.Config, topics []string, logger *slog.Logger, opts ...Clien
 	}
 	return &Client{
 		kc: kc, cfg: cfg, logger: logger, postBatch: co.postBatch,
-		healthGate: co.healthGate, aloOffsets: offsets,
+		healthGate: co.healthGate, aloOffsets: offsets, observer: co.observer,
 	}, nil
 }
 
@@ -501,6 +522,7 @@ func (c *Client) runALO(ctx context.Context, process ProcessFunc) error {
 				slog.Any("error", err),
 			)
 		})
+		c.observeFetchLag(fetches)
 
 		if fetches.Empty() {
 			if c.aloOffsets.due(time.Now()) {
@@ -690,7 +712,7 @@ func (c *Client) runEOS(ctx context.Context, process ProcessFunc) error {
 		}
 		if err := ctx.Err(); err != nil {
 			// Context cancelled: abort open transaction cleanly, then exit.
-			_, _ = c.sess.End(ctx, kgo.TryAbort)
+			_ = c.abortEOS(ctx)
 			c.logger.Info("EOS: context cancelled; stopping run loop", slog.Any("reason", err))
 			return nil
 		}
@@ -702,13 +724,14 @@ func (c *Client) runEOS(ctx context.Context, process ProcessFunc) error {
 				slog.Any("error", err),
 			)
 		})
+		c.observeFetchLag(fetches)
 
 		if fetches.Empty() {
 			if time.Now().Before(transactionDeadline) {
 				goto transactionPoll
 			}
 			if !mutated {
-				if _, err := c.sess.End(ctx, kgo.TryAbort); err != nil {
+				if err := c.abortEOS(ctx); err != nil {
 					c.logger.Warn("EOS: End(TryAbort) on empty interval failed", slog.Any("error", err))
 				}
 				continue
@@ -736,7 +759,7 @@ func (c *Client) runEOS(ctx context.Context, process ProcessFunc) error {
 		mutated = true
 		sinkOuts, ok := processBatchConcurrent(ctx, c.logger, inRecords, process, c.cfg.NumTaskThreads)
 		if !ok {
-			if _, err := c.sess.End(ctx, kgo.TryAbort); err != nil {
+			if err := c.abortEOS(ctx); err != nil {
 				c.logger.Warn("EOS: End(TryAbort) after process failure failed", slog.Any("error", err))
 			}
 			return fmt.Errorf("runEOS: %w: processing failed after transaction began", ErrFatalPipeline)
@@ -751,7 +774,7 @@ func (c *Client) runEOS(ctx context.Context, process ProcessFunc) error {
 					c.logger.Error("EOS: post-batch hook returned fatal error; stopping run loop",
 						slog.Any("error", err),
 					)
-					if _, err2 := c.sess.End(ctx, kgo.TryAbort); err2 != nil {
+					if err2 := c.abortEOS(ctx); err2 != nil {
 						c.logger.Warn("EOS: End(TryAbort) on fatal error failed", slog.Any("error", err2))
 					}
 					return fmt.Errorf("runEOS: fatal post-batch: %w", err)
@@ -759,7 +782,7 @@ func (c *Client) runEOS(ctx context.Context, process ProcessFunc) error {
 				c.logger.Error("EOS: PostBatchSweep failed; aborting txn",
 					slog.Any("error", err),
 				)
-				if _, err2 := c.sess.End(ctx, kgo.TryAbort); err2 != nil {
+				if err2 := c.abortEOS(ctx); err2 != nil {
 					c.logger.Warn("EOS: End(TryAbort) after sweep failure failed", slog.Any("error", err2))
 				}
 				return fmt.Errorf("runEOS: %w: post-batch failed: %w", ErrFatalPipeline, err)
@@ -775,7 +798,7 @@ func (c *Client) runEOS(ctx context.Context, process ProcessFunc) error {
 				c.logger.Error("EOS: changelog drain failed; aborting txn",
 					slog.Any("error", err),
 				)
-				if _, err2 := c.sess.End(ctx, kgo.TryAbort); err2 != nil {
+				if err2 := c.abortEOS(ctx); err2 != nil {
 					c.logger.Warn("EOS: End(TryAbort) after drain failure failed", slog.Any("error", err2))
 				}
 				return fmt.Errorf("runEOS: %w: changelog drain failed: %w", ErrFatalPipeline, err)
@@ -799,7 +822,7 @@ func (c *Client) runEOS(ctx context.Context, process ProcessFunc) error {
 				}
 			}
 			if produceFailed {
-				if _, err := c.sess.End(ctx, kgo.TryAbort); err != nil {
+				if err := c.abortEOS(ctx); err != nil {
 					c.logger.Warn("EOS: End(TryAbort) after ProduceSync failure failed", slog.Any("error", err))
 				}
 				return fmt.Errorf("runEOS: %w: produce failed after local state mutation", ErrFatalPipeline)
@@ -817,6 +840,7 @@ func (c *Client) runEOS(ctx context.Context, process ProcessFunc) error {
 }
 
 func (c *Client) commitEOSTransaction(ctx context.Context) error {
+	started := time.Now()
 	committed, err := c.sess.End(ctx, kgo.TryCommit)
 	if err != nil {
 		// err!=nil from End(TryCommit): txn state is UNKNOWN (not safe to retry
@@ -832,7 +856,35 @@ func (c *Client) commitEOSTransaction(ctx context.Context) error {
 		// task reopen and committed changelog restore before redelivery.
 		return fmt.Errorf("runEOS: %w: transaction aborted by session", ErrFatalPipeline)
 	}
+	if c.observer.Commit != nil {
+		c.observer.Commit(time.Since(started))
+	}
 	return nil
+}
+
+func (c *Client) abortEOS(ctx context.Context) error {
+	if c.observer.TransactionAbort != nil {
+		c.observer.TransactionAbort()
+	}
+	_, err := c.sess.End(ctx, kgo.TryAbort)
+	return err
+}
+
+func (c *Client) observeFetchLag(fetches kgo.Fetches) {
+	if c.observer.Lag == nil {
+		return
+	}
+	var total int64
+	fetches.EachPartition(func(partition kgo.FetchTopicPartition) {
+		if len(partition.Records) == 0 {
+			return
+		}
+		last := partition.Records[len(partition.Records)-1].Offset
+		if lag := partition.HighWatermark - last - 1; lag > 0 {
+			total += lag
+		}
+	})
+	c.observer.Lag(total)
 }
 
 // Close shuts down the underlying kgo client (ALO) or GroupTransactSession (EOS)

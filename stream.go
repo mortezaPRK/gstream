@@ -118,6 +118,8 @@ type WindowStoreBinding struct {
 	WindowDef WindowDefinition
 	// GraceMs is the late-record grace period in milliseconds.
 	GraceMs int64
+	// LateCount returns cumulative records dropped as late for this operator.
+	LateCount func() int64
 }
 
 // SessionStoreBinding extends StoreBinding with session-specific metadata.
@@ -129,6 +131,8 @@ type SessionStoreBinding struct {
 	GapMs int64
 	// GraceMs is the late-record grace period in milliseconds.
 	GraceMs int64
+	// LateCount returns cumulative records dropped as late for this operator.
+	LateCount func() int64
 }
 
 // GlobalTableBinding is the type-erased serde quad for a GlobalKTable. It
