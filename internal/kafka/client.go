@@ -287,7 +287,7 @@ func buildOpts(cfg gstream.Config, topics []string, logger *slog.Logger, co *cli
 //  2. Read StateDir/instance-id:
 //     - file exists and non-empty → use trimmed contents (stable restart).
 //     - file absent/empty → generate uuid.NewString(), mkdir StateDir (0o755),
-//       write the file (0o600), use the new ID.
+//     - write the file (0o600), use the new ID.
 //  3. Any read/write/mkdir error → return error; startup fails. No silent fallback.
 func resolveInstanceID(cfg gstream.Config) (string, error) {
 	if cfg.InstanceID != "" {
@@ -580,6 +580,11 @@ func (c *Client) runEOS(ctx context.Context, process ProcessFunc) error {
 	)
 
 	for {
+		if err := ctx.Err(); err != nil {
+			c.logger.Info("EOS: context cancelled before transaction begin", slog.Any("reason", err))
+			return nil
+		}
+
 		// Health gate: check for a fatal pipeline error before each batch.
 		// A non-nil error means an un-retryable failure (e.g. Pebble store-write)
 		// has been signalled; exit the loop so the process can restart and trigger

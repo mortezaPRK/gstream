@@ -2,6 +2,7 @@ package kafka
 
 import (
 	"context"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -13,6 +14,28 @@ import (
 	"github.com/mortezaPRK/gstream/xtypes"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
+
+func TestRunEOSCancelledBeforeBeginReturnsCleanly(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	client := &Client{
+		cfg: gstream.Config{
+			ApplicationID:  "shutdown",
+			Guarantee:      gstream.ExactlyOnce,
+			CommitInterval: time.Second,
+		},
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		// sess intentionally nil: touching Begin after cancellation would panic.
+	}
+
+	err := client.runEOS(ctx, func(context.Context, InRecord) ([]OutRecord, error) {
+		return nil, nil
+	})
+	if err != nil {
+		t.Fatalf("runEOS with cancelled context: %v", err)
+	}
+}
 
 // validConfig returns a minimal valid gstream.Config for use in unit tests.
 func validConfig() gstream.Config {
