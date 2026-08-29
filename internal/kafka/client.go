@@ -544,35 +544,10 @@ func outRecordsToKgo(outs []OutRecord) []*kgo.Record {
 //
 // # Drain/abort consistency (local-Pebble-ahead-of-changelog)
 //
-// On abort, local Pebble already has the mutations applied (process fn writes
-// to Pebble via store.Put before runEOS can call DrainChangelogRecords).
-// DrainChangelogRecords then drains the collector — mutations are removed from
-// the collector but NOT rolled back from Pebble. So after an abort:
-//   - Committed changelog: no new record (aborted by transaction).
-//   - Local Pebble: has the change.
-//
-// Is this a problem? Only if restore trusts local Pebble without reconciling
-// with the committed changelog. In openTask, RestoreFromChangelog is called
-// on EVERY assignment and replays committed changelog records from the last
-// checkpoint into Pebble (overwriting local state). Since RestoreFromChangelog
-// uses a plain kgo.NewClient (not ReadCommitted — see C4 note below), AND the
-// changelog record was never committed, it will NOT appear in the replay.
-// On task reassignment after crash/rebalance, Pebble is REBUILT from the
-// committed changelog: the local-ahead state is discarded.
-//
-// Therefore: local-Pebble-ahead-on-abort is SAFE because task reassignment
-// always discards local state and rebuilds from the committed changelog.
-// The divergence is transient and self-correcting.
-//
-// # C4 Note (for next task)
-//
-// RestoreFromChangelog uses kgo.NewClient WITHOUT FetchIsolationLevel(ReadCommitted).
-// This means: if a transaction is in-flight when restore runs, aborted changelog
-// records COULD be replayed (FetchIsolationLevel defaults to ReadUncommitted on
-// a plain kgo client). Under normal EOS operation this window is small (restore
-// only runs during OnAssigned, which follows a rebalance that aborts the txn),
-// but it is a latent correctness bug. C4 must add ReadCommitted to
-// RestoreFromChangelog's consumer to close this gap fully.
+// On abort, local Pebble may already contain mutations absent from committed
+// changelog. Continuing would expose uncommitted state to later records. Every
+// abort after processing begins therefore stops run loop. Application restart
+// reopens tasks and restores committed state before processing resumes.
 func (c *Client) runEOS(ctx context.Context, process ProcessFunc) error {
 	c.logger.Info("kafka client EOS run started",
 		slog.String("applicationID", c.cfg.ApplicationID),
@@ -653,7 +628,7 @@ func (c *Client) runEOS(ctx context.Context, process ProcessFunc) error {
 			if _, err := c.sess.End(ctx, kgo.TryAbort); err != nil {
 				c.logger.Warn("EOS: End(TryAbort) after process failure failed", slog.Any("error", err))
 			}
-			continue
+			return fmt.Errorf("runEOS: %w: processing failed after transaction began", ErrFatalPipeline)
 		}
 
 		// --- PostBatchSweep (sweep + WriteStreamTime; no Kafka I/O) ---
@@ -676,7 +651,7 @@ func (c *Client) runEOS(ctx context.Context, process ProcessFunc) error {
 				if _, err2 := c.sess.End(ctx, kgo.TryAbort); err2 != nil {
 					c.logger.Warn("EOS: End(TryAbort) after sweep failure failed", slog.Any("error", err2))
 				}
-				continue
+				return fmt.Errorf("runEOS: %w: post-batch failed: %w", ErrFatalPipeline, err)
 			}
 		}
 
@@ -692,7 +667,7 @@ func (c *Client) runEOS(ctx context.Context, process ProcessFunc) error {
 				if _, err2 := c.sess.End(ctx, kgo.TryAbort); err2 != nil {
 					c.logger.Warn("EOS: End(TryAbort) after drain failure failed", slog.Any("error", err2))
 				}
-				continue
+				return fmt.Errorf("runEOS: %w: changelog drain failed: %w", ErrFatalPipeline, err)
 			}
 		}
 
@@ -716,7 +691,7 @@ func (c *Client) runEOS(ctx context.Context, process ProcessFunc) error {
 				if _, err := c.sess.End(ctx, kgo.TryAbort); err != nil {
 					c.logger.Warn("EOS: End(TryAbort) after ProduceSync failure failed", slog.Any("error", err))
 				}
-				continue
+				return fmt.Errorf("runEOS: %w: produce failed after local state mutation", ErrFatalPipeline)
 			}
 		}
 
@@ -732,9 +707,9 @@ func (c *Client) runEOS(ctx context.Context, process ProcessFunc) error {
 			return fmt.Errorf("runEOS: End(TryCommit): %w", err)
 		}
 		if !committed {
-			// !committed && err==nil: clean abort by the session (rebalance mid-txn).
-			// The session already aborted internally; input records will be redelivered.
-			c.logger.Warn("EOS: transaction aborted by session (rebalance); records will be redelivered")
+			// Session aborted during rebalance. Local state may be ahead, so force
+			// task reopen and committed changelog restore before redelivery.
+			return fmt.Errorf("runEOS: %w: transaction aborted by session", ErrFatalPipeline)
 		}
 	}
 }
