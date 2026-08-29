@@ -669,6 +669,80 @@ func TestRestoreFromChangelog_AbortedTail(t *testing.T) {
 	t.Logf("PASS: RestoreFromChangelog terminated correctly; checkpoint=%d, state has committed keys only", ckpt)
 }
 
+func TestRestoreFromChangelog_AllAbortedWithoutCallerDeadline(t *testing.T) {
+	if !dockerAvailable() {
+		t.Skip("Docker not available; skipping integration test")
+	}
+
+	setupCtx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+
+	kc, err := kafkamodule.Run(setupCtx, "confluentinc/cp-kafka:7.4.0",
+		kafkamodule.WithClusterID("test-restore-all-aborted"),
+		testcontainers.WithEnv(map[string]string{
+			"KAFKA_AUTO_CREATE_TOPICS_ENABLE":                "false",
+			"KAFKA_TRANSACTION_STATE_LOG_MIN_ISR":            "1",
+			"KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR": "1",
+		}),
+	)
+	if err != nil {
+		t.Skipf("failed to start Kafka container: %v", err)
+	}
+	t.Cleanup(func() { _ = kc.Terminate(context.Background()) })
+
+	brokers, err := kc.Brokers(setupCtx)
+	if err != nil {
+		t.Fatalf("get brokers: %v", err)
+	}
+
+	const (
+		topic     = "restore-all-aborted-test"
+		storeName = "all-aborted-store"
+		partition = int32(0)
+	)
+	createChangelogTopic(t, setupCtx, brokers, topic)
+	produceAbortedTxn(t, setupCtx, txnEnv{
+		brokers: brokers, topic: topic, partition: partition,
+	}, "restore-all-aborted", []*kgo.Record{
+		{Topic: topic, Partition: partition, Key: []byte("invisible"), Value: []byte("aborted")},
+	})
+
+	hw, err := fetchHighWatermark(setupCtx, brokers, topic, partition)
+	if err != nil {
+		t.Fatalf("fetchHighWatermark: %v", err)
+	}
+	if hw == 0 {
+		t.Fatal("expected aborted transaction to advance high watermark")
+	}
+
+	db, err := OpenDB(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenDB: %v", err)
+	}
+	defer db.Close()
+
+	// Deliberately no deadline: termination comes from raw LSO inspection.
+	gotHW, err := RestoreFromChangelog(
+		context.Background(), brokers, topic, partition, -1, db, storeName, 2*time.Second,
+	)
+	if err != nil {
+		t.Fatalf("RestoreFromChangelog: %v", err)
+	}
+	if gotHW != hw {
+		t.Fatalf("returned HW: got %d, want %d", gotHW, hw)
+	}
+	if _, _, err := db.Get([]byte("invisible")); err == nil {
+		t.Fatal("aborted record was restored")
+	}
+	checkpoint, found, err := ReadCheckpoint(db, storeName)
+	if err != nil {
+		t.Fatalf("ReadCheckpoint: %v", err)
+	}
+	if !found || checkpoint != hw-1 {
+		t.Fatalf("checkpoint: got (%d, %t), want (%d, true)", checkpoint, found, hw-1)
+	}
+}
+
 // TestRestoreFromChangelog_LargeMultiResponse verifies that RestoreFromChangelog
 // consumes ALL records when the changelog spans MULTIPLE fetch responses.
 //

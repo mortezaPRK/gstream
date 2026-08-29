@@ -138,6 +138,28 @@ func RestoreFromChangelog(
 		return hw, nil
 	}
 
+	// kgo suppresses empty fetch responses. If every offset in the remaining
+	// range belongs to aborted transactions, PollFetches cannot expose the LSO
+	// and may block until the caller context expires. Probe the raw response so
+	// this case terminates without relying on a caller deadline.
+	lso, hasVisibleBatch, err := fetchReadCommittedProbe(
+		ctx, brokers, changelogTopic, partition, startOffset,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("state.RestoreFromChangelog: stable-offset probe: %w", err)
+	}
+	if lso >= hw && !hasVisibleBatch {
+		batch := db.NewBatch()
+		defer func() { _ = batch.Close() }()
+		if err := WriteCheckpoint(batch, storeName, hw-1); err != nil {
+			return 0, fmt.Errorf("state.RestoreFromChangelog: checkpoint empty committed range: %w", err)
+		}
+		if err := batch.Commit(pebble.Sync); err != nil {
+			return 0, fmt.Errorf("state.RestoreFromChangelog: commit empty committed range: %w", err)
+		}
+		return hw, nil
+	}
+
 	consumerOpts := append([]kgo.Opt{
 		kgo.SeedBrokers(brokers...),
 		kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{
@@ -293,6 +315,57 @@ func RestoreFromChangelog(
 	}
 
 	return hw, nil
+}
+
+// fetchReadCommittedProbe performs one raw Fetch request at startOffset. Unlike
+// kgo.PollFetches, the raw protocol response is returned even when every record
+// is filtered by read-committed isolation, allowing callers to observe LSO.
+func fetchReadCommittedProbe(
+	ctx context.Context,
+	brokers []string,
+	topic string,
+	partition int32,
+	startOffset int64,
+) (lastStableOffset int64, hasVisibleBatch bool, err error) {
+	client, err := kgo.NewClient(kgo.SeedBrokers(brokers...))
+	if err != nil {
+		return 0, false, fmt.Errorf("create kgo client: %w", err)
+	}
+	defer client.Close()
+
+	request := kmsg.NewPtrFetchRequest()
+	request.IsolationLevel = 1 // READ_COMMITTED
+	request.MaxWaitMillis = 0
+	request.MinBytes = 1
+
+	requestPartition := kmsg.NewFetchRequestTopicPartition()
+	requestPartition.Partition = partition
+	requestPartition.FetchOffset = startOffset
+	requestPartition.PartitionMaxBytes = 1 << 20
+	requestTopic := kmsg.NewFetchRequestTopic()
+	requestTopic.Topic = topic
+	requestTopic.Partitions = append(requestTopic.Partitions, requestPartition)
+	request.Topics = append(request.Topics, requestTopic)
+
+	response, err := request.RequestWith(ctx, client)
+	if err != nil {
+		return 0, false, fmt.Errorf("fetch request: %w", err)
+	}
+	for _, topicResponse := range response.Topics {
+		if topicResponse.Topic != topic {
+			continue
+		}
+		for _, partitionResponse := range topicResponse.Partitions {
+			if partitionResponse.Partition != partition {
+				continue
+			}
+			if kafkaErr := kerr.ErrorForCode(partitionResponse.ErrorCode); kafkaErr != nil {
+				return 0, false, fmt.Errorf("topic %q partition %d: %w", topic, partition, kafkaErr)
+			}
+			return partitionResponse.LastStableOffset, len(partitionResponse.RecordBatches) > 0, nil
+		}
+	}
+	return 0, false, fmt.Errorf("topic %q partition %d not found in response", topic, partition)
 }
 
 // fetchHighWatermark fetches the Kafka high-watermark (end offset) for the given
