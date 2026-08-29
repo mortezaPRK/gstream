@@ -74,7 +74,9 @@ func ReadCheckpoint(db *pebble.DB, storeName string) (offset int64, found bool, 
 	// valid until closer.Close() is called.
 	buf := make([]byte, len(val))
 	copy(buf, val)
-	closer.Close()
+	if err := closer.Close(); err != nil {
+		return 0, false, fmt.Errorf("state: ReadCheckpoint close: %w", err)
+	}
 
 	if len(buf) != 8 {
 		return 0, false, fmt.Errorf("state: ReadCheckpoint: corrupt value: expected 8 bytes, got %d", len(buf))
@@ -89,7 +91,7 @@ func ReadCheckpoint(db *pebble.DB, storeName string) (offset int64, found bool, 
 // directly with a caller-owned batch.
 func WriteCheckpointSync(db *pebble.DB, storeName string, offset int64) error {
 	b := db.NewBatch()
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 	if err := WriteCheckpoint(b, storeName, offset); err != nil {
 		return err
 	}

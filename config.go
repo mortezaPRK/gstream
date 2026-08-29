@@ -210,7 +210,7 @@ func (c *Config) Validate() error {
 		errs = append(errs, errors.New("ApplicationID must not be empty"))
 	}
 	if len(c.Brokers) == 0 {
-		errs = append(errs, errors.New("Brokers must contain at least one address"))
+		errs = append(errs, errors.New("brokers must contain at least one address"))
 	}
 	if c.NumTaskThreads < 0 {
 		errs = append(errs, fmt.Errorf("NumTaskThreads must be non-negative, got %d", c.NumTaskThreads))

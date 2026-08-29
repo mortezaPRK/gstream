@@ -63,7 +63,9 @@ func ReadStreamTime(db *pebble.DB) (ts int64, found bool, err error) {
 	// valid until closer.Close() is called.
 	buf := make([]byte, len(val))
 	copy(buf, val)
-	closer.Close()
+	if err := closer.Close(); err != nil {
+		return 0, false, fmt.Errorf("state: ReadStreamTime close: %w", err)
+	}
 
 	if len(buf) != 8 {
 		return 0, false, fmt.Errorf("state: ReadStreamTime: corrupt value: expected 8 bytes, got %d", len(buf))

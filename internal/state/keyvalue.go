@@ -193,7 +193,7 @@ func (s *KeyValueStore[K, V]) Get(k K) (V, bool, error) {
 		}
 		return zero, false, fmt.Errorf("state: Get pebble: %w", err)
 	}
-	defer closer.Close()
+	defer func() { _ = closer.Close() }()
 
 	v, err := s.vSerde.Deserialize(valBytes)
 	if err != nil {
@@ -434,7 +434,7 @@ func (s *KeyValueStore[K, V]) WindowGet(kBytes []byte, windowStart int64) ([]byt
 		}
 		return nil, false, fmt.Errorf("state: WindowGet pebble: %w", err)
 	}
-	defer closer.Close()
+	defer func() { _ = closer.Close() }()
 
 	// Copy bytes out of Pebble's buffer before the closer is called.
 	result := make([]byte, len(valBytes))

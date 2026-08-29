@@ -357,7 +357,7 @@ func ValidateCoPartitioned(ctx context.Context, brokers []string, topics []strin
 // describeTopicConfig fetches a single config entry for a topic via a
 // DescribeConfigs request. It returns the string value, or an error if the
 // topic or config key is unknown. This is unexported and used only by tests.
-func describeTopicConfig(ctx context.Context, brokers []string, topic, configKey string) (string, error) {
+func describeTopicConfig(ctx context.Context, brokers []string, topic, configKey string) (string, error) { //nolint:unused // used by integration-tagged tests
 	cl, err := kgo.NewClient(kgo.SeedBrokers(brokers...))
 	if err != nil {
 		return "", fmt.Errorf("describeTopicConfig: create client: %w", err)
