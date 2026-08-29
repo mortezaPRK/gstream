@@ -217,6 +217,7 @@ func (s TimeWindowedStream[K, V]) Aggregate[A any](
 		},
 		WindowDef: windows,
 		GraceMs:   graceMs,
+		LateCount: lateCount.Load,
 	}
 
 	// keySerde unset: windowed/session KTables are not stream-joinable in P4a (key is Windowed[K]).

@@ -294,8 +294,9 @@ func (s SessionWindowedStream[K, V]) Aggregate[A any](
 				return accSerde.Deserialize(b)
 			},
 		},
-		GapMs:   gapMs,
-		GraceMs: graceMs,
+		GapMs:     gapMs,
+		GraceMs:   graceMs,
+		LateCount: lateCount.Load,
 	}
 
 	// keySerde unset: windowed/session KTables are not stream-joinable in P4a (key is Windowed[K]).

@@ -67,6 +67,28 @@ type Adapter struct {
 	health *PipelineHealth
 }
 
+// StorageMetrics is one aggregate snapshot across live partition and global stores.
+type StorageMetrics struct {
+	SizeBytes   uint64
+	CacheHits   int64
+	CacheMisses int64
+}
+
+// StorageMetrics returns current Pebble disk and block-cache totals.
+func (a *Adapter) StorageMetrics() StorageMetrics {
+	result := a.taskManager.storageMetrics()
+	for _, consumer := range a.globalConsumers {
+		if consumer.db == nil {
+			continue
+		}
+		metrics := consumer.db.Metrics()
+		result.SizeBytes += metrics.DiskSpaceUsage()
+		result.CacheHits += metrics.BlockCache.Hits
+		result.CacheMisses += metrics.BlockCache.Misses
+	}
+	return result
+}
+
 // NewAdapter constructs an Adapter driven by a *gstream.BuiltTopology.
 //
 // Handles both stateless (zero-store) and stateful topologies. For zero-store

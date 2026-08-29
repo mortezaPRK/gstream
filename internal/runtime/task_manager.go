@@ -84,6 +84,22 @@ func NewTaskManager(bt *gstream.BuiltTopology, cfg gstream.Config, logger *slog.
 	}
 }
 
+func (tm *TaskManager) storageMetrics() StorageMetrics {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	var result StorageMetrics
+	for _, task := range tm.tasks {
+		if task.db == nil {
+			continue
+		}
+		metrics := task.db.Metrics()
+		result.SizeBytes += metrics.DiskSpaceUsage()
+		result.CacheHits += metrics.BlockCache.Hits
+		result.CacheMisses += metrics.BlockCache.Misses
+	}
+	return result
+}
+
 // RegisterGlobalStore registers a shared global store instance keyed by storeName.
 // Must be called by C5 (adapter) AFTER GlobalConsumer.Bootstrap completes and BEFORE
 // any partitions are assigned (OnAssigned). openTask merges globalStores into every
