@@ -436,3 +436,86 @@ func TestEnsureRepartitionTopics(t *testing.T) {
 		t.Fatalf("EnsureRepartitionTopics (idempotent second call): %v", err)
 	}
 }
+
+func TestPrepareTopologyCreatesOnlyInternalTopics(t *testing.T) {
+	if !dockerAvailable() {
+		t.Skip("Docker not available; skipping integration test")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	kafkaContainer, err := kafkamodule.Run(ctx, "confluentinc/cp-kafka:7.4.0",
+		kafkamodule.WithClusterID("test-prepare-topology"),
+		testcontainers.WithEnv(map[string]string{"KAFKA_AUTO_CREATE_TOPICS_ENABLE": "false"}),
+	)
+	if err != nil {
+		t.Skipf("failed to start Kafka container: %v", err)
+	}
+	t.Cleanup(func() { _ = kafkaContainer.Terminate(context.Background()) })
+
+	brokers, err := kafkaContainer.Brokers(ctx)
+	if err != nil {
+		t.Fatalf("get brokers: %v", err)
+	}
+	if err := EnsureTopics(ctx, brokers, []TopicSpec{
+		{Name: "input", Partitions: 2, ReplicationFactor: 1},
+		{Name: "output", Partitions: 2, ReplicationFactor: 1},
+	}); err != nil {
+		t.Fatalf("create caller-managed topics: %v", err)
+	}
+
+	builder := gstream.NewStreamBuilder()
+	gstream.Stream[string, string](
+		builder, "input", "source", gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{},
+	).
+		SelectKey(func(_ string, value string) string { return value }).
+		GroupByKey(gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{}).
+		Count("counts").
+		To("output", gstream.JSONSerde[string]{}, gstream.JSONSerde[int64]{})
+	topology := builder.Build()
+	cfg := gstream.Config{ApplicationID: "planner", Brokers: brokers}
+	if err := PrepareTopology(ctx, cfg, topology); err != nil {
+		t.Fatalf("PrepareTopology: %v", err)
+	}
+
+	client, err := kgo.NewClient(kgo.SeedBrokers(brokers...))
+	if err != nil {
+		t.Fatalf("create metadata client: %v", err)
+	}
+	defer client.Close()
+	metadata, err := fetchTopicMetadata(ctx, client, []TopicSpec{
+		{Name: "planner-counts-changelog"},
+	})
+	if err != nil {
+		t.Fatalf("fetch internal metadata: %v", err)
+	}
+	if metadata["planner-counts-changelog"].partitions != 2 {
+		t.Fatalf("changelog partitions = %d, want 2", metadata["planner-counts-changelog"].partitions)
+	}
+	if len(topology.RepartitionBindings) != 1 {
+		t.Fatalf("automatic repartition bindings = %d, want 1", len(topology.RepartitionBindings))
+	}
+	for _, binding := range topology.RepartitionBindings {
+		name := cfg.ApplicationID + "-" + binding.Name + "-repartition"
+		repartitionMetadata, err := fetchTopicMetadata(ctx, client, []TopicSpec{{Name: name}})
+		if err != nil {
+			t.Fatalf("fetch repartition metadata: %v", err)
+		}
+		if repartitionMetadata[name].partitions != 2 {
+			t.Fatalf("repartition partitions = %d, want 2", repartitionMetadata[name].partitions)
+		}
+	}
+
+	missingBuilder := gstream.NewStreamBuilder()
+	gstream.Stream[string, string](
+		missingBuilder, "missing-input", "source",
+		gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{},
+	).To("output", "sink", gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{})
+	err = PrepareTopology(ctx, cfg, missingBuilder.Build())
+	if err == nil || !strings.Contains(err.Error(), "missing-input") {
+		t.Fatalf("missing caller topic error = %v, want named failure", err)
+	}
+	if _, err := FetchPartitionCount(ctx, brokers, "missing-input"); err == nil {
+		t.Fatal("PrepareTopology auto-created caller-managed source topic")
+	}
+}

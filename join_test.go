@@ -51,11 +51,40 @@ func buildJoinTopology(t *testing.T) (*gstream.BuiltTopology, string) {
 			return v + ":" + string(rune('0'+count))
 		},
 		gstream.JSONSerde[string]{},
+		gstream.JSONSerde[string]{},
 	)
 
 	joined.To("out-topic", "out", gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{})
 
 	return b.Build(), "t"
+}
+
+func TestJoinTableAutomaticallyRepartitionsChangedStreamKey(t *testing.T) {
+	t.Parallel()
+
+	builder := gstream.NewStreamBuilder()
+	table := gstream.Stream[string, string](
+		builder, "table-topic", "table-source",
+		gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{},
+	).
+		GroupByKey(gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{}).
+		Count("table")
+
+	gstream.Stream[string, string](
+		builder, "stream-topic", "stream-source",
+		gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{},
+	).
+		SelectKey(func(_ string, value string) string { return value }).
+		JoinTable(
+			table,
+			func(value string, count int64) string { return value },
+			gstream.JSONSerde[string]{},
+			gstream.JSONSerde[string]{},
+		)
+
+	if got := len(builder.Build().RepartitionBindings); got != 1 {
+		t.Fatalf("automatic repartition bindings = %d, want 1", got)
+	}
 }
 
 // TestJoinTable_Miss verifies that a stream record with no matching table entry
