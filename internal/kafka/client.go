@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -110,6 +111,72 @@ type Client struct {
 	// pipeline error (e.g. un-retryable Pebble store-write from the global tail
 	// consumer or from a per-partition process step).  Nil = no gate (healthy).
 	healthGate func() error
+	aloOffsets *aloOffsetCommitter
+}
+
+type aloOffsetCommitter struct {
+	mu       sync.Mutex
+	pending  map[string]map[int32]*kgo.Record
+	last     time.Time
+	interval time.Duration
+}
+
+func newALOOffsetCommitter(interval time.Duration) *aloOffsetCommitter {
+	return &aloOffsetCommitter{
+		pending:  make(map[string]map[int32]*kgo.Record),
+		last:     time.Now(),
+		interval: interval,
+	}
+}
+
+func (c *aloOffsetCommitter) add(records ...*kgo.Record) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, record := range records {
+		partitions := c.pending[record.Topic]
+		if partitions == nil {
+			partitions = make(map[int32]*kgo.Record)
+			c.pending[record.Topic] = partitions
+		}
+		if previous := partitions[record.Partition]; previous == nil || record.Offset > previous.Offset {
+			partitions[record.Partition] = record
+		}
+	}
+}
+
+func (c *aloOffsetCommitter) due(now time.Time) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.pending) > 0 && now.Sub(c.last) >= c.interval
+}
+
+func (c *aloOffsetCommitter) deadline() (time.Time, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.pending) == 0 {
+		return time.Time{}, false
+	}
+	return c.last.Add(c.interval), true
+}
+
+func (c *aloOffsetCommitter) commit(ctx context.Context, client *kgo.Client) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var records []*kgo.Record
+	for _, partitions := range c.pending {
+		for _, record := range partitions {
+			records = append(records, record)
+		}
+	}
+	if len(records) == 0 {
+		return nil
+	}
+	if err := client.CommitRecords(ctx, records...); err != nil {
+		return err
+	}
+	clear(c.pending)
+	c.last = time.Now()
+	return nil
 }
 
 // clientOptions holds optional configuration injected via ClientOption functions.
@@ -235,17 +302,27 @@ func New(cfg gstream.Config, topics []string, logger *slog.Logger, opts ...Clien
 		}, nil
 	}
 
-	kgoOpts := buildOpts(cfg, topics, logger, co)
+	offsets := newALOOffsetCommitter(cfg.CommitInterval)
+	kgoOpts := buildOpts(cfg, topics, logger, co, offsets)
 	kc, err := kgo.NewClient(kgoOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("kafka.New: failed to create kgo client: %w", err)
 	}
-	return &Client{kc: kc, cfg: cfg, logger: logger, postBatch: co.postBatch, healthGate: co.healthGate}, nil
+	return &Client{
+		kc: kc, cfg: cfg, logger: logger, postBatch: co.postBatch,
+		healthGate: co.healthGate, aloOffsets: offsets,
+	}, nil
 }
 
 // buildOpts translates a gstream.Config into a kgo.Opt slice. Pure helper kept
 // separate so unit tests can reason about option construction independently.
-func buildOpts(cfg gstream.Config, topics []string, logger *slog.Logger, co *clientOptions) []kgo.Opt {
+func buildOpts(
+	cfg gstream.Config,
+	topics []string,
+	logger *slog.Logger,
+	co *clientOptions,
+	offsets *aloOffsetCommitter,
+) []kgo.Opt {
 	return []kgo.Opt{
 		kgo.SeedBrokers(cfg.Brokers...),
 		kgo.ConsumerGroup(cfg.ApplicationID),
@@ -267,7 +344,7 @@ func buildOpts(cfg gstream.Config, topics []string, logger *slog.Logger, co *cli
 			if co.onRevoked != nil {
 				co.onRevoked(ctx, revoked)
 			}
-			if err := cl.CommitUncommittedOffsets(ctx); err != nil {
+			if err := offsets.commit(ctx, cl); err != nil {
 				logger.Warn("failed to commit offsets on revoke", slog.Any("error", err))
 			}
 		}),
@@ -287,7 +364,7 @@ func buildOpts(cfg gstream.Config, topics []string, logger *slog.Logger, co *cli
 //  2. Read StateDir/instance-id:
 //     - file exists and non-empty → use trimmed contents (stable restart).
 //     - file absent/empty → generate uuid.NewString(), mkdir StateDir (0o755),
-//     - write the file (0o600), use the new ID.
+//     - file is written with mode 0o600 and new ID is used.
 //  3. Any read/write/mkdir error → return error; startup fails. No silent fallback.
 func resolveInstanceID(cfg gstream.Config) (string, error) {
 	if cfg.InstanceID != "" {
@@ -369,8 +446,8 @@ func buildOptsEOS(cfg gstream.Config, topics []string, logger *slog.Logger, co *
 // Run is the main consume-transform-produce-commit loop. It blocks until ctx is
 // cancelled or a fatal error is encountered.
 //
-// ALO commit ordering: process → produce → commit offsets.
-// EOS commit ordering: Begin → process → PostBatchSweep → ProduceSync(sinks+changelog) → End(TryCommit).
+// ALO commit ordering: process → produce → interval offset commit.
+// EOS commit ordering: Begin → process polls until interval → End(TryCommit).
 func (c *Client) Run(ctx context.Context, process ProcessFunc) error {
 	if c.cfg.Guarantee == gstream.ExactlyOnce {
 		return c.runEOS(ctx, process)
@@ -378,8 +455,8 @@ func (c *Client) Run(ctx context.Context, process ProcessFunc) error {
 	return c.runALO(ctx, process)
 }
 
-// runALO is the original at-least-once loop. It is byte-for-byte identical to
-// the previous Run implementation; gated by cfg.Guarantee != ExactlyOnce.
+// runALO batches successful source offsets until CommitInterval while producing
+// sink and changelog records before their corresponding offset becomes committed.
 func (c *Client) runALO(ctx context.Context, process ProcessFunc) error {
 	c.logger.Info("kafka client ALO run started",
 		slog.String("applicationID", c.cfg.ApplicationID),
@@ -400,12 +477,19 @@ func (c *Client) runALO(ctx context.Context, process ProcessFunc) error {
 			}
 		}
 
-		fetches := c.kc.PollFetches(ctx)
+		pollCtx := ctx
+		pollCancel := func() {}
+		if deadline, ok := c.aloOffsets.deadline(); ok {
+			pollCtx, pollCancel = context.WithDeadline(ctx, deadline)
+		}
+		fetches := c.kc.PollFetches(pollCtx)
+		pollCancel()
 		if fetches.IsClientClosed() {
 			c.logger.Info("kafka client closed; stopping run loop")
 			return nil
 		}
 		if err := ctx.Err(); err != nil {
+			c.commitALOOnShutdown()
 			c.logger.Info("context cancelled; stopping run loop", slog.Any("reason", err))
 			return nil
 		}
@@ -419,6 +503,11 @@ func (c *Client) runALO(ctx context.Context, process ProcessFunc) error {
 		})
 
 		if fetches.Empty() {
+			if c.aloOffsets.due(time.Now()) {
+				if err := c.aloOffsets.commit(ctx, c.kc); err != nil {
+					c.logger.Warn("failed to commit offsets on interval", slog.Any("error", err))
+				}
+			}
 			continue
 		}
 
@@ -438,9 +527,9 @@ func (c *Client) runALO(ctx context.Context, process ProcessFunc) error {
 			kgoRecords = append(kgoRecords, r)
 		})
 
-		allOut, ok := processBatch(ctx, c.logger, inRecords, process)
+		allOut, ok := processBatchConcurrent(ctx, c.logger, inRecords, process, c.cfg.NumTaskThreads)
 		if !ok {
-			goto nextBatch
+			return fmt.Errorf("runALO: processing failed; restart required")
 		}
 
 		// Post-batch hook: flush changelog mutations to Kafka BEFORE producing sink
@@ -462,7 +551,7 @@ func (c *Client) runALO(ctx context.Context, process ProcessFunc) error {
 				c.logger.Error("post-batch hook failed; not committing offsets",
 					slog.Any("error", err),
 				)
-				goto nextBatch
+				return fmt.Errorf("runALO: post-batch failed: %w", err)
 			}
 		}
 
@@ -490,21 +579,30 @@ func (c *Client) runALO(ctx context.Context, process ProcessFunc) error {
 						slog.Any("error", res.Err),
 					)
 					// Do not commit; records will be redelivered (ALO).
-					goto nextBatch
+					return fmt.Errorf("runALO: produce failed: %w", res.Err)
 				}
 			}
 		}
 
-		// Commit offsets after produce (ALO). A commit failure is non-fatal:
-		// the broker re-delivers uncommitted records on the next session (may
-		// produce duplicates but no data is lost).
-		if err := c.kc.CommitRecords(ctx, kgoRecords...); err != nil {
-			c.logger.Warn("failed to commit offsets; batch will be reprocessed on reconnect",
-				slog.Any("error", err),
-			)
+		c.aloOffsets.add(kgoRecords...)
+		if c.aloOffsets.due(time.Now()) {
+			if err := c.aloOffsets.commit(ctx, c.kc); err != nil {
+				c.logger.Warn("failed to commit offsets; records will be reprocessed on reconnect",
+					slog.Any("error", err),
+				)
+			}
 		}
+	}
+}
 
-	nextBatch:
+func (c *Client) commitALOOnShutdown() {
+	if c.kc == nil || c.aloOffsets == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := c.aloOffsets.commit(ctx, c.kc); err != nil {
+		c.logger.Warn("failed to flush offsets on shutdown", slog.Any("error", err))
 	}
 }
 
@@ -531,10 +629,9 @@ func outRecordsToKgo(outs []OutRecord) []*kgo.Record {
 
 // runEOS is the exactly-once consume-transform-produce loop. It uses
 // kgo.GroupTransactSession to make sink writes, changelog writes, and
-// source-offset commits atomic (one Kafka transaction per batch).
+// source-offset commits atomic (one Kafka transaction per commit interval).
 //
-// Loop invariant: for every polled batch exactly one of the following is true
-// on loop iteration exit:
+// Loop invariant: for every transaction exactly one of following is true on exit:
 //   - End(TryCommit) returned (committed=true, err=nil): state + sinks advanced.
 //   - End(TryAbort) returned or rebalance aborted (committed=false, err=nil):
 //     input will be redelivered; local Pebble state may be ahead of the
@@ -579,9 +676,14 @@ func (c *Client) runEOS(ctx context.Context, process ProcessFunc) error {
 			c.logger.Error("EOS: Begin failed; stopping loop", slog.Any("error", err))
 			return fmt.Errorf("runEOS: Begin: %w", err)
 		}
+		transactionDeadline := time.Now().Add(c.cfg.CommitInterval)
+		mutated := false
 
 		// --- Poll ---
-		fetches := c.sess.PollFetches(ctx)
+	transactionPoll:
+		pollCtx, pollCancel := context.WithDeadline(ctx, transactionDeadline)
+		fetches := c.sess.PollFetches(pollCtx)
+		pollCancel()
 		if fetches.IsClientClosed() {
 			c.logger.Info("EOS: kafka client closed; stopping run loop")
 			return nil
@@ -602,9 +704,17 @@ func (c *Client) runEOS(ctx context.Context, process ProcessFunc) error {
 		})
 
 		if fetches.Empty() {
-			// No records: abort the empty transaction cleanly and continue.
-			if _, err := c.sess.End(ctx, kgo.TryAbort); err != nil {
-				c.logger.Warn("EOS: End(TryAbort) on empty batch failed", slog.Any("error", err))
+			if time.Now().Before(transactionDeadline) {
+				goto transactionPoll
+			}
+			if !mutated {
+				if _, err := c.sess.End(ctx, kgo.TryAbort); err != nil {
+					c.logger.Warn("EOS: End(TryAbort) on empty interval failed", slog.Any("error", err))
+				}
+				continue
+			}
+			if err := c.commitEOSTransaction(ctx); err != nil {
+				return err
 			}
 			continue
 		}
@@ -623,7 +733,8 @@ func (c *Client) runEOS(ctx context.Context, process ProcessFunc) error {
 		})
 
 		// --- Process ---
-		sinkOuts, ok := processBatch(ctx, c.logger, inRecords, process)
+		mutated = true
+		sinkOuts, ok := processBatchConcurrent(ctx, c.logger, inRecords, process, c.cfg.NumTaskThreads)
 		if !ok {
 			if _, err := c.sess.End(ctx, kgo.TryAbort); err != nil {
 				c.logger.Warn("EOS: End(TryAbort) after process failure failed", slog.Any("error", err))
@@ -694,24 +805,34 @@ func (c *Client) runEOS(ctx context.Context, process ProcessFunc) error {
 				return fmt.Errorf("runEOS: %w: produce failed after local state mutation", ErrFatalPipeline)
 			}
 		}
+		if time.Now().Before(transactionDeadline) {
+			goto transactionPoll
+		}
 
 		// --- End(TryCommit): commit offsets + flush + EndTransaction atomically ---
-		committed, err := c.sess.End(ctx, kgo.TryCommit)
-		if err != nil {
-			// err!=nil from End(TryCommit): txn state is UNKNOWN (not safe to retry
-			// TryCommit on the same batch — could double-commit). The only safe
-			// action is to stop the loop and restart the application.
-			c.logger.Error("EOS: End(TryCommit) returned error; stopping loop (txn state unknown)",
-				slog.Any("error", err),
-			)
-			return fmt.Errorf("runEOS: End(TryCommit): %w", err)
-		}
-		if !committed {
-			// Session aborted during rebalance. Local state may be ahead, so force
-			// task reopen and committed changelog restore before redelivery.
-			return fmt.Errorf("runEOS: %w: transaction aborted by session", ErrFatalPipeline)
+		if err := c.commitEOSTransaction(ctx); err != nil {
+			return err
 		}
 	}
+}
+
+func (c *Client) commitEOSTransaction(ctx context.Context) error {
+	committed, err := c.sess.End(ctx, kgo.TryCommit)
+	if err != nil {
+		// err!=nil from End(TryCommit): txn state is UNKNOWN (not safe to retry
+		// TryCommit on the same batch — could double-commit). The only safe
+		// action is to stop the loop and restart the application.
+		c.logger.Error("EOS: End(TryCommit) returned error; stopping loop (txn state unknown)",
+			slog.Any("error", err),
+		)
+		return fmt.Errorf("runEOS: End(TryCommit): %w", err)
+	}
+	if !committed {
+		// Session aborted during rebalance. Local state may be ahead, so force
+		// task reopen and committed changelog restore before redelivery.
+		return fmt.Errorf("runEOS: %w: transaction aborted by session", ErrFatalPipeline)
+	}
+	return nil
 }
 
 // Close shuts down the underlying kgo client (ALO) or GroupTransactSession (EOS)
@@ -724,5 +845,6 @@ func (c *Client) Close() {
 		c.sess.Close()
 		return
 	}
+	c.commitALOOnShutdown()
 	c.kc.Close()
 }

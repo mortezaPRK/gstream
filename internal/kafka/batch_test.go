@@ -4,8 +4,77 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
+
+func TestProcessBatchConcurrentPreservesPartitionOrderAndUsesLimit(t *testing.T) {
+	records := []InRecord{
+		{Topic: "t", Partition: 0, Offset: 0},
+		{Topic: "t", Partition: 1, Offset: 0},
+		{Topic: "t", Partition: 0, Offset: 1},
+		{Topic: "t", Partition: 1, Offset: 1},
+		{Topic: "t", Partition: 2, Offset: 0},
+	}
+
+	var active atomic.Int32
+	var maximum atomic.Int32
+	seen := map[int32][]int64{}
+	var seenMu sync.Mutex
+	process := func(_ context.Context, in InRecord) ([]OutRecord, error) {
+		current := active.Add(1)
+		defer active.Add(-1)
+		for {
+			old := maximum.Load()
+			if current <= old || maximum.CompareAndSwap(old, current) {
+				break
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+		seenMu.Lock()
+		seen[in.Partition] = append(seen[in.Partition], in.Offset)
+		seenMu.Unlock()
+		return []OutRecord{{Topic: "sink"}}, nil
+	}
+
+	outputs, ok := processBatchConcurrent(context.Background(), slog.Default(), records, process, 2)
+	if !ok {
+		t.Fatal("expected successful concurrent batch")
+	}
+	if len(outputs) != len(records) {
+		t.Fatalf("got %d outputs, want %d", len(outputs), len(records))
+	}
+	if maximum.Load() != 2 {
+		t.Fatalf("maximum concurrency = %d, want 2", maximum.Load())
+	}
+	for partition, offsets := range seen {
+		for index, offset := range offsets {
+			if offset != int64(index) {
+				t.Fatalf("partition %d offsets = %v; order changed", partition, offsets)
+			}
+		}
+	}
+}
+
+func TestProcessBatchConcurrentFailureDropsAllOutputs(t *testing.T) {
+	records := []InRecord{
+		{Topic: "t", Partition: 0, Offset: 0},
+		{Topic: "t", Partition: 1, Offset: 0},
+	}
+	process := func(_ context.Context, in InRecord) ([]OutRecord, error) {
+		if in.Partition == 1 {
+			return nil, errors.New("boom")
+		}
+		return []OutRecord{{Topic: "sink"}}, nil
+	}
+
+	outputs, ok := processBatchConcurrent(context.Background(), slog.Default(), records, process, 2)
+	if ok || len(outputs) != 0 {
+		t.Fatalf("outputs=%v ok=%v; want nil,false", outputs, ok)
+	}
+}
 
 // fakeProducer / fakeCommitter are injected in the batch-level integration test
 // (TestRun_ProcessError_SkipsProduceAndCommit) to prove the Run loop behaviour
