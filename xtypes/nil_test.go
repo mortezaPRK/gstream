@@ -1,7 +1,7 @@
 package xtypes_test
 
 import (
-	"encoding/json"
+	"encoding/json/v2"
 	"testing"
 
 	"github.com/mortezaPRK/gstream/xtypes"

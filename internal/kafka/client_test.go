@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"uuid"
 
 	gstream "github.com/mortezaPRK/gstream"
 	"github.com/mortezaPRK/gstream/xtypes"
@@ -495,6 +496,9 @@ func TestResolveInstanceID_AbsentFile_GeneratesAndPersists(t *testing.T) {
 	}
 	if id == "" {
 		t.Fatal("resolveInstanceID: returned empty ID")
+	}
+	if _, err := uuid.Parse(id); err != nil {
+		t.Fatalf("resolveInstanceID: returned invalid UUID %q: %v", id, err)
 	}
 
 	// File must now exist with that content.

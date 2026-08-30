@@ -50,7 +50,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"encoding/json"
+	"encoding/json/v2"
 	"log/slog"
 	"os"
 	"path/filepath"

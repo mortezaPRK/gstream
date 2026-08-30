@@ -6,7 +6,7 @@ package gstream
 //
 // Built-in implementations:
 //   - BytesSerde   — identity pass-through for raw []byte.
-//   - JSONSerde[T] — marshals/unmarshals via encoding/json (future change).
+//   - JSONSerde[T] — marshals/unmarshals via encoding/json/v2.
 //   - Protobuf     — see module github.com/mortezaPRK/gstream/serde/proto
 //     (protoserde.Serde[T, PT]).
 //

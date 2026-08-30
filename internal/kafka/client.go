@@ -10,8 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"uuid"
 
-	"github.com/google/uuid"
 	gstream "github.com/mortezaPRK/gstream"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
@@ -363,8 +363,8 @@ func buildOpts(
 //  1. If cfg.InstanceID != "" → use it verbatim (operator override; no file I/O).
 //  2. Read StateDir/instance-id:
 //     - file exists and non-empty → use trimmed contents (stable restart).
-//     - file absent/empty → generate uuid.NewString(), mkdir StateDir (0o755),
-//     - file is written with mode 0o600 and new ID is used.
+//     - file absent/empty → generate uuid.New(), mkdir StateDir (0o755),
+//     - file is written with mode 0o600 and new UUID is used.
 //  3. Any read/write/mkdir error → return error; startup fails. No silent fallback.
 func resolveInstanceID(cfg gstream.Config) (string, error) {
 	if cfg.InstanceID != "" {
@@ -382,7 +382,7 @@ func resolveInstanceID(cfg gstream.Config) (string, error) {
 	}
 
 	// File absent or empty: generate a new UUID and persist it.
-	id := uuid.NewString()
+	id := uuid.New().String()
 	if err := os.MkdirAll(cfg.StateDir, 0o755); err != nil {
 		return "", fmt.Errorf("resolveInstanceID: mkdir %s: %w", cfg.StateDir, err)
 	}
