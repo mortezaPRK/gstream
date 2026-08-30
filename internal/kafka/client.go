@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	gstream "github.com/mortezaPRK/gstream"
 	"github.com/google/uuid"
+	gstream "github.com/mortezaPRK/gstream"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 

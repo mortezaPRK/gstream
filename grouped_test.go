@@ -492,7 +492,10 @@ func TestKTable_To_RecordsReachSink(t *testing.T) {
 
 	// Process a, b, a — expect sink to buffer: a=1, b=1, a=2 (one record per update).
 	inputs := []string{"a", "b", "a"}
-	type wantRecord struct{ key string; val int64 }
+	type wantRecord struct {
+		key string
+		val int64
+	}
 	wants := []wantRecord{{"a", 1}, {"b", 1}, {"a", 2}}
 
 	for i, key := range inputs {

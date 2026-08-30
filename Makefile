@@ -33,7 +33,7 @@ lint:
 
 ## integration-test: Run integration tests (requires Docker/Podman).
 integration-test:
-	TESTCONTAINERS_RYUK_DISABLED=true go test -tags integration ./...
+	TESTCONTAINERS_RYUK_DISABLED=true go test -p 1 -tags integration ./...
 
 ## verify-modules: Build each module standalone (GOWORK=off) to catch per-module go.sum gaps.
 verify-modules:
