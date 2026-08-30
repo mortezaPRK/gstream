@@ -37,6 +37,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"os"
 	"testing"
@@ -443,10 +444,8 @@ func TestE2E_EOS(t *testing.T) {
 
 	select {
 	case err := <-done2:
-		if err != nil {
-			// runEOS returns non-nil only on fatal txn errors (unknown commit state).
-			// A context cancel returns nil. Log but don't fail — test continues.
-			t.Logf("case2: client2.Run returned: %v", err)
+		if !errors.Is(err, kafka.ErrFatalPipeline) {
+			t.Fatalf("case2: client2.Run error = %v, want ErrFatalPipeline", err)
 		}
 	case <-time.After(20 * time.Second):
 		t.Fatal("case2: client2.Run did not stop within 20s after cancel")
