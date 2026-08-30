@@ -28,6 +28,7 @@ type kvBytesStore interface {
 // the same key are already co-located on the same partition. Key-changing operators
 // (Map, SelectKey) before GroupByKey without a repartition may yield incorrect results.
 func (s KStream[K, V]) GroupByKey(keySerde Serde[K], valSerde Serde[V]) KGroupedStream[K, V] {
+	s = s.ensureRepartition(keySerde, valSerde)
 	return KGroupedStream[K, V]{
 		builder:  s.builder,
 		nodeName: s.nodeName,

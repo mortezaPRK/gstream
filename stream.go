@@ -51,8 +51,9 @@ func (b *StreamBuilder) nextName(prefix string) string {
 // Operator methods (Filter, Map, MapValues, SelectKey, etc.) are defined in
 // operators.go (same package).
 type KStream[K, V any] struct {
-	builder  *StreamBuilder
-	nodeName string
+	builder             *StreamBuilder
+	nodeName            string
+	repartitionRequired bool
 }
 
 // SourceBinding is the type-erased decode pair for a source node. It is stored

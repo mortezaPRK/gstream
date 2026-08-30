@@ -223,3 +223,42 @@ func TestRepartition_ExecutorDrivesSource(t *testing.T) {
 		t.Errorf("record value: got %v, want \"keep\"", records[0].Value)
 	}
 }
+
+func TestAutomaticRepartitionMapBeforeGroupBy(t *testing.T) {
+	t.Parallel()
+
+	builder := gstream.NewStreamBuilder()
+	gstream.Stream[string, string](
+		builder, "input", "src", gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{},
+	).
+		SelectKey(func(_ string, value string) string { return value }).
+		GroupByKey(gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{}).
+		Count("counts")
+
+	topology := builder.Build()
+	if len(topology.RepartitionBindings) != 1 {
+		t.Fatalf("automatic repartition bindings = %d, want 1", len(topology.RepartitionBindings))
+	}
+	for _, binding := range topology.RepartitionBindings {
+		if binding.Partitions != 0 {
+			t.Fatalf("automatic partition count = %d, want runtime inference sentinel 0", binding.Partitions)
+		}
+	}
+}
+
+func TestAutomaticRepartitionNotAddedWhenKeyUnchanged(t *testing.T) {
+	t.Parallel()
+
+	builder := gstream.NewStreamBuilder()
+	gstream.Stream[string, string](
+		builder, "input", "src", gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{},
+	).
+		MapValues(func(_ string, value string) string { return value + "!" }).
+		GroupByKey(gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{}).
+		Count("counts")
+
+	topology := builder.Build()
+	if len(topology.RepartitionBindings) != 0 {
+		t.Fatalf("unexpected automatic repartition bindings: %d", len(topology.RepartitionBindings))
+	}
+}
