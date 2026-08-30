@@ -40,6 +40,7 @@ import (
 	"log/slog"
 	"os"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -387,8 +388,8 @@ func TestE2E_GlobalKTableJoin(t *testing.T) {
 	run2negCancel()
 	select {
 	case err := <-done2neg:
-		if err != nil {
-			t.Errorf("client2neg.Run error: %v", err)
+		if err == nil || !strings.Contains(err.Error(), "processing failed; restart required") {
+			t.Errorf("client2neg.Run error = %v, want processing failure for unwired global store", err)
 		}
 	case <-time.After(15 * time.Second):
 		t.Fatal("client2neg.Run did not stop within 15s")
