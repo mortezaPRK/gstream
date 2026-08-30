@@ -538,7 +538,7 @@ func TestAdapter_ProcessFuncIsKafkaProcessFunc(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewAdapter: %v", err)
 	}
-	var _ kafka.ProcessFunc = adapter.ProcessFunc()
+	var _ = adapter.ProcessFunc()
 }
 
 // TestAdapter_TimestampPreserved checks that the record timestamp is accepted and

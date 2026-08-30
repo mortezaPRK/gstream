@@ -154,7 +154,7 @@ func RestoreFromChangelog(
 	defer consumer.Close()
 
 	batch := db.NewBatch()
-	defer batch.Close() // no-op if already committed
+	defer func() { _ = batch.Close() }() // no-op if already committed
 
 	lastAppliedOffset := int64(-1)
 

@@ -151,7 +151,7 @@ tension explicitly rather than promising both.
 
 ### 6.1 Method type parameters — **verified available in Go 1.27**
 This was historically the biggest constraint (Go ≤ 1.26 disallowed methods with their own type
-parameters). Confirmed by compiling against the local toolchain (`go1.27rc2`):
+parameters). Confirmed by compiling against the stable local toolchain (`go1.27.0`):
 ```go
 type Stream[K, V any] struct{}
 func (s Stream[K, V]) Map[K2, V2 any](fn func(K, V) (K2, V2)) Stream[K2, V2] { /* ... */ }

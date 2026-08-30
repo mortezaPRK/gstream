@@ -2,32 +2,60 @@ name: CI
 
 on:
   push:
-    branches: ["main"]
+    branches: [main]
   pull_request:
-    branches: ["main"]
+
+permissions:
+  contents: read
 
 jobs:
-  ci:
-    name: vet / test / build
+  lint:
+    name: lint
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      # Go 1.27 is a release candidate; actions/setup-go accepts the full RC
-      # version string "1.27.0-rc.2" (the rc available at time of scaffolding).
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.27.0-rc.2"
+          go-version: "1.27.0"
           cache: true
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.13.2
 
+  unit:
+    name: unit / vet / build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.0"
+          cache: true
       - name: Vet
         run: make vet
-
-      - name: Test
+      - name: Unit tests
         run: make test
-
       - name: Build
         run: make build
+      - name: Verify standalone modules
+        run: make verify-modules
+
+  e2e:
+    name: e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.0"
+          cache: true
+      - name: End-to-end tests
+        run: make integration-test

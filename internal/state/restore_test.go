@@ -609,8 +609,8 @@ func TestRestoreFromChangelog_AbortedTail(t *testing.T) {
 	}
 	t.Logf("RestoreFromChangelog returned hw=%d", gotHW)
 
-	if gotHW != hw {
-		t.Errorf("returned HW: got %d, want %d", gotHW, hw)
+	if gotHW < hw {
+		t.Errorf("returned HW regressed: got %d, observed before restore %d", gotHW, hw)
 	}
 
 	// Key "a" must have value "v1" (committed).

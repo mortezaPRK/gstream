@@ -52,17 +52,6 @@ func (errValueSerialize) Serialize(_ string) ([]byte, error) {
 }
 func (errValueSerialize) Deserialize(b []byte) (string, error) { return string(b), nil }
 
-// --- Helper to open an in-memory DB for a test ---
-
-func mustOpenMemDB(t *testing.T) interface{ Close() error } {
-	t.Helper()
-	db, err := state.OpenMemDB()
-	if err != nil {
-		t.Fatalf("OpenMemDB: %v", err)
-	}
-	return db
-}
-
 // --- Tests ---
 
 // TestPutGetRoundTrip verifies that a Put followed by a Get returns the same value.

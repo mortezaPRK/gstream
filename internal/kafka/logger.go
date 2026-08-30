@@ -1,6 +1,7 @@
 package kafka
 
 import (
+	"context"
 	"log/slog"
 
 	"github.com/twmb/franz-go/pkg/kgo"
@@ -38,5 +39,5 @@ func (k *kgoLogger) Log(level kgo.LogLevel, msg string, keyvals ...any) {
 		sl = slog.LevelInfo
 	}
 	// keyvals from kgo are alternating key/value pairs; pass them directly to slog.
-	k.l.Log(nil, sl, "[franz-go] "+msg, keyvals...) //nolint:sloglint // variadic keyvals from kgo
+	k.l.Log(context.Background(), sl, "[franz-go] "+msg, keyvals...) //nolint:sloglint // variadic keyvals from kgo
 }

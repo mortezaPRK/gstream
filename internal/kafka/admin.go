@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	gstream "github.com/mortezaPRK/gstream"
 	"github.com/twmb/franz-go/pkg/kerr"
@@ -79,7 +80,45 @@ func EnsureTopics(ctx context.Context, brokers []string, specs []TopicSpec) erro
 		return nil
 	}
 
-	return createTopicSpecs(ctx, cl, missing)
+	if err := createTopicSpecs(ctx, cl, missing); err != nil {
+		return err
+	}
+	return waitForTopicMetadata(ctx, cl, missing)
+}
+
+func waitForTopicMetadata(ctx context.Context, client *kgo.Client, specs []TopicSpec) error {
+	waitCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		metadata, err := fetchTopicMetadata(waitCtx, client, specs)
+		if err != nil {
+			return fmt.Errorf("kafka.EnsureTopics: wait for metadata: %w", err)
+		}
+		ready := true
+		for _, spec := range specs {
+			info, ok := metadata[spec.Name]
+			if !ok {
+				ready = false
+				break
+			}
+			if info.partitions != spec.Partitions {
+				return fmt.Errorf(
+					"kafka.EnsureTopics: topic %q became visible with %d partitions, spec requires %d",
+					spec.Name, info.partitions, spec.Partitions,
+				)
+			}
+		}
+		if ready {
+			return nil
+		}
+		select {
+		case <-waitCtx.Done():
+			return fmt.Errorf("kafka.EnsureTopics: topics not visible before deadline: %w", waitCtx.Err())
+		case <-ticker.C:
+		}
+	}
 }
 
 // EnsureRepartitionTopics idempotently creates the repartition topics declared
@@ -357,7 +396,7 @@ func ValidateCoPartitioned(ctx context.Context, brokers []string, topics []strin
 // describeTopicConfig fetches a single config entry for a topic via a
 // DescribeConfigs request. It returns the string value, or an error if the
 // topic or config key is unknown. This is unexported and used only by tests.
-func describeTopicConfig(ctx context.Context, brokers []string, topic, configKey string) (string, error) {
+func describeTopicConfig(ctx context.Context, brokers []string, topic, configKey string) (string, error) { //nolint:unused // used by integration-tagged tests
 	cl, err := kgo.NewClient(kgo.SeedBrokers(brokers...))
 	if err != nil {
 		return "", fmt.Errorf("describeTopicConfig: create client: %w", err)
