@@ -15,6 +15,7 @@ type StreamBuilder struct {
 	counter             int
 	sources             map[string]SourceBinding
 	sinks               map[string]SinkBinding
+	internalSinks       map[string]struct{}
 	repartitionBindings map[string]RepartitionBinding
 	stores              map[string]StoreBinding
 	windowStores        map[string]WindowStoreBinding
@@ -28,6 +29,7 @@ func NewStreamBuilder() *StreamBuilder {
 		internal:            topology.NewBuilder(),
 		sources:             make(map[string]SourceBinding),
 		sinks:               make(map[string]SinkBinding),
+		internalSinks:       make(map[string]struct{}),
 		repartitionBindings: make(map[string]RepartitionBinding),
 		stores:              make(map[string]StoreBinding),
 		windowStores:        make(map[string]WindowStoreBinding),
@@ -217,6 +219,10 @@ type BuiltTopology struct {
 	// Sinks maps sink node names to their type-erased encode bindings.
 	Sinks map[string]SinkBinding
 
+	// InternalSinks identifies terminal nodes whose records are intentionally
+	// discarded when no public sink binding is registered.
+	InternalSinks map[string]struct{}
+
 	// RepartitionBindings maps logical repartition names to their combined
 	// encode+decode bindings. Populated by Build(); consumed by C3 (adapter).
 	RepartitionBindings map[string]RepartitionBinding
@@ -292,6 +298,7 @@ func (b *StreamBuilder) Build() *BuiltTopology {
 		Topology:             b.internal.Build(),
 		Sources:              b.sources,
 		Sinks:                b.sinks,
+		InternalSinks:        b.internalSinks,
 		RepartitionBindings:  b.repartitionBindings,
 		StoreBindings:        b.stores,
 		WindowStoreBindings:  b.windowStores,

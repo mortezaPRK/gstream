@@ -41,6 +41,18 @@ func TestNewValidatesInputs(t *testing.T) {
 	}
 }
 
+func TestNewAllowsUnboundInternalAggregateSink(t *testing.T) {
+	builder := gstream.NewStreamBuilder()
+	stream := gstream.Stream(
+		builder, "input", "source", gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{},
+	)
+	stream.GroupByKey(gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{}).Count("counts")
+
+	if _, err := app.New(testConfig(), builder.Build()); err != nil {
+		t.Fatalf("New() error = %v, want internal aggregate sink accepted", err)
+	}
+}
+
 func TestPrometheusRegistrationConflict(t *testing.T) {
 	registry := prometheus.NewRegistry()
 	if _, err := app.New(testConfig(), testTopology(), app.WithPrometheusRegisterer(registry)); err != nil {

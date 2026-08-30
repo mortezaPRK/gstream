@@ -140,6 +140,7 @@ func (g KGroupedStream[K, V]) Aggregate[A any](
 	// Not registered in BuiltTopology.Sinks; invisible to the runtime output path.
 	sinkName := g.builder.nextName("ktable-out")
 	g.builder.internal.AddSink(sinkName, name)
+	g.builder.internalSinks[sinkName] = struct{}{}
 
 	// Register a StoreBinding so the runtime can open and recover this store.
 	// ChangelogTopic is the bare store name; the runtime derives the full Kafka topic
