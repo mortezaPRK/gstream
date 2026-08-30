@@ -63,7 +63,7 @@ package runtime_test
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"log/slog"
 	"os"
 	"path/filepath"

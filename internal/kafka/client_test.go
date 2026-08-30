@@ -483,7 +483,7 @@ func cfgWithStateDir(stateDir string) gstream.Config {
 }
 
 // TestResolveInstanceID_AbsentFile_GeneratesAndPersists verifies that when the
-// StateDir/instance-id file does not exist, resolveInstanceID generates a UUID,
+// StateDir/instance-id file does not exist, resolveInstanceID generates an ID,
 // persists it, and returns it. The file must exist with that content afterwards.
 func TestResolveInstanceID_AbsentFile_GeneratesAndPersists(t *testing.T) {
 	dir := t.TempDir()
