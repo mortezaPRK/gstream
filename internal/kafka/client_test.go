@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"uuid"
 
 	gstream "github.com/mortezaPRK/gstream"
 	"github.com/mortezaPRK/gstream/xtypes"
@@ -483,7 +484,7 @@ func cfgWithStateDir(stateDir string) gstream.Config {
 }
 
 // TestResolveInstanceID_AbsentFile_GeneratesAndPersists verifies that when the
-// StateDir/instance-id file does not exist, resolveInstanceID generates an ID,
+// StateDir/instance-id file does not exist, resolveInstanceID generates a UUID,
 // persists it, and returns it. The file must exist with that content afterwards.
 func TestResolveInstanceID_AbsentFile_GeneratesAndPersists(t *testing.T) {
 	dir := t.TempDir()
@@ -495,6 +496,9 @@ func TestResolveInstanceID_AbsentFile_GeneratesAndPersists(t *testing.T) {
 	}
 	if id == "" {
 		t.Fatal("resolveInstanceID: returned empty ID")
+	}
+	if _, err := uuid.Parse(id); err != nil {
+		t.Fatalf("resolveInstanceID: returned invalid UUID %q: %v", id, err)
 	}
 
 	// File must now exist with that content.
