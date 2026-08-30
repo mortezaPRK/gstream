@@ -121,6 +121,9 @@ func validateTopology(topology *gstream.BuiltTopology) error {
 	}
 	for _, name := range topology.Topology.SinkNames() {
 		if _, ok := knownSinks[name]; !ok {
+			if _, internal := topology.InternalSinks[name]; internal {
+				continue
+			}
 			return fmt.Errorf("sink node %q has no binding", name)
 		}
 	}
