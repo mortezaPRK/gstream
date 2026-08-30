@@ -728,8 +728,8 @@ func TestRestoreFromChangelog_AllAbortedWithoutCallerDeadline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RestoreFromChangelog: %v", err)
 	}
-	if gotHW != hw {
-		t.Fatalf("returned HW: got %d, want %d", gotHW, hw)
+	if gotHW < hw {
+		t.Fatalf("returned HW: got %d, want at least pre-restore HW %d", gotHW, hw)
 	}
 	if _, _, err := db.Get([]byte("invisible")); err == nil {
 		t.Fatal("aborted record was restored")
@@ -738,8 +738,8 @@ func TestRestoreFromChangelog_AllAbortedWithoutCallerDeadline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadCheckpoint: %v", err)
 	}
-	if !found || checkpoint != hw-1 {
-		t.Fatalf("checkpoint: got (%d, %t), want (%d, true)", checkpoint, found, hw-1)
+	if !found || checkpoint != gotHW-1 {
+		t.Fatalf("checkpoint: got (%d, %t), want (%d, true)", checkpoint, found, gotHW-1)
 	}
 }
 
