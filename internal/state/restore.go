@@ -132,10 +132,28 @@ func RestoreFromChangelog(
 		return 0, fmt.Errorf("state.RestoreFromChangelog: fetch high-watermark: %w", err)
 	}
 
+	earliest, err := fetchEarliestOffset(ctx, brokers, changelogTopic, partition)
+	if err != nil {
+		return 0, fmt.Errorf("state.RestoreFromChangelog: fetch earliest offset: %w", err)
+	}
 	startOffset := checkpointOffset + 1
+	if startOffset < earliest {
+		startOffset = earliest
+	}
 	if hw == 0 || startOffset >= hw {
 		// Nothing to restore; leave state and checkpoint untouched.
 		return hw, nil
+	}
+
+	// kgo suppresses empty fetch responses. If every offset in the remaining
+	// range belongs to aborted transactions, PollFetches cannot expose the LSO
+	// and may block until the caller context expires. Probe the raw response so
+	// this case terminates without relying on a caller deadline.
+	lso, _, err := fetchReadCommittedProbe(
+		ctx, brokers, changelogTopic, partition, startOffset,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("state.RestoreFromChangelog: stable-offset probe: %w", err)
 	}
 
 	consumerOpts := append([]kgo.Opt{
@@ -167,7 +185,7 @@ func RestoreFromChangelog(
 	// does NOT mean all committed records have already been delivered
 	// (especially for large changelogs spanning multiple fetch responses),
 	// so it triggers a bounded confirm-poll rather than an immediate break.
-	lsoReachedHW := false
+	lsoReachedHW := lso >= hw
 
 	// applyFetches applies records to the Pebble batch, tracks
 	// lastAppliedOffset, and updates lsoReachedHW via partition metadata.
@@ -280,6 +298,14 @@ func RestoreFromChangelog(
 	}
 
 	if lastAppliedOffset < 0 {
+		if lsoReachedHW {
+			if err := WriteCheckpoint(batch, storeName, hw-1); err != nil {
+				return 0, fmt.Errorf("state.RestoreFromChangelog: checkpoint resolved empty range: %w", err)
+			}
+			if err := batch.Commit(pebble.Sync); err != nil {
+				return 0, fmt.Errorf("state.RestoreFromChangelog: commit resolved empty range: %w", err)
+			}
+		}
 		return hw, nil
 	}
 
@@ -295,13 +321,122 @@ func RestoreFromChangelog(
 	return hw, nil
 }
 
+// fetchReadCommittedProbe performs one raw Fetch request at startOffset. Unlike
+// kgo.PollFetches, the raw protocol response is returned even when every record
+// is filtered by read-committed isolation, allowing callers to observe LSO.
+func fetchReadCommittedProbe(
+	ctx context.Context,
+	brokers []string,
+	topic string,
+	partition int32,
+	startOffset int64,
+) (lastStableOffset int64, hasVisibleBatch bool, err error) {
+	client, err := kgo.NewClient(kgo.SeedBrokers(brokers...))
+	if err != nil {
+		return 0, false, fmt.Errorf("create kgo client: %w", err)
+	}
+	defer client.Close()
+	leader, err := fetchPartitionLeader(ctx, client, topic, partition)
+	if err != nil {
+		return 0, false, err
+	}
+
+	request := kmsg.NewPtrFetchRequest()
+	request.IsolationLevel = 1 // READ_COMMITTED
+	request.MaxWaitMillis = 0
+	request.MinBytes = 1
+
+	requestPartition := kmsg.NewFetchRequestTopicPartition()
+	requestPartition.Partition = partition
+	requestPartition.FetchOffset = startOffset
+	requestPartition.PartitionMaxBytes = 1 << 20
+	requestTopic := kmsg.NewFetchRequestTopic()
+	requestTopic.Topic = topic
+	requestTopic.Partitions = append(requestTopic.Partitions, requestPartition)
+	request.Topics = append(request.Topics, requestTopic)
+
+	responseAny, err := client.Broker(int(leader)).Request(ctx, &fetchRequestV12{FetchRequest: request})
+	if err != nil {
+		return 0, false, fmt.Errorf("fetch request: %w", err)
+	}
+	response, ok := responseAny.(*kmsg.FetchResponse)
+	if !ok {
+		return 0, false, fmt.Errorf("unexpected response type %T", responseAny)
+	}
+	for _, topicResponse := range response.Topics {
+		if topicResponse.Topic != topic {
+			continue
+		}
+		for _, partitionResponse := range topicResponse.Partitions {
+			if partitionResponse.Partition != partition {
+				continue
+			}
+			if kafkaErr := kerr.ErrorForCode(partitionResponse.ErrorCode); kafkaErr != nil {
+				return 0, false, fmt.Errorf("topic %q partition %d: %w", topic, partition, kafkaErr)
+			}
+			return partitionResponse.LastStableOffset, len(partitionResponse.RecordBatches) > 0, nil
+		}
+	}
+	return 0, false, fmt.Errorf("topic %q partition %d not found in response", topic, partition)
+}
+
+// fetchRequestV12 keeps topic names on the wire. Fetch v13+ requires topic IDs,
+// which raw callers do not have unless they reproduce franz-go's fetch session.
+type fetchRequestV12 struct {
+	*kmsg.FetchRequest
+}
+
+func (*fetchRequestV12) MaxVersion() int16 { return 12 }
+
+func fetchPartitionLeader(ctx context.Context, client *kgo.Client, topic string, partition int32) (int32, error) {
+	request := kmsg.NewPtrMetadataRequest()
+	request.AllowAutoTopicCreation = false
+	requestTopic := kmsg.NewMetadataRequestTopic()
+	requestTopic.Topic = &topic
+	request.Topics = append(request.Topics, requestTopic)
+	responseAny, err := client.Request(ctx, request)
+	if err != nil {
+		return 0, fmt.Errorf("metadata request: %w", err)
+	}
+	response := responseAny.(*kmsg.MetadataResponse)
+	for _, topicResponse := range response.Topics {
+		if topicResponse.Topic == nil || *topicResponse.Topic != topic {
+			continue
+		}
+		if kafkaErr := kerr.ErrorForCode(topicResponse.ErrorCode); kafkaErr != nil {
+			return 0, fmt.Errorf("metadata topic %q: %w", topic, kafkaErr)
+		}
+		for _, partitionResponse := range topicResponse.Partitions {
+			if partitionResponse.Partition == partition {
+				return partitionResponse.Leader, nil
+			}
+		}
+	}
+	return 0, fmt.Errorf("metadata topic %q partition %d not found", topic, partition)
+}
+
 // fetchHighWatermark fetches the Kafka high-watermark (end offset) for the given
 // (topic, partition) using ListOffsets with Timestamp=-1. HW is the next offset to
 // be written; the last existing record (if any) is at offset HW-1.
 func fetchHighWatermark(ctx context.Context, brokers []string, topic string, partition int32) (int64, error) {
+	return fetchOffset(ctx, brokers, topic, partition, -1, "fetchHighWatermark")
+}
+
+func fetchEarliestOffset(ctx context.Context, brokers []string, topic string, partition int32) (int64, error) {
+	return fetchOffset(ctx, brokers, topic, partition, -2, "fetchEarliestOffset")
+}
+
+func fetchOffset(
+	ctx context.Context,
+	brokers []string,
+	topic string,
+	partition int32,
+	timestamp int64,
+	operation string,
+) (int64, error) {
 	cl, err := kgo.NewClient(kgo.SeedBrokers(brokers...))
 	if err != nil {
-		return 0, fmt.Errorf("fetchHighWatermark: create kgo client: %w", err)
+		return 0, fmt.Errorf("%s: create kgo client: %w", operation, err)
 	}
 	defer cl.Close()
 
@@ -310,7 +445,7 @@ func fetchHighWatermark(ctx context.Context, brokers []string, topic string, par
 
 	topicPartition := kmsg.NewListOffsetsRequestTopicPartition()
 	topicPartition.Partition = partition
-	topicPartition.Timestamp = -1 // latest (high-watermark)
+	topicPartition.Timestamp = timestamp
 
 	rt := kmsg.NewListOffsetsRequestTopic()
 	rt.Topic = topic
@@ -319,7 +454,7 @@ func fetchHighWatermark(ctx context.Context, brokers []string, topic string, par
 
 	resp, err := req.RequestWith(ctx, cl)
 	if err != nil {
-		return 0, fmt.Errorf("fetchHighWatermark: ListOffsets request: %w", err)
+		return 0, fmt.Errorf("%s: ListOffsets request: %w", operation, err)
 	}
 
 	for _, topicResp := range resp.Topics {
@@ -331,8 +466,8 @@ func fetchHighWatermark(ctx context.Context, brokers []string, topic string, par
 				continue
 			}
 			if kerErr := kerr.ErrorForCode(partResp.ErrorCode); kerErr != nil {
-				return 0, fmt.Errorf("fetchHighWatermark: topic %q partition %d: %w",
-					topic, partition, kerErr)
+				return 0, fmt.Errorf("%s: topic %q partition %d: %w",
+					operation, topic, partition, kerErr)
 			}
 			if partResp.Offset < 0 {
 				return 0, nil
@@ -340,6 +475,6 @@ func fetchHighWatermark(ctx context.Context, brokers []string, topic string, par
 			return partResp.Offset, nil
 		}
 	}
-	return 0, fmt.Errorf("fetchHighWatermark: topic %q partition %d not found in response",
-		topic, partition)
+	return 0, fmt.Errorf("%s: topic %q partition %d not found in response",
+		operation, topic, partition)
 }
