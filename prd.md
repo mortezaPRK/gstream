@@ -123,13 +123,13 @@ Shared Compose broker and Make targets start Kafka, create caller-managed topics
 
 | Area | Repository evidence | Current proof |
 | --- | --- | --- |
-| Stable toolchain and split CI | `.github/workflows/ci.yml`, `.golangci.yml`, PR #25 | Go 1.27.0; lint and unit jobs pass; e2e regression under repair |
-| Clean EOS shutdown and bounded restore | `internal/kafka/client_test.go`, `internal/state/restore_test.go`, PR #26 | unit and integration-tag compile pass; local Docker unavailable |
-| Fatal EOS abort recovery | `internal/kafka/client.go`, EOS restart integration test, PR #27 | unit and integration-tag compile pass; local Docker unavailable |
+| Stable toolchain and split CI | `.github/workflows/ci.yml`, `.golangci.yml`, PR #25 | Go 1.27.0; local lint, unit, build, and race gates pass; GitHub rerun pending |
+| Clean EOS shutdown and bounded restore | `internal/kafka/client_test.go`, `internal/state/restore_test.go`, PR #26 | aborted-tail and all-aborted no-deadline broker tests pass locally |
+| Fatal EOS abort recovery | `internal/kafka/client.go`, EOS restart integration test, PR #27 | narrow unit tests pass; full GitHub e2e rerun pending |
 | Commit cadence and task concurrency | `internal/kafka/client.go`, `internal/kafka/batch_test.go`, PR #28 | unit and race suites pass locally |
-| Internal topics and repartition | `internal/kafka/admin_plan_test.go`, `repartition_test.go`, PR #29 | planner unit tests pass; broker test compiles and skips without Docker |
+| Internal topics and repartition | `internal/kafka/admin_plan_test.go`, `repartition_test.go`, PR #29 | planner unit tests pass; automatic internal topics exercised by example smoke |
 | Public runtime and metrics | `app/app_test.go`, `app/metrics_test.go`, PR #30 | facade, lifecycle, conflict, metric, CI, and race tests pass locally |
-| Examples and docs | `examples/`, `README.md`, this PRD | all examples compile; broker smoke requires Docker |
+| Examples and docs | `examples/`, `README.md`, this PRD | all four examples compile and pass shared-broker smoke locally |
 
 Evidence labels remain strict: compiled, skipped, passed, failed, and pending are not interchangeable. Functional implementation is complete only when final branch gates below are green.
 

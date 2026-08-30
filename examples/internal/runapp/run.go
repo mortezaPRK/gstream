@@ -21,11 +21,15 @@ func Run(applicationID string, guarantee gstream.Guarantee, topology *gstream.Bu
 	if brokers == "" {
 		brokers = "localhost:9092"
 	}
-	cfg, err := gstream.Configure(
+	configOptions := []gstream.Option{
 		gstream.WithName(applicationID),
 		gstream.WithBrokerStr(brokers),
 		gstream.WithGuarantee(guarantee),
-	)
+	}
+	if stateDir := os.Getenv("EXAMPLE_STATE_DIR"); stateDir != "" {
+		configOptions = append(configOptions, gstream.WithStateDir(stateDir))
+	}
+	cfg, err := gstream.Configure(configOptions...)
 	if err != nil {
 		logger.Error("configuration failed", slog.Any("error", err))
 		os.Exit(1)

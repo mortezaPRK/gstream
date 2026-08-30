@@ -1,94 +1,62 @@
 #!/bin/sh
 set -eu
 
-compose="docker compose -f examples/compose.yml"
 pids=""
 smoke_key="smoke-$$"
+log_dir=$(mktemp -d)
 
 cleanup() {
+	status=$?
 	for pid in $pids; do
 		kill "$pid" 2>/dev/null || true
 	done
+	if [ "$status" -ne 0 ]; then
+		for log in "$log_dir"/*.log; do
+			printf '\n==> %s <==\n' "$log" >&2
+			tail -n 80 "$log" >&2
+		done
+	fi
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT TERM
 
-produce() {
-	topic=$1
-	record=$2
-	printf '%s\n' "$record" | $compose exec -T kafka kafka-console-producer \
-		--bootstrap-server localhost:9092 --topic "$topic" \
-		--property parse.key=true --property key.separator=:
-}
-
-expect_key_value() {
-	topic=$1
-	key=$2
-	expected=$3
+wait_for_tasks() {
+	log=$1
 	attempt=0
-	while [ "$attempt" -lt 30 ]; do
-		output=$($compose exec -T kafka kafka-console-consumer \
-			--bootstrap-server localhost:9092 --topic "$topic" --from-beginning \
-			--property print.key=true --timeout-ms 1000 2>/dev/null || true)
-		if printf '%s\n' "$output" | grep -F "\"$key\"" | grep -F "$expected" >/dev/null; then
+	while [ "$attempt" -lt 60 ]; do
+		count=$(grep -c 'task opened' "$log" 2>/dev/null || true)
+		if [ "$count" -ge 3 ]; then
 			return 0
 		fi
 		attempt=$((attempt + 1))
 		sleep 1
 	done
-	printf 'missing topic=%s key=%s value=%s\n' "$topic" "$key" "$expected" >&2
-	return 1
-}
-
-expect_record() {
-	topic=$1
-	attempt=0
-	while [ "$attempt" -lt 30 ]; do
-		if $compose exec -T kafka kafka-console-consumer \
-			--bootstrap-server localhost:9092 --topic "$topic" --from-beginning \
-			--max-messages 1 --timeout-ms 1000 >/dev/null 2>&1; then
-			return 0
-		fi
-		attempt=$((attempt + 1))
-		sleep 1
-	done
-	printf 'missing record on topic=%s\n' "$topic" >&2
+	printf 'tasks not ready; inspect %s\n' "$log" >&2
 	return 1
 }
 
 # Global table must contain profile before joins app bootstraps it.
-produce join-profiles "\"$smoke_key\":\"gold\""
+go run ./examples/internal/smokeio profile "$smoke_key"
 
-EXAMPLE_STOP_AFTER=24s go run ./examples/filter-map & pids="$pids $!"
-EXAMPLE_STOP_AFTER=24s go run ./examples/stateful & pids="$pids $!"
-EXAMPLE_STOP_AFTER=24s go run ./examples/joins & pids="$pids $!"
-EXAMPLE_RESTART_AFTER=8s EXAMPLE_STOP_AFTER=24s go run ./examples/eos-recovery & pids="$pids $!"
+EXAMPLE_STATE_DIR="$log_dir/filter-map-state" EXAMPLE_STOP_AFTER=50s go run ./examples/filter-map >"$log_dir/filter-map.log" 2>&1 & pids="$pids $!"
+EXAMPLE_STATE_DIR="$log_dir/stateful-state" EXAMPLE_STOP_AFTER=50s go run ./examples/stateful >"$log_dir/stateful.log" 2>&1 & pids="$pids $!"
+EXAMPLE_STATE_DIR="$log_dir/joins-state" EXAMPLE_STOP_AFTER=50s go run ./examples/joins >"$log_dir/joins.log" 2>&1 & pids="$pids $!"
+EXAMPLE_RESTART_AFTER=20s EXAMPLE_STOP_AFTER=50s go run ./examples/eos-recovery >"$log_dir/eos.log" 2>&1 & pids="$pids $!"
 
-sleep 4
-produce filter-map-input "\"$smoke_key\":\"hello\""
-produce stateful-input "\"$smoke_key\":\"value\""
-produce eos-input "\"$smoke_key\":\"value\""
-produce join-table-input "\"$smoke_key\":\"table\""
-sleep 2
-produce join-stream-input "\"$smoke_key\":\"stream\""
-produce join-left-input "\"$smoke_key\":\"left\""
-produce join-right-input "\"$smoke_key\":\"right\""
-produce join-orders "\"order-$smoke_key\":{\"id\":\"order-$smoke_key\",\"user_id\":\"$smoke_key\"}"
-
-expect_key_value filter-map-output "$smoke_key" '"HELLO"'
-expect_key_value stateful-count-output "$smoke_key" '1'
-expect_record stateful-example-counts-changelog
-expect_key_value eos-output "$smoke_key" '1'
-expect_key_value join-table-output "$smoke_key" '"stream:1"'
-expect_key_value join-stream-output "$smoke_key" '"left:right"'
-expect_key_value join-global-output "order-$smoke_key" "\"order-$smoke_key:gold\""
+wait_for_tasks "$log_dir/filter-map.log"
+wait_for_tasks "$log_dir/stateful.log"
+wait_for_tasks "$log_dir/joins.log"
+wait_for_tasks "$log_dir/eos.log"
+go run ./examples/internal/smokeio initial "$smoke_key"
+go run ./examples/internal/smokeio verify-initial "$smoke_key"
 
 # Phase 2 uses empty local state. Count 2 proves changelog value 1 restored first.
-sleep 4
-produce eos-input "\"$smoke_key\":\"value\""
-expect_key_value eos-output "$smoke_key" '2'
-expect_record eos-recovery-example-counts-changelog
+sleep 12
+go run ./examples/internal/smokeio second "$smoke_key"
+go run ./examples/internal/smokeio verify-final "$smoke_key"
 
 for pid in $pids; do
 	wait "$pid"
 done
 pids=""
+rm -r "$log_dir"
