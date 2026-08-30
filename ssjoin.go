@@ -135,6 +135,8 @@ func (s KStream[K, V1]) Join[V2, VR any](
 	rightSerde Serde[V2],
 	outValSerde Serde[VR],
 ) KStream[K, VR] {
+	s = s.ensureRepartition(keySerde, leftSerde)
+	other = other.ensureRepartition(keySerde, rightSerde)
 	b := s.builder
 
 	leftStoreName := b.nextName("ssjoin-left-store")

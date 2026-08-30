@@ -15,6 +15,7 @@ type StreamBuilder struct {
 	counter             int
 	sources             map[string]SourceBinding
 	sinks               map[string]SinkBinding
+	internalSinks       map[string]struct{}
 	repartitionBindings map[string]RepartitionBinding
 	stores              map[string]StoreBinding
 	windowStores        map[string]WindowStoreBinding
@@ -28,6 +29,7 @@ func NewStreamBuilder() *StreamBuilder {
 		internal:            topology.NewBuilder(),
 		sources:             make(map[string]SourceBinding),
 		sinks:               make(map[string]SinkBinding),
+		internalSinks:       make(map[string]struct{}),
 		repartitionBindings: make(map[string]RepartitionBinding),
 		stores:              make(map[string]StoreBinding),
 		windowStores:        make(map[string]WindowStoreBinding),
@@ -51,8 +53,9 @@ func (b *StreamBuilder) nextName(prefix string) string {
 // Operator methods (Filter, Map, MapValues, SelectKey, etc.) are defined in
 // operators.go (same package).
 type KStream[K, V any] struct {
-	builder  *StreamBuilder
-	nodeName string
+	builder             *StreamBuilder
+	nodeName            string
+	repartitionRequired bool
 }
 
 // SourceBinding is the type-erased decode pair for a source node. It is stored
@@ -117,6 +120,8 @@ type WindowStoreBinding struct {
 	WindowDef WindowDefinition
 	// GraceMs is the late-record grace period in milliseconds.
 	GraceMs int64
+	// LateCount returns cumulative records dropped as late for this operator.
+	LateCount func() int64
 }
 
 // SessionStoreBinding extends StoreBinding with session-specific metadata.
@@ -128,6 +133,8 @@ type SessionStoreBinding struct {
 	GapMs int64
 	// GraceMs is the late-record grace period in milliseconds.
 	GraceMs int64
+	// LateCount returns cumulative records dropped as late for this operator.
+	LateCount func() int64
 }
 
 // GlobalTableBinding is the type-erased serde quad for a GlobalKTable. It
@@ -212,6 +219,10 @@ type BuiltTopology struct {
 	// Sinks maps sink node names to their type-erased encode bindings.
 	Sinks map[string]SinkBinding
 
+	// InternalSinks identifies terminal nodes whose records are intentionally
+	// discarded when no public sink binding is registered.
+	InternalSinks map[string]struct{}
+
 	// RepartitionBindings maps logical repartition names to their combined
 	// encode+decode bindings. Populated by Build(); consumed by C3 (adapter).
 	RepartitionBindings map[string]RepartitionBinding
@@ -287,6 +298,7 @@ func (b *StreamBuilder) Build() *BuiltTopology {
 		Topology:             b.internal.Build(),
 		Sources:              b.sources,
 		Sinks:                b.sinks,
+		InternalSinks:        b.internalSinks,
 		RepartitionBindings:  b.repartitionBindings,
 		StoreBindings:        b.stores,
 		WindowStoreBindings:  b.windowStores,

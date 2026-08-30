@@ -176,6 +176,29 @@ func TestApplyDefaults_FillsCommitInterval(t *testing.T) {
 	}
 }
 
+func TestALOOffsetCommitterDueAndLatestOffset(t *testing.T) {
+	committer := newALOOffsetCommitter(100 * time.Millisecond)
+	committer.last = time.Unix(10, 0)
+	committer.add(
+		&kgo.Record{Topic: "input", Partition: 0, Offset: 2},
+		&kgo.Record{Topic: "input", Partition: 0, Offset: 4},
+		&kgo.Record{Topic: "input", Partition: 0, Offset: 3},
+	)
+	if committer.due(time.Unix(10, int64(99*time.Millisecond))) {
+		t.Fatal("due before interval = true, want false")
+	}
+	if !committer.due(time.Unix(10, int64(100*time.Millisecond))) {
+		t.Fatal("due at interval = false, want true")
+	}
+	if got := committer.pending["input"][0].Offset; got != 4 {
+		t.Fatalf("pending offset = %d, want 4", got)
+	}
+	deadline, ok := committer.deadline()
+	if !ok || !deadline.Equal(time.Unix(10, 0).Add(100*time.Millisecond)) {
+		t.Fatalf("deadline = (%s, %t), want (10.1s, true)", deadline, ok)
+	}
+}
+
 func TestApplyDefaults_FillsNumTaskThreads(t *testing.T) {
 	cfg, err := gstream.Configure(
 		gstream.WithName("app"),
@@ -208,7 +231,7 @@ func TestApplyDefaults_DefaultGuaranteeIsALO(t *testing.T) {
 
 func TestBuildOpts_ReturnsSomeOpts(t *testing.T) {
 	cfg := validConfig()
-	opts := buildOpts(cfg, []string{"input-topic"}, nil, &clientOptions{})
+	opts := buildOpts(cfg, []string{"input-topic"}, nil, &clientOptions{}, newALOOffsetCommitter(cfg.CommitInterval))
 	if len(opts) == 0 {
 		t.Fatal("expected non-empty opts slice from buildOpts")
 	}

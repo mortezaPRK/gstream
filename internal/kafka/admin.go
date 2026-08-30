@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -12,6 +14,134 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
+
+// PrepareTopology validates caller-managed topics and creates only deterministic
+// gstream internal topics. Source, sink, and global-table topics must already
+// exist; gstream never creates them.
+func PrepareTopology(ctx context.Context, cfg gstream.Config, topology *gstream.BuiltTopology) error {
+	if topology == nil {
+		return errors.New("kafka.PrepareTopology: topology must not be nil")
+	}
+
+	externalNames := make(map[string]struct{})
+	for _, binding := range topology.Sources {
+		externalNames[binding.Topic] = struct{}{}
+	}
+	for _, binding := range topology.Sinks {
+		externalNames[binding.Topic] = struct{}{}
+	}
+	for _, binding := range topology.GlobalTableBindings {
+		externalNames[binding.Topic] = struct{}{}
+	}
+	names := make([]string, 0, len(externalNames))
+	for name := range externalNames {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	client, err := kgo.NewClient(kgo.SeedBrokers(cfg.Brokers...))
+	if err != nil {
+		return fmt.Errorf("kafka.PrepareTopology: create client: %w", err)
+	}
+	defer client.Close()
+
+	specs := make([]TopicSpec, 0, len(names))
+	for _, name := range names {
+		specs = append(specs, TopicSpec{Name: name})
+	}
+	metadata, err := fetchTopicMetadata(ctx, client, specs)
+	if err != nil {
+		return fmt.Errorf("kafka.PrepareTopology: metadata: %w", err)
+	}
+	var missing []string
+	for _, name := range names {
+		if _, ok := metadata[name]; !ok {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("kafka.PrepareTopology: caller-managed topics do not exist: %s", strings.Join(missing, ", "))
+	}
+
+	partitionCount, err := sourcePartitionCount(topology, metadata)
+	if err != nil {
+		return err
+	}
+	for _, binding := range topology.RepartitionBindings {
+		if binding.Partitions != 0 && binding.Partitions != partitionCount {
+			return fmt.Errorf(
+				"kafka.PrepareTopology: repartition %q requests %d partitions; source topics have %d",
+				binding.Name, binding.Partitions, partitionCount,
+			)
+		}
+	}
+	if err := EnsureTopics(ctx, cfg.Brokers, internalTopicSpecs(cfg, topology, partitionCount)); err != nil {
+		return fmt.Errorf("kafka.PrepareTopology: internal topics: %w", err)
+	}
+	return nil
+}
+
+func sourcePartitionCount(topology *gstream.BuiltTopology, metadata map[string]topicMeta) (int32, error) {
+	var count int32
+	for _, binding := range topology.Sources {
+		got := metadata[binding.Topic].partitions
+		if count == 0 {
+			count = got
+			continue
+		}
+		if got != count {
+			return 0, fmt.Errorf(
+				"kafka.PrepareTopology: source topic %q has %d partitions; expected %d",
+				binding.Topic, got, count,
+			)
+		}
+	}
+	if count == 0 {
+		return 0, errors.New("kafka.PrepareTopology: topology has no source topics")
+	}
+	return count, nil
+}
+
+func internalTopicSpecs(cfg gstream.Config, topology *gstream.BuiltTopology, partitions int32) []TopicSpec {
+	byName := make(map[string]TopicSpec)
+	addChangelog := func(name string, retentionMs int64) {
+		configs := map[string]string{"cleanup.policy": "compact"}
+		if retentionMs > 0 {
+			configs["cleanup.policy"] = "compact,delete"
+			configs["retention.ms"] = strconv.FormatInt(retentionMs, 10)
+		}
+		fullName := cfg.ApplicationID + "-" + name + "-changelog"
+		byName[fullName] = TopicSpec{
+			Name: fullName, Partitions: partitions, ReplicationFactor: 1, Configs: configs,
+		}
+	}
+	for _, binding := range topology.StoreBindings {
+		addChangelog(binding.ChangelogTopic, 0)
+	}
+	for _, binding := range topology.WindowStoreBindings {
+		addChangelog(binding.ChangelogTopic, binding.WindowDef.MaxSizeMs()+binding.GraceMs)
+	}
+	for _, binding := range topology.SessionStoreBindings {
+		addChangelog(binding.ChangelogTopic, binding.GapMs+binding.GraceMs)
+	}
+	for _, binding := range topology.RepartitionBindings {
+		count := binding.Partitions
+		if count == 0 {
+			count = partitions
+		}
+		name := cfg.ApplicationID + "-" + binding.Name + "-repartition"
+		byName[name] = TopicSpec{
+			Name: name, Partitions: count, ReplicationFactor: 1,
+			Configs: map[string]string{"cleanup.policy": "delete"},
+		}
+	}
+	out := make([]TopicSpec, 0, len(byName))
+	for _, spec := range byName {
+		out = append(out, spec)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
 
 // TopicSpec describes the desired state of a Kafka topic.
 type TopicSpec struct {

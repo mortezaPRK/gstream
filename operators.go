@@ -25,7 +25,7 @@ func (s KStream[K, V]) Filter(fn func(K, V) bool) KStream[K, V] {
 		}
 		return nil
 	}, s.nodeName)
-	return KStream[K, V]{builder: s.builder, nodeName: name}
+	return KStream[K, V]{builder: s.builder, nodeName: name, repartitionRequired: s.repartitionRequired}
 }
 
 // MapValues transforms the value of each record from V to V2 using fn. The key
@@ -48,7 +48,7 @@ func (s KStream[K, V]) MapValues[V2 any](fn func(K, V) V2) KStream[K, V2] {
 		})
 		return nil
 	}, s.nodeName)
-	return KStream[K, V2]{builder: s.builder, nodeName: name}
+	return KStream[K, V2]{builder: s.builder, nodeName: name, repartitionRequired: s.repartitionRequired}
 }
 
 // Map transforms each record's key and value from (K, V) to (K2, V2) using fn.
@@ -75,7 +75,7 @@ func (s KStream[K, V]) Map[K2, V2 any](fn func(K, V) (K2, V2)) KStream[K2, V2] {
 		})
 		return nil
 	}, s.nodeName)
-	return KStream[K2, V2]{builder: s.builder, nodeName: name}
+	return KStream[K2, V2]{builder: s.builder, nodeName: name, repartitionRequired: true}
 }
 
 // SelectKey replaces the key of each record using fn(k, v) → K2. The value V
@@ -102,5 +102,5 @@ func (s KStream[K, V]) SelectKey[K2 any](fn func(K, V) K2) KStream[K2, V] {
 		})
 		return nil
 	}, s.nodeName)
-	return KStream[K2, V]{builder: s.builder, nodeName: name}
+	return KStream[K2, V]{builder: s.builder, nodeName: name, repartitionRequired: true}
 }

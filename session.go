@@ -269,6 +269,7 @@ func (s SessionWindowedStream[K, V]) Aggregate[A any](
 	// Internal sink to satisfy topology.Builder.Build()'s >=1 sink invariant.
 	sinkName := s.builder.nextName("session-ktable-out")
 	s.builder.internal.AddSink(sinkName, name)
+	s.builder.internalSinks[sinkName] = struct{}{}
 
 	// Register SessionStoreBinding so the runtime can open the store and configure
 	// the session sweeper. EncodeKey/DecodeKey are stubs: the active processing path
@@ -294,8 +295,9 @@ func (s SessionWindowedStream[K, V]) Aggregate[A any](
 				return accSerde.Deserialize(b)
 			},
 		},
-		GapMs:   gapMs,
-		GraceMs: graceMs,
+		GapMs:     gapMs,
+		GraceMs:   graceMs,
+		LateCount: lateCount.Load,
 	}
 
 	// keySerde unset: windowed/session KTables are not stream-joinable in P4a (key is Windowed[K]).
