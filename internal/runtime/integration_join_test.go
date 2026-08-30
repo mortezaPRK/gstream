@@ -356,6 +356,7 @@ func buildJoinE2ETopology(tableTopic, streamTopic, storeName, outTopic string) *
 		table,
 		func(v string, c int64) string { return fmt.Sprintf("%s#%d", v, c) },
 		gstream.JSONSerde[string]{},
+		gstream.JSONSerde[string]{},
 	)
 
 	joined.To(outTopic, "out", gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{})

@@ -28,6 +28,7 @@ type kvBytesStore interface {
 // the same key are already co-located on the same partition. Key-changing operators
 // (Map, SelectKey) before GroupByKey without a repartition may yield incorrect results.
 func (s KStream[K, V]) GroupByKey(keySerde Serde[K], valSerde Serde[V]) KGroupedStream[K, V] {
+	s = s.ensureRepartition(keySerde, valSerde)
 	return KGroupedStream[K, V]{
 		builder:  s.builder,
 		nodeName: s.nodeName,
@@ -139,6 +140,7 @@ func (g KGroupedStream[K, V]) Aggregate[A any](
 	// Not registered in BuiltTopology.Sinks; invisible to the runtime output path.
 	sinkName := g.builder.nextName("ktable-out")
 	g.builder.internal.AddSink(sinkName, name)
+	g.builder.internalSinks[sinkName] = struct{}{}
 
 	// Register a StoreBinding so the runtime can open and recover this store.
 	// ChangelogTopic is the bare store name; the runtime derives the full Kafka topic

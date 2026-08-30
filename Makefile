@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help build vet test tidy fmt lint integration-test verify-modules ci
+.PHONY: help build vet test tidy fmt lint integration-test test-race verify-modules ci examples-up examples-topics example-filter-map example-stateful example-joins example-eos example-smoke examples-down
 
 ## help: Show this help message (default target).
 help:
@@ -34,6 +34,44 @@ lint:
 ## integration-test: Run integration tests (requires Docker/Podman).
 integration-test:
 	TESTCONTAINERS_RYUK_DISABLED=true go test -p 1 -tags integration ./...
+
+## test-race: Run all tests with race detector.
+test-race:
+	go test -race ./...
+
+## examples-up: Start shared local Kafka broker for examples.
+examples-up:
+	docker compose -f examples/compose.yml up -d --wait
+
+## examples-topics: Create caller-managed source, sink, and global-table topics.
+examples-topics:
+	@for topic in filter-map-input filter-map-output stateful-input stateful-count-output eos-input eos-output join-table-input join-stream-input join-table-output join-left-input join-right-input join-stream-output join-profiles join-orders join-global-output; do \
+		docker compose -f examples/compose.yml exec -T kafka kafka-topics --bootstrap-server localhost:9092 --create --if-not-exists --topic $$topic --partitions 3 --replication-factor 1; \
+	done
+
+## example-filter-map: Run stateless ALO filter/map example.
+example-filter-map:
+	go run ./examples/filter-map
+
+## example-stateful: Run count, time-window, and session-window example.
+example-stateful:
+	go run ./examples/stateful
+
+## example-joins: Run stream-table, stream-stream, and global-table joins example.
+example-joins:
+	go run ./examples/joins
+
+## example-eos: Run controlled EOS stop/restart recovery example.
+example-eos:
+	go run ./examples/eos-recovery
+
+## example-smoke: Run all public examples and verify outputs and clean shutdown.
+example-smoke: examples-topics
+	sh examples/smoke.sh
+
+## examples-down: Stop shared local Kafka broker.
+examples-down:
+	docker compose -f examples/compose.yml down
 
 ## verify-modules: Build each module standalone (GOWORK=off) to catch per-module go.sum gaps.
 verify-modules:

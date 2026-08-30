@@ -3,6 +3,7 @@ package kafka
 import (
 	"context"
 	"log/slog"
+	"sync"
 )
 
 // processBatch runs Step 1 of the ALO loop for a single polled batch: it calls
@@ -38,6 +39,69 @@ func processBatch(
 			return nil, false
 		}
 		outputs = append(outputs, out...)
+	}
+	return outputs, true
+}
+
+// processBatchConcurrent preserves record order within each partition while
+// processing independent partitions concurrently. Output ordering is stable by
+// first partition appearance in fetched batch.
+func processBatchConcurrent(
+	ctx context.Context,
+	logger *slog.Logger,
+	inRecords []InRecord,
+	process ProcessFunc,
+	maxThreads int,
+) ([]OutRecord, bool) {
+	if maxThreads <= 1 || len(inRecords) < 2 {
+		return processBatch(ctx, logger, inRecords, process)
+	}
+
+	type partitionBatch struct {
+		records []InRecord
+	}
+	type partitionResult struct {
+		outputs []OutRecord
+		ok      bool
+	}
+
+	groups := make([]partitionBatch, 0)
+	groupIndex := make(map[int32]int)
+	for _, record := range inRecords {
+		index, exists := groupIndex[record.Partition]
+		if !exists {
+			index = len(groups)
+			groupIndex[record.Partition] = index
+			groups = append(groups, partitionBatch{})
+		}
+		groups[index].records = append(groups[index].records, record)
+	}
+	if len(groups) == 1 {
+		return processBatch(ctx, logger, inRecords, process)
+	}
+
+	workers := min(maxThreads, len(groups))
+	semaphore := make(chan struct{}, workers)
+	results := make([]partitionResult, len(groups))
+	var waitGroup sync.WaitGroup
+	for index := range groups {
+		waitGroup.Add(1)
+		go func(index int) {
+			defer waitGroup.Done()
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+			outputs, ok := processBatch(ctx, logger, groups[index].records, process)
+			results[index] = partitionResult{outputs: outputs, ok: ok}
+		}(index)
+	}
+	waitGroup.Wait()
+
+	var outputs []OutRecord
+	for _, result := range results {
+		if !result.ok {
+			return nil, false
+		}
+		outputs = append(outputs, result.outputs...)
 	}
 	return outputs, true
 }
