@@ -65,3 +65,27 @@ func TestSourcePartitionCountRejectsMismatch(t *testing.T) {
 		t.Fatal("sourcePartitionCount() error = nil, want mismatch")
 	}
 }
+
+func TestSourcePartitionCountRejectsMissingMetadata(t *testing.T) {
+	topology := &gstream.BuiltTopology{Sources: map[string]gstream.SourceBinding{
+		"orders": {Topic: "orders"},
+	}}
+
+	_, err := sourcePartitionCount(topology, map[string]topicMeta{})
+	if err == nil {
+		t.Fatal("sourcePartitionCount() error = nil, want missing metadata error")
+	}
+}
+
+func TestSourcePartitionCountRejectsInvalidPartitionCount(t *testing.T) {
+	topology := &gstream.BuiltTopology{Sources: map[string]gstream.SourceBinding{
+		"orders": {Topic: "orders"},
+	}}
+
+	_, err := sourcePartitionCount(topology, map[string]topicMeta{
+		"orders": {partitions: 0},
+	})
+	if err == nil {
+		t.Fatal("sourcePartitionCount() error = nil, want invalid partition count error")
+	}
+}
