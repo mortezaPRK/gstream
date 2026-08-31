@@ -84,7 +84,20 @@ func PrepareTopology(ctx context.Context, cfg gstream.Config, topology *gstream.
 func sourcePartitionCount(topology *gstream.BuiltTopology, metadata map[string]topicMeta) (int32, error) {
 	var count int32
 	for _, binding := range topology.Sources {
-		got := metadata[binding.Topic].partitions
+		info, ok := metadata[binding.Topic]
+		if !ok {
+			return 0, fmt.Errorf(
+				"kafka.PrepareTopology: source topic %q is missing from metadata",
+				binding.Topic,
+			)
+		}
+		got := info.partitions
+		if got <= 0 {
+			return 0, fmt.Errorf(
+				"kafka.PrepareTopology: source topic %q has invalid partition count %d",
+				binding.Topic, got,
+			)
+		}
 		if count == 0 {
 			count = got
 			continue
