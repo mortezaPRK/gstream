@@ -18,7 +18,7 @@ import (
 //
 // Before and After define the (optionally asymmetric) join window;
 // Grace extends the lower lookup bound to accept late-arriving B-side records.
-// Formula frozen by the P4b-F2-C0 bounds spike (internal/state/ssjoin_bounds_spike_test.go).
+// Formula frozen by the P4b-F2-C0 bounds spike (store/pebble/ssjoin_bounds_spike_test.go).
 type JoinWindows struct {
 	Before time.Duration // lower half-width: look back Before from tsA
 	After  time.Duration // upper half-width: look forward After from tsA
@@ -65,10 +65,10 @@ var _ WindowDefinition = joinWindowDef{}
 // B-side records and scan them when an A-side record arrives.
 //
 // The runtime supplies a *state.KeyValueStore[[]byte,[]byte]; gstream cannot
-// import internal/state directly (import cycle: internal/state → gstream via
+// import store/pebble directly (import cycle: store/pebble → gstream via
 // Serde[T]), so a narrow interface is used and the runtime type-asserts at
 // processor startup.  The compile-time proof that *state.KeyValueStore[[]byte,[]byte]
-// satisfies this interface lives in internal/state/ssjoin_store_assert.go.
+// satisfies this interface lives in store/pebble/ssjoin_store_assert.go.
 //
 // Signatures match *state.KeyValueStore[[]byte,[]byte] exactly (P4b-F2-C1 freeze):
 //
@@ -116,7 +116,7 @@ func ssJoinScanBounds(kBytes []byte, ts, beforeMs, afterMs, graceMs int64) (lowe
 //	max(0, tsA - before - grace) <= tsB <= tsA + after
 //
 // where A is the triggering side and B is the opposite side. The bounds formula is
-// frozen by the P4b-F2-C0 spike (internal/state/ssjoin_bounds_spike_test.go).
+// frozen by the P4b-F2-C0 spike (store/pebble/ssjoin_bounds_spike_test.go).
 //
 // joiner(v1, v2) always receives the LEFT value as the first argument and the RIGHT
 // value as the second, regardless of which side triggered the emit.

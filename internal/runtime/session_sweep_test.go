@@ -8,7 +8,7 @@ import (
 	"testing"
 
 	gstream "github.com/mortezaPRK/gstream"
-	"github.com/mortezaPRK/gstream/internal/state"
+	state "github.com/mortezaPRK/gstream/store/pebble"
 )
 
 // encodeSessionValue builds the session value wire format:

@@ -1,6 +1,6 @@
 // Package gstream_test provides broker-free tests for session-window aggregation.
-// Uses package gstream_test (external) because internal/state imports gstream,
-// so an internal test importing internal/state would create a circular import.
+// Uses package gstream_test (external) because store/memory imports gstream,
+// so an internal test importing it would create a circular import.
 package gstream_test
 
 import (
@@ -9,8 +9,8 @@ import (
 	"time"
 
 	"github.com/mortezaPRK/gstream"
-	"github.com/mortezaPRK/gstream/internal/state"
 	"github.com/mortezaPRK/gstream/internal/topology"
+	"github.com/mortezaPRK/gstream/store/memory"
 )
 
 // newSessionCount builds a pipeline:
@@ -23,7 +23,7 @@ func newSessionCount(
 	t *testing.T,
 	gap, grace time.Duration,
 	storeName string,
-) (*gstream.BuiltTopology, *int64, *topology.Executor, *state.KeyValueStore[[]byte, []byte], gstream.SessionWindowedStream[string, string]) {
+) (*gstream.BuiltTopology, *int64, *topology.Executor, *memory.KeyValueStore[[]byte, []byte], gstream.SessionWindowedStream[string, string]) {
 	t.Helper()
 
 	b := gstream.NewStreamBuilder()
@@ -38,14 +38,14 @@ func newSessionCount(
 
 	bt := b.Build()
 
-	db, err := state.OpenMemDB()
+	db, err := memory.OpenMemDB()
 	if err != nil {
 		t.Fatalf("OpenMemDB: %v", err)
 	}
 	t.Cleanup(func() { db.Close() })
 
-	byteStore := state.NewKeyValueStoreWithChangelog[[]byte, []byte](
-		storeName, db, gstream.BytesSerde{}, gstream.BytesSerde{}, nil,
+	byteStore := memory.NewKeyValueStore[[]byte, []byte](
+		storeName, db, gstream.BytesSerde{}, gstream.BytesSerde{},
 	)
 
 	var streamTime int64
@@ -57,7 +57,7 @@ func newSessionCount(
 
 // readSession retrieves the count and session bounds for key k from byteStore.
 // Returns (count, sessionStart, sessionEnd, found).
-func readSession(t *testing.T, byteStore *state.KeyValueStore[[]byte, []byte], key string, expectedStart int64) (count int64, sessionStart int64, sessionEnd int64, found bool) {
+func readSession(t *testing.T, byteStore *memory.KeyValueStore[[]byte, []byte], key string, expectedStart int64) (count int64, sessionStart int64, sessionEnd int64, found bool) {
 	t.Helper()
 
 	keySerde := gstream.JSONSerde[string]{}
@@ -89,7 +89,7 @@ func readSession(t *testing.T, byteStore *state.KeyValueStore[[]byte, []byte], k
 }
 
 // countSessions counts how many sessions exist for key k.
-func countSessions(t *testing.T, byteStore *state.KeyValueStore[[]byte, []byte], key string) int {
+func countSessions(t *testing.T, byteStore *memory.KeyValueStore[[]byte, []byte], key string) int {
 	t.Helper()
 
 	keySerde := gstream.JSONSerde[string]{}
@@ -315,7 +315,7 @@ func newSessionAggregate[A any](
 	aggFn func(string, string, A) A,
 	mergeFn func(string, A, A) A,
 	accSerde gstream.Serde[A],
-) (*gstream.BuiltTopology, *int64, *topology.Executor, *state.KeyValueStore[[]byte, []byte]) {
+) (*gstream.BuiltTopology, *int64, *topology.Executor, *memory.KeyValueStore[[]byte, []byte]) {
 	t.Helper()
 
 	b := gstream.NewStreamBuilder()
@@ -329,14 +329,14 @@ func newSessionAggregate[A any](
 
 	bt := b.Build()
 
-	db, err := state.OpenMemDB()
+	db, err := memory.OpenMemDB()
 	if err != nil {
 		t.Fatalf("OpenMemDB: %v", err)
 	}
 	t.Cleanup(func() { db.Close() })
 
-	byteStore := state.NewKeyValueStoreWithChangelog[[]byte, []byte](
-		storeName, db, gstream.BytesSerde{}, gstream.BytesSerde{}, nil,
+	byteStore := memory.NewKeyValueStore[[]byte, []byte](
+		storeName, db, gstream.BytesSerde{}, gstream.BytesSerde{},
 	)
 
 	var streamTime int64
@@ -347,7 +347,7 @@ func newSessionAggregate[A any](
 }
 
 // readSessionA is like readSession but for a generic accumulator A.
-func readSessionA[A any](t *testing.T, byteStore *state.KeyValueStore[[]byte, []byte], key string, expectedStart int64, accSerde gstream.Serde[A]) (acc A, sessionStart int64, sessionEnd int64, found bool) {
+func readSessionA[A any](t *testing.T, byteStore *memory.KeyValueStore[[]byte, []byte], key string, expectedStart int64, accSerde gstream.Serde[A]) (acc A, sessionStart int64, sessionEnd int64, found bool) {
 	t.Helper()
 
 	keySerde := gstream.JSONSerde[string]{}

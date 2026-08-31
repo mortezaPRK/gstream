@@ -13,6 +13,8 @@ import (
 	"uuid"
 
 	gstream "github.com/mortezaPRK/gstream"
+	"github.com/mortezaPRK/gstream/logging"
+	gslog "github.com/mortezaPRK/gstream/logging/slog"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
@@ -100,7 +102,7 @@ type Client struct {
 	sess *kgo.GroupTransactSession
 
 	cfg       gstream.Config
-	logger    *slog.Logger
+	logger    logging.Logger
 	postBatch func(ctx context.Context) error // nil = no-op (ALO: PostBatch; EOS: PostBatchSweep)
 
 	// changelogFlusher is called inside the EOS transaction, after PostBatchSweep,
@@ -266,7 +268,7 @@ func WithHealthGate(fn func() error) ClientOption {
 //   - kgo.TransactionTimeout(60s): explicit timeout within the broker max.
 //   - OnPartitionsRevoked WITHOUT CommitUncommittedOffsets: the session aborts on
 //     revoke; offset commits happen only via End(TryCommit).
-func New(cfg gstream.Config, topics []string, logger *slog.Logger, opts ...ClientOption) (*Client, error) {
+func New(cfg gstream.Config, topics []string, logger logging.Logger, opts ...ClientOption) (*Client, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("kafka.New: invalid config: %w", err)
 	}
@@ -274,7 +276,7 @@ func New(cfg gstream.Config, topics []string, logger *slog.Logger, opts ...Clien
 		return nil, fmt.Errorf("kafka.New: topics must not be empty")
 	}
 	if logger == nil {
-		logger = slog.Default()
+		logger = gslog.Default()
 	}
 
 	co := &clientOptions{}
@@ -319,7 +321,7 @@ func New(cfg gstream.Config, topics []string, logger *slog.Logger, opts ...Clien
 func buildOpts(
 	cfg gstream.Config,
 	topics []string,
-	logger *slog.Logger,
+	logger logging.Logger,
 	co *clientOptions,
 	offsets *aloOffsetCommitter,
 ) []kgo.Opt {
@@ -410,7 +412,7 @@ func resolveInstanceID(cfg gstream.Config) (string, error) {
 //
 // instanceID is the resolved per-instance suffix (from resolveInstanceID); it forms
 // the full TransactionalID "gstream-<ApplicationID>-<instanceID>".
-func buildOptsEOS(cfg gstream.Config, topics []string, logger *slog.Logger, co *clientOptions, instanceID string) []kgo.Opt {
+func buildOptsEOS(cfg gstream.Config, topics []string, logger logging.Logger, co *clientOptions, instanceID string) []kgo.Opt {
 	return []kgo.Opt{
 		kgo.SeedBrokers(cfg.Brokers...),
 		kgo.TransactionalID("gstream-" + cfg.ApplicationID + "-" + instanceID),

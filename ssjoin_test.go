@@ -1,9 +1,9 @@
 // Package gstream_test provides broker-free tests for the stream-stream windowed
 // inner join (KStream.Join). Tests live in package gstream_test (external) to avoid
-// the import cycle: internal/state imports gstream via Serde[T].
+// the import cycle: store/memory imports gstream via Serde[T].
 //
 // All tests use topology.NewExecutorWithStreamTime so stream-time advances correctly
-// and late-drop semantics are exercised.  Two real in-memory Pebble stores are wired
+// and late-drop semantics are exercised. Two in-memory stores are wired
 // per test — one per join side.
 package gstream_test
 
@@ -13,8 +13,8 @@ import (
 	"time"
 
 	"github.com/mortezaPRK/gstream"
-	"github.com/mortezaPRK/gstream/internal/state"
 	"github.com/mortezaPRK/gstream/internal/topology"
+	"github.com/mortezaPRK/gstream/store/memory"
 )
 
 // buildSSJoinTopology constructs the test topology:
@@ -71,20 +71,20 @@ func buildSSJoinTopology(t *testing.T, windows gstream.JoinWindows) (
 	return bt, leftStore, rightStore, "out"
 }
 
-// openJoinStores opens two in-memory Pebble stores for a join test.
+// openJoinStores opens two memory stores for a join test.
 // Returns the stores map and a closer function.
 func openJoinStores(t *testing.T, leftStoreName, rightStoreName string) (map[string]any, func()) {
 	t.Helper()
 
-	db, err := state.OpenMemDB()
+	db, err := memory.OpenMemDB()
 	if err != nil {
 		t.Fatalf("OpenMemDB: %v", err)
 	}
 
-	ls := state.NewKeyValueStore[[]byte, []byte](
+	ls := memory.NewKeyValueStore[[]byte, []byte](
 		leftStoreName, db, gstream.BytesSerde{}, gstream.BytesSerde{},
 	)
-	rs := state.NewKeyValueStore[[]byte, []byte](
+	rs := memory.NewKeyValueStore[[]byte, []byte](
 		rightStoreName, db, gstream.BytesSerde{}, gstream.BytesSerde{},
 	)
 

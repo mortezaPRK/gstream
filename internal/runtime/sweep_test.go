@@ -9,8 +9,8 @@ import (
 	"time"
 
 	gstream "github.com/mortezaPRK/gstream"
-	"github.com/mortezaPRK/gstream/internal/state"
 	"github.com/mortezaPRK/gstream/internal/topology"
+	state "github.com/mortezaPRK/gstream/store/pebble"
 )
 
 // buildWindowedTopology builds a BuiltTopology with a windowed Count store:

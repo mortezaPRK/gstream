@@ -16,7 +16,9 @@ import (
 
 	gstream "github.com/mortezaPRK/gstream"
 	"github.com/mortezaPRK/gstream/internal/kafka"
-	"github.com/mortezaPRK/gstream/internal/state"
+	"github.com/mortezaPRK/gstream/logging"
+	gslog "github.com/mortezaPRK/gstream/logging/slog"
+	state "github.com/mortezaPRK/gstream/store/pebble"
 )
 
 // GlobalConsumer bootstraps a GlobalKTable from a Kafka topic — reading ALL
@@ -41,7 +43,7 @@ type GlobalConsumer struct {
 	topic     string
 	binding   gstream.GlobalTableBinding
 	brokers   []string
-	logger    *slog.Logger
+	logger    logging.Logger
 
 	// client is the kgo client created during Bootstrap. TailConsume reuses it.
 	// Nil until Bootstrap completes successfully.
@@ -74,10 +76,10 @@ type GlobalConsumer struct {
 func NewGlobalConsumer(
 	cfg gstream.Config,
 	binding gstream.GlobalTableBinding,
-	logger *slog.Logger,
+	logger logging.Logger,
 ) (*GlobalConsumer, error) {
 	if logger == nil {
-		logger = slog.Default()
+		logger = gslog.Default()
 	}
 
 	dbDir := filepath.Join(cfg.StateDir, cfg.ApplicationID, "global-"+binding.StoreName)
@@ -145,7 +147,7 @@ func (gc *GlobalConsumer) Bootstrap(ctx context.Context) error {
 	}
 
 	// Step 2: fetch per-partition high-watermarks. Extended from state.fetchHighWatermark
-	// (internal/state/restore.go) to N partitions in a single ListOffsets request.
+	// (store/pebble/restore.go) to N partitions in a single ListOffsets request.
 	hwms, err := fetchAllPartitionHWMs(ctx, gc.brokers, gc.topic, int(nPartitions))
 	if err != nil {
 		return fmt.Errorf("runtime.GlobalConsumer.Bootstrap: fetch HWMs for %q: %w",
@@ -368,7 +370,7 @@ func (gc *GlobalConsumer) TailConsume(ctx context.Context) error {
 // are safe: all operations delegate to the concurrent-safe Pebble DB (S2).
 //
 // The returned value is *state.KeyValueStore[[]byte,[]byte]; callers type-assert
-// as needed. The any type avoids importing internal/state at call sites.
+// as needed. The any type avoids importing store/pebble at call sites.
 func (gc *GlobalConsumer) Store() any {
 	return gc.store
 }
@@ -377,7 +379,7 @@ func (gc *GlobalConsumer) Store() any {
 //
 // Close CONTRACT (S2 — race safety):
 //
-//	KeyValueStore.closed is an unsynchronized bool (internal/state/keyvalue.go).
+//	KeyValueStore.closed is an unsynchronized bool (store/pebble/keyvalue.go).
 //	If the tail goroutine were still calling store.Put or store.Delete when
 //	db.Close() ran, Pebble would receive operations on a closed database.
 //
@@ -448,7 +450,7 @@ func (gc *GlobalConsumer) applyKV(key, value []byte, offset int64, partition int
 // offset to be written) for each partition [0..numPartitions) using a single
 // ListOffsets request with Timestamp=-1.
 //
-// This extends state.fetchHighWatermark (internal/state/restore.go:160–204) from
+// This extends state.fetchHighWatermark (store/pebble/restore.go:160–204) from
 // a single partition to N partitions in one request. The same kmsg pattern is
 // used: kgo.NewClient + kmsg.NewPtrListOffsetsRequest + req.RequestWith.
 //

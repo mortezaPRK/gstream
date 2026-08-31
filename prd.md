@@ -377,7 +377,7 @@ type Config struct {
   store contents **without a broker** (the single most important test tool; mirrors Kafka
   Streams' `TopologyTestDriver`).
 - **State store unit tests**: KV/window/session semantics, TTL sweep, range correctness.
-- **Integration tests**: real Kafka + Pebble via `testcontainers-go`; group membership, restore,
+- **Integration tests**: real Kafka + Pebble via the isolated `integration/kafka` Testcontainers module; group membership, restore,
   and **internal-topic auto-creation** (§14).
 - **EOS correctness**: fault-injection (kill mid-transaction) → assert no duplicate/lost output
   on the read-committed side.
@@ -439,8 +439,8 @@ type Config struct {
 
 ## 20. Immediate Next Steps
 
-1. **Repo scaffolding**: `go.mod` (Go 1.27), package layout (`gstream/` public API incl. `Config` + `Serde[T]`; `internal/state`, `internal/topology`, `internal/runtime`, `internal/kafka` wrapping franz-go), CI (lint + test + vet), `Makefile`.
-2. **P0 spike**: hidden franz-go group consumer + producer behind `Config`; minimal `KStream` source→filter→sink with ALO commit against a `testcontainers` broker.
+1. **Repo scaffolding**: `go.mod` (Go 1.27), package layout (`gstream/` public API incl. `Config` + `Serde[T]`; lightweight `logging`, `store/memory`, and `integration/kafka` subpackages; `store/pebble`, `internal/topology`, `internal/runtime`, `internal/kafka` wrapping franz-go), CI (lint + test + vet), `Makefile`.
+2. **P0 spike**: hidden franz-go group consumer + producer behind `Config`; minimal `KStream` source→filter→sink with ALO commit against a Testcontainers Kafka broker.
 3. **Topology test driver skeleton** (unblocks all later phases with broker-free testing).
 4. **Serde built-ins**: `JSONSerde[T]` and `ProtoSerde[T, PT]` with round-trip tests (design verified on Go 1.27).
 5. **Pebble KV wrapper** with a `KeyValueStore[K,V]` interface + serde plumbing (no TTL yet).

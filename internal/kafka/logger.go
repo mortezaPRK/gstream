@@ -1,9 +1,7 @@
 package kafka
 
 import (
-	"context"
-	"log/slog"
-
+	"github.com/mortezaPRK/gstream/logging"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
@@ -11,10 +9,10 @@ import (
 // emitted through the application's structured logger. This keeps franz-go
 // internal details hidden from the public API (§13).
 type kgoLogger struct {
-	l *slog.Logger
+	l logging.Logger
 }
 
-func newKgoLogger(l *slog.Logger) kgo.Logger {
+func newKgoLogger(l logging.Logger) kgo.Logger {
 	return &kgoLogger{l: l}
 }
 
@@ -27,17 +25,14 @@ func (k *kgoLogger) Level() kgo.LogLevel {
 
 // Log converts a kgo log entry into a structured slog message.
 func (k *kgoLogger) Log(level kgo.LogLevel, msg string, keyvals ...any) {
-	var sl slog.Level
 	switch level {
 	case kgo.LogLevelError:
-		sl = slog.LevelError
+		k.l.Error("[franz-go] "+msg, keyvals...)
 	case kgo.LogLevelWarn:
-		sl = slog.LevelWarn
+		k.l.Warn("[franz-go] "+msg, keyvals...)
 	case kgo.LogLevelDebug:
-		sl = slog.LevelDebug
+		k.l.Debug("[franz-go] "+msg, keyvals...)
 	default:
-		sl = slog.LevelInfo
+		k.l.Info("[franz-go] "+msg, keyvals...)
 	}
-	// keyvals from kgo are alternating key/value pairs; pass them directly to slog.
-	k.l.Log(context.Background(), sl, "[franz-go] "+msg, keyvals...) //nolint:sloglint // variadic keyvals from kgo
 }

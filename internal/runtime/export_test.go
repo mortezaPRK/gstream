@@ -2,8 +2,8 @@ package runtime
 
 import (
 	"github.com/cockroachdb/pebble"
-	"github.com/mortezaPRK/gstream/internal/state"
 	"github.com/mortezaPRK/gstream/internal/topology"
+	state "github.com/mortezaPRK/gstream/store/pebble"
 )
 
 // TaskManagerStoresForPartition returns the stores map for the given partition's

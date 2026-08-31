@@ -1,15 +1,15 @@
 // Package gstream_test provides broker-free tests for the stateful DSL
 // operators: GroupByKey, Count, and Aggregate. Tests live in package
 // gstream_test (external) rather than package gstream because
-// internal/state imports gstream (for Serde[T]), so a package-internal test
-// that imports internal/state would create a circular import.
+// store/memory imports gstream (for Serde[T]), so a package-internal test
+// that imports it would create a circular import.
 //
 // # Store type: []byte/[]byte (Option A)
 //
 // After the P2-S7fix type-erasure boundary fix, stateful operators assert against
 // a kvBytesStore (Get([]byte)([]byte,bool,error) / Put([]byte,[]byte)error). The
-// runtime supplies a *state.KeyValueStore[[]byte,[]byte] with identity (BytesSerde)
-// serdes. Tests must wire the store accordingly — using KeyValueStore[string,int64]
+// runtime supplies a compatible byte store with identity (BytesSerde) serdes.
+// Tests must wire the store accordingly — using KeyValueStore[string,int64]
 // would still satisfy the test assertion on the *store* variable but would fail
 // the runtime kvBytesStore assertion inside the StatefulProcessFunc.
 package gstream_test
@@ -19,8 +19,8 @@ import (
 	"testing"
 
 	"github.com/mortezaPRK/gstream"
-	"github.com/mortezaPRK/gstream/internal/state"
 	"github.com/mortezaPRK/gstream/internal/topology"
+	"github.com/mortezaPRK/gstream/store/memory"
 )
 
 // ---------------------------------------------------------------------------
@@ -28,15 +28,14 @@ import (
 // ---------------------------------------------------------------------------
 
 // TestGroupByKey_Count verifies that Count correctly accumulates per-key
-// record counts using a real *state.KeyValueStore[[]byte,[]byte] byte store
+// record counts using an in-memory []byte/[]byte store
 // wired into a topology.Executor, and asserts store contents by decoding with
 // JSONSerde[int64].
 //
 // Pipeline: source[string,string] → GroupByKey → Count("wc")
 //
-// This test exercises the REAL store.Get/Put path (not a fake), using the same
-// store type the runtime supplies: NewKeyValueStoreWithChangelog[[]byte,[]byte]
-// with identity BytesSerde. The Aggregate StatefulProcessFunc encodes keys and
+// This test exercises store.Get/Put through public memory store, using same
+// byte-store contract as runtime. Aggregate StatefulProcessFunc encodes keys and
 // values itself using the captured serdes.
 func TestGroupByKey_Count(t *testing.T) {
 	t.Parallel()
@@ -56,17 +55,17 @@ func TestGroupByKey_Count(t *testing.T) {
 		t.Errorf("StoreBinding.StoreName: got %q, want %q", bt.StoreBindings["wc"].StoreName, "wc")
 	}
 
-	// Open an in-memory Pebble DB and wire a []byte/[]byte byte store.
-	// This is the same type the runtime supplies via NewKeyValueStoreWithChangelog.
-	db, err := state.OpenMemDB()
+	// Open an in-memory DB and wire a []byte/[]byte byte store.
+	// Memory store satisfies same byte-store contract as durable runtime store.
+	db, err := memory.OpenMemDB()
 	if err != nil {
 		t.Fatalf("OpenMemDB: %v", err)
 	}
 	defer db.Close()
 
 	// BytesSerde is the identity serde used by the runtime for the bytes boundary.
-	byteStore := state.NewKeyValueStoreWithChangelog[[]byte, []byte](
-		"wc", db, gstream.BytesSerde{}, gstream.BytesSerde{}, nil,
+	byteStore := memory.NewKeyValueStore[[]byte, []byte](
+		"wc", db, gstream.BytesSerde{}, gstream.BytesSerde{},
 	)
 
 	stores := map[string]any{"wc": byteStore}
@@ -140,14 +139,14 @@ func TestCount_NoBufferLeak(t *testing.T) {
 		t.Errorf("expected bt.Sinks empty (To() not called), got %v", bt.Sinks)
 	}
 
-	db, err := state.OpenMemDB()
+	db, err := memory.OpenMemDB()
 	if err != nil {
 		t.Fatalf("OpenMemDB: %v", err)
 	}
 	defer db.Close()
 
-	byteStore := state.NewKeyValueStoreWithChangelog[[]byte, []byte](
-		"wc-leak", db, gstream.BytesSerde{}, gstream.BytesSerde{}, nil,
+	byteStore := memory.NewKeyValueStore[[]byte, []byte](
+		"wc-leak", db, gstream.BytesSerde{}, gstream.BytesSerde{},
 	)
 	exec := topology.NewExecutor(bt.Topology, map[string]any{"wc-leak": byteStore})
 
@@ -231,14 +230,14 @@ func TestGroupByKey_Aggregate(t *testing.T) {
 	}
 
 	// Open in-memory byte store.
-	db, err := state.OpenMemDB()
+	db, err := memory.OpenMemDB()
 	if err != nil {
 		t.Fatalf("OpenMemDB: %v", err)
 	}
 	defer db.Close()
 
-	byteStore := state.NewKeyValueStoreWithChangelog[[]byte, []byte](
-		"lensum", db, gstream.BytesSerde{}, gstream.BytesSerde{}, nil,
+	byteStore := memory.NewKeyValueStore[[]byte, []byte](
+		"lensum", db, gstream.BytesSerde{}, gstream.BytesSerde{},
 	)
 	exec := topology.NewExecutor(bt.Topology, map[string]any{"lensum": byteStore})
 
@@ -318,7 +317,7 @@ func TestKTable_StoreBinding_Fields(t *testing.T) {
 
 // TestAggregate_ByteStoreAssertionSucceeds is the regression test for the
 // P2-S7fix type-erasure boundary bug. It verifies that when the runtime supplies
-// a *state.KeyValueStore[[]byte,[]byte] (the correct byte-store type), the
+// a *memory.KeyValueStore[[]byte,[]byte] (the correct byte-store type), the
 // Aggregate StatefulProcessFunc does NOT return a "store type mismatch" error.
 //
 // The original bug: the processor asserted ctx.Store(name).(kvStoreI[K,A]) with
@@ -336,15 +335,15 @@ func TestAggregate_ByteStoreAssertionSucceeds(t *testing.T) {
 	_ = src.GroupByKey(gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{}).Count("tstore")
 	bt := b.Build()
 
-	db, err := state.OpenMemDB()
+	db, err := memory.OpenMemDB()
 	if err != nil {
 		t.Fatalf("OpenMemDB: %v", err)
 	}
 	defer db.Close()
 
 	// Supply the CORRECT byte store type.
-	byteStore := state.NewKeyValueStoreWithChangelog[[]byte, []byte](
-		"tstore", db, gstream.BytesSerde{}, gstream.BytesSerde{}, nil,
+	byteStore := memory.NewKeyValueStore[[]byte, []byte](
+		"tstore", db, gstream.BytesSerde{}, gstream.BytesSerde{},
 	)
 	exec := topology.NewExecutor(bt.Topology, map[string]any{"tstore": byteStore})
 
@@ -465,14 +464,14 @@ func TestKTable_To_RecordsReachSink(t *testing.T) {
 
 	bt := b.Build()
 
-	db, err := state.OpenMemDB()
+	db, err := memory.OpenMemDB()
 	if err != nil {
 		t.Fatalf("OpenMemDB: %v", err)
 	}
 	defer db.Close()
 
-	byteStore := state.NewKeyValueStoreWithChangelog[[]byte, []byte](
-		"reach-store", db, gstream.BytesSerde{}, gstream.BytesSerde{}, nil,
+	byteStore := memory.NewKeyValueStore[[]byte, []byte](
+		"reach-store", db, gstream.BytesSerde{}, gstream.BytesSerde{},
 	)
 	exec := topology.NewExecutor(bt.Topology, map[string]any{"reach-store": byteStore})
 

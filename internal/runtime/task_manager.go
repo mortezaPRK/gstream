@@ -11,8 +11,10 @@ import (
 	"github.com/cockroachdb/pebble"
 	gstream "github.com/mortezaPRK/gstream"
 	"github.com/mortezaPRK/gstream/internal/kafka"
-	"github.com/mortezaPRK/gstream/internal/state"
 	"github.com/mortezaPRK/gstream/internal/topology"
+	"github.com/mortezaPRK/gstream/logging"
+	gslog "github.com/mortezaPRK/gstream/logging/slog"
+	state "github.com/mortezaPRK/gstream/store/pebble"
 )
 
 // task holds the per-partition state for stateful stream processing.
@@ -61,7 +63,7 @@ type TaskManager struct {
 
 	bt     *gstream.BuiltTopology
 	cfg    gstream.Config
-	logger *slog.Logger
+	logger logging.Logger
 	appID  string
 }
 
@@ -70,9 +72,9 @@ type TaskManager struct {
 // It is only meaningful when bt.StoreBindings or bt.WindowStoreBindings is
 // non-empty (stateful topologies). The caller must wire its lifecycle methods
 // into the kafka.Client via WithLifecycle and WithPostBatch.
-func NewTaskManager(bt *gstream.BuiltTopology, cfg gstream.Config, logger *slog.Logger) *TaskManager {
+func NewTaskManager(bt *gstream.BuiltTopology, cfg gstream.Config, logger logging.Logger) *TaskManager {
 	if logger == nil {
-		logger = slog.Default()
+		logger = gslog.Default()
 	}
 	return &TaskManager{
 		tasks:        make(map[int32]*task),

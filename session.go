@@ -15,11 +15,11 @@ import (
 // runtime. The runtime supplies a *state.KeyValueStore[[]byte,[]byte] which
 // satisfies this interface via its RangeForKey / WindowPut / WindowDelete methods.
 //
-// Using a narrow interface avoids importing internal/state directly (which would
-// create an import cycle: internal/state → gstream via Serde[T]).
+// Using a narrow interface avoids importing store/pebble directly (which would
+// create an import cycle: store/pebble → gstream via Serde[T]).
 //
 // RangeForKey is a T1-amendment method that decodes composite keys store-side and
-// hands sessionStart directly to the DSL, keeping key-format knowledge in internal/state.
+// hands sessionStart directly to the DSL, keeping key-format knowledge in store/pebble.
 type sessionStore interface {
 	// RangeForKey iterates all entries stored under kBytes, calling fn with each
 	// entry's sessionStart (int64) and raw value bytes (safe to retain).
@@ -272,7 +272,7 @@ func (s SessionWindowedStream[K, V]) Aggregate[A any](
 
 	// Register SessionStoreBinding so the runtime can open the store and configure
 	// the session sweeper. EncodeKey/DecodeKey are stubs: the active processing path
-	// uses the sessionStore interface. gstream cannot import internal/state (cycle).
+	// uses the sessionStore interface. gstream cannot import store/pebble (cycle).
 	s.builder.sessionStores[storeName] = SessionStoreBinding{
 		StoreBinding: StoreBinding{
 			StoreName:      storeName,
@@ -311,8 +311,8 @@ func (s SessionWindowedStream[K, V]) Aggregate[A any](
 //
 //	int64(sessionEnd) big-endian (8 bytes) ‖ accBytes
 //
-// This format is owned by the gstream package (not internal/state), so the DSL
-// can decode it without importing internal/state.
+// This format is owned by the gstream package (not store/pebble), so the DSL
+// can decode it without importing store/pebble.
 // Exported so T4 runtime sweep can reuse it.
 func EncodeSessionValue(sessionEnd int64, accBytes []byte) []byte {
 	out := make([]byte, 8+len(accBytes))

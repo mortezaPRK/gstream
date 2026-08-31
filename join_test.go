@@ -1,11 +1,11 @@
 // Package gstream_test provides broker-free tests for the stream-table inner join
 // (JoinTable). Tests live in package gstream_test (external) rather than package
-// gstream because internal/state imports gstream (for Serde[T]), so a
-// package-internal test that imports internal/state would create a circular import.
+// gstream because store/memory imports gstream (for Serde[T]), so a
+// package-internal test that imports it would create a circular import.
 //
 // Store type: []byte/[]byte (same as grouped_test — Option A type-erasure pattern).
 // The table sub-graph writes counts via accSerde (JSONSerde[int64]) into a
-// *state.KeyValueStore[[]byte,[]byte]. JoinTable reads the same store, decodes via
+// compatible []byte/[]byte store. JoinTable reads same store, decodes via
 // table.valSerde (captured accSerde), and forwards the joined record.
 package gstream_test
 
@@ -14,8 +14,8 @@ import (
 	"testing"
 
 	"github.com/mortezaPRK/gstream"
-	"github.com/mortezaPRK/gstream/internal/state"
 	"github.com/mortezaPRK/gstream/internal/topology"
+	"github.com/mortezaPRK/gstream/store/memory"
 )
 
 // buildJoinTopology constructs the test topology:
@@ -94,14 +94,14 @@ func TestJoinTable_Miss(t *testing.T) {
 
 	bt, storeName := buildJoinTopology(t)
 
-	db, err := state.OpenMemDB()
+	db, err := memory.OpenMemDB()
 	if err != nil {
 		t.Fatalf("OpenMemDB: %v", err)
 	}
 	defer db.Close()
 
-	byteStore := state.NewKeyValueStoreWithChangelog[[]byte, []byte](
-		storeName, db, gstream.BytesSerde{}, gstream.BytesSerde{}, nil,
+	byteStore := memory.NewKeyValueStore[[]byte, []byte](
+		storeName, db, gstream.BytesSerde{}, gstream.BytesSerde{},
 	)
 	exec := topology.NewExecutor(bt.Topology, map[string]any{storeName: byteStore})
 
@@ -128,14 +128,14 @@ func TestJoinTable_Hit(t *testing.T) {
 
 	bt, storeName := buildJoinTopology(t)
 
-	db, err := state.OpenMemDB()
+	db, err := memory.OpenMemDB()
 	if err != nil {
 		t.Fatalf("OpenMemDB: %v", err)
 	}
 	defer db.Close()
 
-	byteStore := state.NewKeyValueStoreWithChangelog[[]byte, []byte](
-		storeName, db, gstream.BytesSerde{}, gstream.BytesSerde{}, nil,
+	byteStore := memory.NewKeyValueStore[[]byte, []byte](
+		storeName, db, gstream.BytesSerde{}, gstream.BytesSerde{},
 	)
 	exec := topology.NewExecutor(bt.Topology, map[string]any{storeName: byteStore})
 	ctx := context.Background()
@@ -179,14 +179,14 @@ func TestJoinTable_StreamBeforeTable(t *testing.T) {
 
 	bt, storeName := buildJoinTopology(t)
 
-	db, err := state.OpenMemDB()
+	db, err := memory.OpenMemDB()
 	if err != nil {
 		t.Fatalf("OpenMemDB: %v", err)
 	}
 	defer db.Close()
 
-	byteStore := state.NewKeyValueStoreWithChangelog[[]byte, []byte](
-		storeName, db, gstream.BytesSerde{}, gstream.BytesSerde{}, nil,
+	byteStore := memory.NewKeyValueStore[[]byte, []byte](
+		storeName, db, gstream.BytesSerde{}, gstream.BytesSerde{},
 	)
 	exec := topology.NewExecutor(bt.Topology, map[string]any{storeName: byteStore})
 	ctx := context.Background()
@@ -225,14 +225,14 @@ func TestJoinTable_TwoKeys(t *testing.T) {
 
 	bt, storeName := buildJoinTopology(t)
 
-	db, err := state.OpenMemDB()
+	db, err := memory.OpenMemDB()
 	if err != nil {
 		t.Fatalf("OpenMemDB: %v", err)
 	}
 	defer db.Close()
 
-	byteStore := state.NewKeyValueStoreWithChangelog[[]byte, []byte](
-		storeName, db, gstream.BytesSerde{}, gstream.BytesSerde{}, nil,
+	byteStore := memory.NewKeyValueStore[[]byte, []byte](
+		storeName, db, gstream.BytesSerde{}, gstream.BytesSerde{},
 	)
 	exec := topology.NewExecutor(bt.Topology, map[string]any{storeName: byteStore})
 	ctx := context.Background()
@@ -360,13 +360,13 @@ func buildJoinGlobalTopology(t *testing.T) (*gstream.BuiltTopology, string) {
 func openGlobalStore(t *testing.T, storeName string, pairs map[string]string) (any, func()) {
 	t.Helper()
 
-	db, err := state.OpenMemDB()
+	db, err := memory.OpenMemDB()
 	if err != nil {
 		t.Fatalf("OpenMemDB: %v", err)
 	}
 
-	byteStore := state.NewKeyValueStoreWithChangelog[[]byte, []byte](
-		storeName, db, gstream.BytesSerde{}, gstream.BytesSerde{}, nil,
+	byteStore := memory.NewKeyValueStore[[]byte, []byte](
+		storeName, db, gstream.BytesSerde{}, gstream.BytesSerde{},
 	)
 
 	keySerde := gstream.JSONSerde[string]{}
@@ -574,14 +574,14 @@ func TestJoinTable_UpdatedTableValue(t *testing.T) {
 
 	bt, storeName := buildJoinTopology(t)
 
-	db, err := state.OpenMemDB()
+	db, err := memory.OpenMemDB()
 	if err != nil {
 		t.Fatalf("OpenMemDB: %v", err)
 	}
 	defer db.Close()
 
-	byteStore := state.NewKeyValueStoreWithChangelog[[]byte, []byte](
-		storeName, db, gstream.BytesSerde{}, gstream.BytesSerde{}, nil,
+	byteStore := memory.NewKeyValueStore[[]byte, []byte](
+		storeName, db, gstream.BytesSerde{}, gstream.BytesSerde{},
 	)
 	exec := topology.NewExecutor(bt.Topology, map[string]any{storeName: byteStore})
 	ctx := context.Background()

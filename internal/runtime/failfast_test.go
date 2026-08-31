@@ -18,7 +18,7 @@ import (
 	"github.com/cockroachdb/pebble/vfs"
 	gstream "github.com/mortezaPRK/gstream"
 	"github.com/mortezaPRK/gstream/internal/kafka"
-	"github.com/mortezaPRK/gstream/internal/state"
+	state "github.com/mortezaPRK/gstream/store/pebble"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────

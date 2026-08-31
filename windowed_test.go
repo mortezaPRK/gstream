@@ -1,7 +1,7 @@
 // Package gstream_test provides broker-free exit-criterion tests for
 // windowed aggregation. Tests use package gstream_test (external) because
-// internal/state imports gstream, so an internal test that imports
-// internal/state would cause a circular import.
+// store/memory imports gstream, so an internal test importing it would cause a
+// circular import.
 package gstream_test
 
 import (
@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"github.com/mortezaPRK/gstream"
-	"github.com/mortezaPRK/gstream/internal/state"
 	"github.com/mortezaPRK/gstream/internal/topology"
+	"github.com/mortezaPRK/gstream/store/memory"
 )
 
 // TestWindowedCount_OutOfOrderAndGrace is the P3 exit-criterion test.
@@ -52,17 +52,17 @@ func TestWindowedCount_OutOfOrderAndGrace(t *testing.T) {
 		t.Fatal("expected WindowStoreBindings[\"wc\"] to be registered")
 	}
 
-	// Open an in-memory byte store. Supply *state.KeyValueStore[[]byte,[]byte]
+	// Open an in-memory byte store. Supply *memory.KeyValueStore[[]byte,[]byte]
 	// which satisfies both the DSL's windowStore interface (WindowGet/WindowPut)
 	// and the test's direct WindowGet call below.
-	db, err := state.OpenMemDB()
+	db, err := memory.OpenMemDB()
 	if err != nil {
 		t.Fatalf("OpenMemDB: %v", err)
 	}
 	defer db.Close()
 
-	byteStore := state.NewKeyValueStoreWithChangelog[[]byte, []byte](
-		"wc", db, gstream.BytesSerde{}, gstream.BytesSerde{}, nil,
+	byteStore := memory.NewKeyValueStore[[]byte, []byte](
+		"wc", db, gstream.BytesSerde{}, gstream.BytesSerde{},
 	)
 
 	var streamTime int64
@@ -84,7 +84,7 @@ func TestWindowedCount_OutOfOrderAndGrace(t *testing.T) {
 	}
 
 	// Assert window counts via byteStore.WindowGet — no hand-rolled composite key.
-	// The format lives once in state.WindowCompositeKey (called internally by WindowGet).
+	// The format lives once in memory.WindowCompositeKey (called internally by WindowGet).
 	keySerde := gstream.JSONSerde[string]{}
 	intSerde := gstream.JSONSerde[int64]{}
 
@@ -132,14 +132,14 @@ func TestWindowedCount_AllLate(t *testing.T) {
 
 	bt := b.Build()
 
-	db, err := state.OpenMemDB()
+	db, err := memory.OpenMemDB()
 	if err != nil {
 		t.Fatalf("OpenMemDB: %v", err)
 	}
 	defer db.Close()
 
-	byteStore := state.NewKeyValueStoreWithChangelog[[]byte, []byte](
-		"wc2", db, gstream.BytesSerde{}, gstream.BytesSerde{}, nil,
+	byteStore := memory.NewKeyValueStore[[]byte, []byte](
+		"wc2", db, gstream.BytesSerde{}, gstream.BytesSerde{},
 	)
 
 	var streamTime int64

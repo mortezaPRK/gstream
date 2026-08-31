@@ -18,10 +18,13 @@ vet:
 ## test: Run all tests (go test ./...).
 test:
 	go test ./...
+	cd serde/proto && GOWORK=off go test ./...
 
 ## tidy: Tidy and verify the module graph (go mod tidy).
 tidy:
 	go mod tidy
+	cd serde/proto && GOWORK=off go mod tidy
+	cd integration/kafka && GOWORK=off go mod tidy
 
 ## fmt: Format all Go source files (gofmt -l -w .).
 fmt:
@@ -31,14 +34,15 @@ fmt:
 lint:
 	golangci-lint run
 
-## integration-test: Run integration tests (requires Docker/Podman).
+## integration-test: Run Testcontainers integration tests (requires Docker/Podman).
 integration-test:
-	TESTCONTAINERS_RYUK_DISABLED=true go test -p 1 -tags integration ./...
+	cd integration/kafka && GOWORK=off go test -p 1 -tags integration ./...
 
 ## verify-modules: Build each module standalone (GOWORK=off) to catch per-module go.sum gaps.
 verify-modules:
 	GOWORK=off go build ./...
 	cd serde/proto && GOWORK=off go build ./...
+	cd integration/kafka && GOWORK=off go build -tags integration ./...
 
 ## ci: Run vet, test, build, and verify-modules (full CI gate).
 ci: vet test build verify-modules

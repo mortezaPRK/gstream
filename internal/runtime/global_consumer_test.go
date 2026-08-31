@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	gstream "github.com/mortezaPRK/gstream"
-	"github.com/mortezaPRK/gstream/internal/state"
+	state "github.com/mortezaPRK/gstream/store/pebble"
 )
 
 // dummyBinding returns a minimal GlobalTableBinding for tests that do not

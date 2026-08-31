@@ -13,7 +13,7 @@ import (
 // windowStore is the interface the windowed processor asserts against at runtime.
 // The runtime supplies a *state.KeyValueStore[[]byte,[]byte] which satisfies this
 // interface via its WindowGet/WindowPut methods. Using a narrow interface avoids
-// importing internal/state directly (which would create an import cycle via Serde[T]).
+// importing store/pebble directly (which would create an import cycle via Serde[T]).
 type windowStore interface {
 	WindowGet(kBytes []byte, windowStart int64) ([]byte, bool, error)
 	WindowPut(kBytes []byte, windowStart int64, val []byte) error
@@ -191,7 +191,7 @@ func (s TimeWindowedStream[K, V]) Aggregate[A any](
 	// Register a WindowStoreBinding so the runtime can open the store and configure
 	// the window sweeper. EncodeKey/DecodeKey are stubs: the active processing path
 	// uses the windowStore interface (WindowGet/WindowPut). gstream cannot import
-	// internal/state (cycle: internal/state → gstream via Serde[T]).
+	// store/pebble (cycle: store/pebble → gstream via Serde[T]).
 	s.builder.windowStores[storeName] = WindowStoreBinding{
 		StoreBinding: StoreBinding{
 			StoreName:      storeName,
