@@ -8,7 +8,6 @@ import (
 
 	gstream "github.com/mortezaPRK/gstream"
 	"github.com/mortezaPRK/gstream/internal/kafka"
-	"github.com/mortezaPRK/gstream/internal/state"
 	"github.com/mortezaPRK/gstream/internal/topology"
 )
 
@@ -52,7 +51,7 @@ type Adapter struct {
 	taskManager     *TaskManager
 	bt              *gstream.BuiltTopology
 	cfg             gstream.Config
-	logger          *slog.Logger
+	logger          gstream.Logger
 	topicToSource   map[string]string                // Kafka topic → topology source-node name
 	resolvedSources map[string]gstream.SourceBinding // source-node name → SourceBinding (includes repartition)
 	resolvedSinks   map[string]gstream.SinkBinding   // sink-node name → SinkBinding (includes repartition)
@@ -105,7 +104,7 @@ type Adapter struct {
 // kafka.ErrFatalPipeline, so store-write failures ALWAYS halt the loop even
 // without WithHealthGate — but WithHealthGate catches failures faster during
 // idle (no records) periods.
-func NewAdapter(bt *gstream.BuiltTopology, cfg gstream.Config, logger *slog.Logger) (*Adapter, error) {
+func NewAdapter(bt *gstream.BuiltTopology, cfg gstream.Config, logger gstream.Logger) (*Adapter, error) {
 	if bt == nil {
 		return nil, fmt.Errorf("runtime.NewAdapter: bt must not be nil")
 	}
@@ -438,7 +437,7 @@ func (a *Adapter) process(ctx context.Context, in kafka.InRecord) ([]kafka.OutRe
 		// livelock forever on the same disk error.  Trip health so the run loop
 		// halts after this batch and the process can restart (changelog restore).
 		// Non-store errors (serde / user-logic) use the existing abort path.
-		if errors.Is(err, state.ErrStoreWriteSentinel) {
+		if errors.Is(err, gstream.ErrStoreWriteSentinel) {
 			a.health.Fail(err)
 		}
 		return nil, fmt.Errorf("runtime: topology: %w", err)

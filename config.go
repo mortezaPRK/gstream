@@ -39,8 +39,8 @@ func (g Guarantee) String() string {
 
 // Config is the public configuration surface for gstream.
 //
-// franz-go and Pebble are intentionally hidden: callers never import or reference
-// kgo.* or pebble.* types. gstream picks sane defaults for both libraries.
+// franz-go is intentionally hidden: callers never import or reference kgo types.
+// Stateful applications supply a StoreProvider implementation.
 //
 // Use ApplyDefaults to fill in zero values, then Validate to confirm the result
 // is sound before passing Config to a topology builder or runtime.
@@ -58,7 +58,7 @@ type Config struct {
 	// AtLeastOnce if zero.
 	Guarantee Guarantee
 
-	// StateDir is the root directory under which Pebble stores local state.
+	// StateDir is the root directory passed to StoreProvider for local state.
 	// Defaults to os.TempDir()/gstream-<ApplicationID>.
 	StateDir string
 
@@ -75,7 +75,7 @@ type Config struct {
 	// pending transaction.
 	//
 	// Note: if StateDir is ephemeral (wiped on restart) the persisted ID is also
-	// lost, so a new UUID is generated. This is acceptable because local Pebble
+	// lost, so a new UUID is generated. This is acceptable because local
 	// state is likewise lost; the instance restores from changelog on startup,
 	// and the old zombie transactional producer times out via TransactionTimeout.
 	// Operators running on ephemeral storage who want a stable ID should set
@@ -100,6 +100,11 @@ type Config struct {
 	// this bounded poll. Defaults to 2s. Lower only for low-latency brokers — too
 	// low risks incomplete restore on large multi-response changelogs under load.
 	RestoreCatchUpTimeout time.Duration
+
+	// StoreProvider opens local state backends for stateful topologies. It may be
+	// nil for stateless topologies. Implementations live under
+	// github.com/mortezaPRK/gstream/stores.
+	StoreProvider StoreProvider
 }
 
 // Option is a functional option for Configure.
@@ -153,6 +158,11 @@ func WithRestoreCatchUpTimeout(d time.Duration) Option {
 // WithNumTaskThreads sets NumTaskThreads.
 func WithNumTaskThreads(n int) Option {
 	return func(c *Config) { c.NumTaskThreads = n }
+}
+
+// WithStoreProvider sets local state backend implementation.
+func WithStoreProvider(provider StoreProvider) Option {
+	return func(c *Config) { c.StoreProvider = provider }
 }
 
 // WithDefaults is an explicit-intent marker accepted by Configure.

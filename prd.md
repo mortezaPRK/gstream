@@ -55,7 +55,7 @@ Streams (Java) but idiomatic Go generics and no JVM.
 | Component | Library / Tech | Responsibility |
 |-----------|----------------|----------------|
 | **Kafka client** | franz-go (`github.com/twmb/franz-go`) | Group membership, fetch/produce, offset commits, transactions (EOS). |
-| **State store** | Pebble (`github.com/cockroachdb/pebble`) | Local KV / Window / Session stores; LSM persistence + block cache. |
+| **State store** | Root `StoreProvider` contract; Pebble and memory modules | Local KV / Window / Session stores without forcing implementation dependencies into root. |
 | **Changelog** | Kafka compacted topics | Durable, replicated backing log for every state store; source of truth for recovery. |
 | **DSL core** | Go 1.27 generics | `KStream`, `KTable`, `GlobalKTable`; compiled to a processor topology (DAG). |
 | **Runtime** | Task scheduler (1 task ⇒ 1 partition of the source) | Owns processing threads, commit cadence, restore, rebalance callbacks. |
@@ -170,7 +170,7 @@ KStream[K, V].GroupByKey()                                      -> KGroupedStrea
 
 // Windowing + aggregation:
 grouped.WindowedBy(gstream.Tumbling(5 * time.Minute))           -> TimeWindowedStream[K, V]
-windowed.Count()                                                -> KTable[gstream.Windowed[K], int64]
+windowed.Count("counts", jsonserde.Serde[int64]{})             -> KTable[gstream.Windowed[K], int64]
 grouped.Aggregate[A any](initFn, aggFn)                         -> KTable[K, A]
 
 // Joins (co-partitioning enforced/inserted — see §8):
@@ -253,16 +253,14 @@ type JSONSerde[T any] struct{}
 func (JSONSerde[T]) Serialize(v T) ([]byte, error)   { return json.Marshal(v) }
 func (JSONSerde[T]) Deserialize(b []byte) (T, error) { var v T; err := json.Unmarshal(b, &v); return v, err }
 
-// usage: gstream.JSONSerde[Order]{}  ->  Serde[Order]
+// usage: jsonserde.Serde[Order]{}  ->  gstream.Serde[Order]
 ```
 
-### 10.2 Protobuf serde — value type + its pointer constraint
-Protobuf needs to allocate and mutate a message, so the value type `T` must be paired with a
-pointer type `PT` that satisfies `proto.Message`. **This two-parameter form is required** —
-verified by compiling & round-tripping against `google.golang.org/protobuf` on the local
-Go 1.27 toolchain:
+### 10.2 Protobuf serde — generated message pointer
+Protobuf needs to allocate and mutate a message, so `T` is a generated message pointer that
+satisfies `proto.Message`:
 ```go
-type ProtoMessage[T any] interface { *T; proto.Message }   // pointer-to-T is a proto.Message
+protoserde.Serde[*pb.Order]{}  // implements gstream.Serde[*pb.Order]
 
 type ProtoSerde[T any, PT ProtoMessage[T]] struct{}
 func (ProtoSerde[T, PT]) Serialize(v T) ([]byte, error)   { return proto.Marshal(PT(&v)) }
@@ -305,10 +303,9 @@ state is observed via metrics and the changelog, not a query API.*
 
 ## 13. Configuration
 
-**Decision: a curated `Config` is the only public surface. franz-go and Pebble are hidden.**
-Users never import or see `kgo.*` / `pebble.*` types in v1; gstream owns those dependencies and
-picks sane defaults. This keeps the API stable if we swap or upgrade either library, and it lets
-us enforce invariants (e.g. `ReadCommitted` under EOS) rather than trusting caller config.
+**Decision: franz-go stays hidden; state storage uses root contracts.**
+Users never see `kgo.*` types. Stateful applications select a separate store module through
+`StoreProvider`, keeping Pebble and other implementation dependencies out of root.
 
 ```go
 type Guarantee int
@@ -318,10 +315,11 @@ type Config struct {
     ApplicationID string          // → consumer group id + TransactionalID prefix (required)
     Brokers       []string        // required
     Guarantee     Guarantee       // default AtLeastOnce
-    StateDir      string          // Pebble root; default OS temp-derived path
+    StateDir      string          // local-state root; default OS temp-derived path
+    StoreProvider StoreProvider   // required for stateful topologies
     NumTaskThreads int            // default = GOMAXPROCS; capped at assigned partitions (§7)
     CommitInterval time.Duration  // default 100ms (also EOS txn boundary)
-    // ... curated, documented knobs only — no raw kgo.Opt / pebble.Options exposed.
+    // ... curated, documented knobs only — no raw kgo.Opt exposed.
 }
 ```
 
@@ -377,7 +375,7 @@ type Config struct {
   store contents **without a broker** (the single most important test tool; mirrors Kafka
   Streams' `TopologyTestDriver`).
 - **State store unit tests**: KV/window/session semantics, TTL sweep, range correctness.
-- **Integration tests**: real Kafka + Pebble via `testcontainers-go`; group membership, restore,
+- **Integration tests**: real Kafka + Pebble via the isolated `integration/kafka` Testcontainers module; group membership, restore,
   and **internal-topic auto-creation** (§14).
 - **EOS correctness**: fault-injection (kill mid-transaction) → assert no duplicate/lost output
   on the read-committed side.
@@ -439,10 +437,10 @@ type Config struct {
 
 ## 20. Immediate Next Steps
 
-1. **Repo scaffolding**: `go.mod` (Go 1.27), package layout (`gstream/` public API incl. `Config` + `Serde[T]`; `internal/state`, `internal/topology`, `internal/runtime`, `internal/kafka` wrapping franz-go), CI (lint + test + vet), `Makefile`.
-2. **P0 spike**: hidden franz-go group consumer + producer behind `Config`; minimal `KStream` source→filter→sink with ALO commit against a `testcontainers` broker.
+1. **Repo scaffolding**: root contracts plus separate `serdes/*`, `stores/*`, `loggers/*`, and `integration/kafka` modules; `internal/runtime` and `internal/kafka` keep franz-go runtime behavior; CI verifies every module independently.
+2. **P0 spike**: hidden franz-go group consumer + producer behind `Config`; minimal `KStream` source→filter→sink with ALO commit against a Testcontainers Kafka broker.
 3. **Topology test driver skeleton** (unblocks all later phases with broker-free testing).
-4. **Serde built-ins**: `JSONSerde[T]` and `ProtoSerde[T, PT]` with round-trip tests (design verified on Go 1.27).
+4. **Serde implementations**: `serdes/json`, `serdes/bytes`, and `serdes/proto` modules with round-trip tests.
 5. **Pebble KV wrapper** with a `KeyValueStore[K,V]` interface + serde plumbing (no TTL yet).
 
 ---

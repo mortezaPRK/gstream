@@ -7,8 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/testcontainers/testcontainers-go"
-	kafkamodule "github.com/testcontainers/testcontainers-go/modules/kafka"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
@@ -35,31 +33,11 @@ import (
 //     bumped the epoch and the broker aborted A's pending txn (confirmed by 2+3).
 //     Direct PRODUCER_FENCED on A is not tested — A is already closed.
 func TestEOSFence_SingleInstanceRestart(t *testing.T) {
-	if !dockerAvailable() {
-		t.Skip("Docker not available; skipping EOS fence integration test")
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
 
 	// Transaction-state topic requires min.isr=1 and rf=1 on a single-broker cluster.
-	kc, err := kafkamodule.Run(ctx, "confluentinc/cp-kafka:7.4.0",
-		kafkamodule.WithClusterID("test-cluster"),
-		testcontainers.WithEnv(map[string]string{
-			"KAFKA_AUTO_CREATE_TOPICS_ENABLE":                "true",
-			"KAFKA_TRANSACTION_STATE_LOG_MIN_ISR":            "1",
-			"KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR": "1",
-		}),
-	)
-	if err != nil {
-		t.Skipf("failed to start Kafka container: %v", err)
-	}
-	t.Cleanup(func() { _ = kc.Terminate(context.Background()) })
-
-	brokers, err := kc.Brokers(ctx)
-	if err != nil {
-		t.Fatalf("get brokers: %v", err)
-	}
+	brokers := integrationBrokers(t)
 	t.Logf("brokers: %v", brokers)
 
 	const (

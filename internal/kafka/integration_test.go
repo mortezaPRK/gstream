@@ -6,54 +6,37 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"os/exec"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
 	gstream "github.com/mortezaPRK/gstream"
-	"github.com/testcontainers/testcontainers-go"
-	kafkamodule "github.com/testcontainers/testcontainers-go/modules/kafka"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
-// dockerAvailable probes for a running Docker daemon without importing the
-// Docker SDK, so this helper stays lightweight.
-func dockerAvailable() bool {
-	cmd := exec.Command("docker", "info")
-	return cmd.Run() == nil
+func integrationBrokers(t *testing.T) []string {
+	t.Helper()
+	raw := os.Getenv("GSTREAM_TEST_KAFKA_BROKERS")
+	if raw == "" {
+		t.Skip("Kafka fixture unavailable; run make integration-test")
+	}
+	return strings.Split(raw, ",")
 }
 
 // TestRoundTrip_ALO is a full produce→consume→process→commit integration test.
 // It is gated by the "integration" build tag AND skipped at runtime when Docker
 // is unavailable, so default `go test ./internal/kafka/` never requires Docker.
 func TestRoundTrip_ALO(t *testing.T) {
-	if !dockerAvailable() {
-		t.Skip("Docker not available; skipping integration test")
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
-	// Spin up a Kafka broker via testcontainers (kafka module — NOT redpanda).
+	// Spin up a Kafka broker via integration/kafka (NOT redpanda).
 	// WithClusterID is required for cp-kafka:7.4.0: that image's startup script
 	// calls `dub ensure CLUSTER_ID` and exits 1 if the env var is absent.
 	// KAFKA_AUTO_CREATE_TOPICS_ENABLE=true so that produce-before-consume works
 	// without an explicit admin CreateTopics call.
-	kc, err := kafkamodule.Run(ctx, "confluentinc/cp-kafka:7.4.0",
-		kafkamodule.WithClusterID("test-cluster"),
-		testcontainers.WithEnv(map[string]string{
-			"KAFKA_AUTO_CREATE_TOPICS_ENABLE": "true",
-		}),
-	)
-	if err != nil {
-		t.Skipf("failed to start Kafka container (Docker may be unavailable or slow): %v", err)
-	}
-	t.Cleanup(func() { _ = kc.Terminate(ctx) })
-
-	brokers, err := kc.Brokers(ctx)
-	if err != nil {
-		t.Fatalf("failed to get broker addresses: %v", err)
-	}
+	brokers := integrationBrokers(t)
 
 	const (
 		srcTopic  = "integration-src"

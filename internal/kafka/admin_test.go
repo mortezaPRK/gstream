@@ -9,8 +9,7 @@ import (
 	"time"
 
 	gstream "github.com/mortezaPRK/gstream"
-	testcontainers "github.com/testcontainers/testcontainers-go"
-	kafkamodule "github.com/testcontainers/testcontainers-go/modules/kafka"
+	state "github.com/mortezaPRK/gstream/internal/testutil"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
@@ -31,28 +30,10 @@ func TestValidateCoPartitioned_LessThanTwo(t *testing.T) {
 //  3. Is idempotent: a second call with the same spec returns no error.
 //  4. Returns an error if the existing topic has a different partition count.
 func TestEnsureTopics(t *testing.T) {
-	if !dockerAvailable() {
-		t.Skip("Docker not available; skipping integration test")
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
-	kc, err := kafkamodule.Run(ctx, "confluentinc/cp-kafka:7.4.0",
-		kafkamodule.WithClusterID("test-admin-cluster"),
-		testcontainers.WithEnv(map[string]string{
-			"KAFKA_AUTO_CREATE_TOPICS_ENABLE": "false",
-		}),
-	)
-	if err != nil {
-		t.Skipf("failed to start Kafka container (Docker may be unavailable or slow): %v", err)
-	}
-	t.Cleanup(func() { _ = kc.Terminate(ctx) })
-
-	brokers, err := kc.Brokers(ctx)
-	if err != nil {
-		t.Fatalf("failed to get broker addresses: %v", err)
-	}
+	brokers := integrationBrokers(t)
 
 	const topicName = "changelog-test-compact"
 	spec := TopicSpec{
@@ -96,28 +77,10 @@ func TestEnsureTopics(t *testing.T) {
 // TestValidateCoPartitioned_MissingTopic verifies GATE-1: a nonexistent topic causes
 // ValidateCoPartitioned to return a non-nil error that names the missing topic.
 func TestValidateCoPartitioned_MissingTopic(t *testing.T) {
-	if !dockerAvailable() {
-		t.Skip("Docker not available; skipping integration test")
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
-	kc, err := kafkamodule.Run(ctx, "confluentinc/cp-kafka:7.4.0",
-		kafkamodule.WithClusterID("test-missingtopic-cluster"),
-		testcontainers.WithEnv(map[string]string{
-			"KAFKA_AUTO_CREATE_TOPICS_ENABLE": "false",
-		}),
-	)
-	if err != nil {
-		t.Skipf("failed to start Kafka container: %v", err)
-	}
-	t.Cleanup(func() { _ = kc.Terminate(ctx) })
-
-	brokers, err := kc.Brokers(ctx)
-	if err != nil {
-		t.Fatalf("get brokers: %v", err)
-	}
+	brokers := integrationBrokers(t)
 
 	// Create exactly one topic.
 	if err := EnsureTopics(ctx, brokers, []TopicSpec{
@@ -127,7 +90,7 @@ func TestValidateCoPartitioned_MissingTopic(t *testing.T) {
 	}
 
 	const ghost = "definitely-does-not-exist-abc123"
-	err = ValidateCoPartitioned(ctx, brokers, []string{"exists-topic", ghost})
+	err := ValidateCoPartitioned(ctx, brokers, []string{"exists-topic", ghost})
 	if err == nil {
 		t.Fatal("want non-nil error for missing topic, got nil")
 	}
@@ -139,28 +102,10 @@ func TestValidateCoPartitioned_MissingTopic(t *testing.T) {
 
 // TestValidateCoPartitioned tests the co-partition validator against a live broker.
 func TestValidateCoPartitioned(t *testing.T) {
-	if !dockerAvailable() {
-		t.Skip("Docker not available; skipping integration test")
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
-	kc, err := kafkamodule.Run(ctx, "confluentinc/cp-kafka:7.4.0",
-		kafkamodule.WithClusterID("test-copartition-cluster"),
-		testcontainers.WithEnv(map[string]string{
-			"KAFKA_AUTO_CREATE_TOPICS_ENABLE": "false",
-		}),
-	)
-	if err != nil {
-		t.Skipf("failed to start Kafka container (Docker may be unavailable or slow): %v", err)
-	}
-	t.Cleanup(func() { _ = kc.Terminate(ctx) })
-
-	brokers, err := kc.Brokers(ctx)
-	if err != nil {
-		t.Fatalf("failed to get broker addresses: %v", err)
-	}
+	brokers := integrationBrokers(t)
 
 	// Create two topics with the SAME partition count.
 	if err := EnsureTopics(ctx, brokers, []TopicSpec{
@@ -216,28 +161,10 @@ func TestEnsureGlobalTopics_EmptyBindings(t *testing.T) {
 //  1. A topic created with 3 partitions returns 3.
 //  2. A non-existent topic returns a non-nil error.
 func TestFetchPartitionCount(t *testing.T) {
-	if !dockerAvailable() {
-		t.Skip("Docker not available; skipping integration test")
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
-	kc, err := kafkamodule.Run(ctx, "confluentinc/cp-kafka:7.4.0",
-		kafkamodule.WithClusterID("test-fetchpartition-cluster"),
-		testcontainers.WithEnv(map[string]string{
-			"KAFKA_AUTO_CREATE_TOPICS_ENABLE": "false",
-		}),
-	)
-	if err != nil {
-		t.Skipf("failed to start Kafka container: %v", err)
-	}
-	t.Cleanup(func() { _ = kc.Terminate(ctx) })
-
-	brokers, err := kc.Brokers(ctx)
-	if err != nil {
-		t.Fatalf("get brokers: %v", err)
-	}
+	brokers := integrationBrokers(t)
 
 	const topicName = "fetch-count-test"
 	if err := EnsureTopics(ctx, brokers, []TopicSpec{
@@ -270,28 +197,10 @@ func TestFetchPartitionCount(t *testing.T) {
 //  2. Is idempotent: a second call returns no error.
 //  3. Does not error if the topic pre-exists with different config.
 func TestEnsureGlobalTopics(t *testing.T) {
-	if !dockerAvailable() {
-		t.Skip("Docker not available; skipping integration test")
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
-	kc, err := kafkamodule.Run(ctx, "confluentinc/cp-kafka:7.4.0",
-		kafkamodule.WithClusterID("test-globaltopics-cluster"),
-		testcontainers.WithEnv(map[string]string{
-			"KAFKA_AUTO_CREATE_TOPICS_ENABLE": "false",
-		}),
-	)
-	if err != nil {
-		t.Skipf("failed to start Kafka container: %v", err)
-	}
-	t.Cleanup(func() { _ = kc.Terminate(ctx) })
-
-	brokers, err := kc.Brokers(ctx)
-	if err != nil {
-		t.Fatalf("get brokers: %v", err)
-	}
+	brokers := integrationBrokers(t)
 
 	cfg := gstream.Config{
 		ApplicationID: "test-app",
@@ -362,28 +271,10 @@ func TestEnsureRepartitionTopics_EmptyBindings(t *testing.T) {
 //  2. Sets cleanup.policy=delete (NOT compact).
 //  3. Is idempotent: a second call returns no error.
 func TestEnsureRepartitionTopics(t *testing.T) {
-	if !dockerAvailable() {
-		t.Skip("Docker not available; skipping integration test")
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
-	kc, err := kafkamodule.Run(ctx, "confluentinc/cp-kafka:7.4.0",
-		kafkamodule.WithClusterID("test-repartition-cluster"),
-		testcontainers.WithEnv(map[string]string{
-			"KAFKA_AUTO_CREATE_TOPICS_ENABLE": "false",
-		}),
-	)
-	if err != nil {
-		t.Skipf("failed to start Kafka container (Docker may be unavailable or slow): %v", err)
-	}
-	t.Cleanup(func() { _ = kc.Terminate(ctx) })
-
-	brokers, err := kc.Brokers(ctx)
-	if err != nil {
-		t.Fatalf("failed to get broker addresses: %v", err)
-	}
+	brokers := integrationBrokers(t)
 
 	const appID = "myapp"
 	cfg := gstream.Config{
@@ -438,25 +329,9 @@ func TestEnsureRepartitionTopics(t *testing.T) {
 }
 
 func TestPrepareTopologyCreatesOnlyInternalTopics(t *testing.T) {
-	if !dockerAvailable() {
-		t.Skip("Docker not available; skipping integration test")
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
-	kafkaContainer, err := kafkamodule.Run(ctx, "confluentinc/cp-kafka:7.4.0",
-		kafkamodule.WithClusterID("test-prepare-topology"),
-		testcontainers.WithEnv(map[string]string{"KAFKA_AUTO_CREATE_TOPICS_ENABLE": "false"}),
-	)
-	if err != nil {
-		t.Skipf("failed to start Kafka container: %v", err)
-	}
-	t.Cleanup(func() { _ = kafkaContainer.Terminate(context.Background()) })
-
-	brokers, err := kafkaContainer.Brokers(ctx)
-	if err != nil {
-		t.Fatalf("get brokers: %v", err)
-	}
+	brokers := integrationBrokers(t)
 	if err := EnsureTopics(ctx, brokers, []TopicSpec{
 		{Name: "input", Partitions: 2, ReplicationFactor: 1},
 		{Name: "output", Partitions: 2, ReplicationFactor: 1},
@@ -466,12 +341,12 @@ func TestPrepareTopologyCreatesOnlyInternalTopics(t *testing.T) {
 
 	builder := gstream.NewStreamBuilder()
 	gstream.Stream[string, string](
-		builder, "input", "source", gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{},
+		builder, "input", "source", state.JSONSerde[string]{}, state.JSONSerde[string]{},
 	).
 		SelectKey(func(_ string, value string) string { return value }).
-		GroupByKey(gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{}).
-		Count("counts").
-		To("output", gstream.JSONSerde[string]{}, gstream.JSONSerde[int64]{})
+		GroupByKey(state.JSONSerde[string]{}, state.JSONSerde[string]{}).
+		Count("counts", state.JSONSerde[int64]{}).
+		To("output", state.JSONSerde[string]{}, state.JSONSerde[int64]{})
 	topology := builder.Build()
 	cfg := gstream.Config{ApplicationID: "planner", Brokers: brokers}
 	if err := PrepareTopology(ctx, cfg, topology); err != nil {
@@ -509,8 +384,8 @@ func TestPrepareTopologyCreatesOnlyInternalTopics(t *testing.T) {
 	missingBuilder := gstream.NewStreamBuilder()
 	gstream.Stream[string, string](
 		missingBuilder, "missing-input", "source",
-		gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{},
-	).To("output", "sink", gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{})
+		state.JSONSerde[string]{}, state.JSONSerde[string]{},
+	).To("output", "sink", state.JSONSerde[string]{}, state.JSONSerde[string]{})
 	err = PrepareTopology(ctx, cfg, missingBuilder.Build())
 	if err == nil || !strings.Contains(err.Error(), "missing-input") {
 		t.Fatalf("missing caller topic error = %v, want named failure", err)

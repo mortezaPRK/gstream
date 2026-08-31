@@ -25,6 +25,7 @@ import (
 	gstream "github.com/mortezaPRK/gstream"
 	"github.com/mortezaPRK/gstream/internal/kafka"
 	"github.com/mortezaPRK/gstream/internal/runtime"
+	jsonserde "github.com/mortezaPRK/gstream/serdes/json"
 )
 
 func main() {
@@ -59,8 +60,8 @@ func main() {
 		b,
 		"input-topic", // Kafka source topic
 		"source",      // unique node name in the DAG
-		gstream.JSONSerde[string]{},
-		gstream.JSONSerde[string]{},
+		jsonserde.Serde[string]{},
+		jsonserde.Serde[string]{},
 	)
 
 	// Filter: keep only records whose value has at least 4 characters.
@@ -76,8 +77,8 @@ func main() {
 		To(
 			"output-topic", // Kafka sink topic
 			"sink",         // unique node name in the DAG
-			gstream.JSONSerde[string]{},
-			gstream.JSONSerde[string]{},
+			jsonserde.Serde[string]{},
+			jsonserde.Serde[string]{},
 		)
 
 	bt := b.Build()

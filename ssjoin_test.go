@@ -1,9 +1,9 @@
 // Package gstream_test provides broker-free tests for the stream-stream windowed
 // inner join (KStream.Join). Tests live in package gstream_test (external) to avoid
-// the import cycle: internal/state imports gstream via Serde[T].
+// the import cycle: stores/memory imports gstream via Serde[T].
 //
 // All tests use topology.NewExecutorWithStreamTime so stream-time advances correctly
-// and late-drop semantics are exercised.  Two real in-memory Pebble stores are wired
+// and late-drop semantics are exercised. Two in-memory stores are wired
 // per test — one per join side.
 package gstream_test
 
@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/mortezaPRK/gstream"
-	"github.com/mortezaPRK/gstream/internal/state"
+	memory "github.com/mortezaPRK/gstream/internal/testutil"
 	"github.com/mortezaPRK/gstream/internal/topology"
 )
 
@@ -33,23 +33,23 @@ func buildSSJoinTopology(t *testing.T, windows gstream.JoinWindows) (
 
 	left := gstream.Stream[string, string](
 		b, "left-topic", "lsrc",
-		gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{},
+		memory.JSONSerde[string]{}, memory.JSONSerde[string]{},
 	)
 	right := gstream.Stream[string, string](
 		b, "right-topic", "rsrc",
-		gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{},
+		memory.JSONSerde[string]{}, memory.JSONSerde[string]{},
 	)
 
 	joined := left.Join[string, string](
 		right,
 		func(v1, v2 string) string { return v1 + ":" + v2 },
 		windows,
-		gstream.JSONSerde[string]{},
-		gstream.JSONSerde[string]{},
-		gstream.JSONSerde[string]{},
-		gstream.JSONSerde[string]{},
+		memory.JSONSerde[string]{},
+		memory.JSONSerde[string]{},
+		memory.JSONSerde[string]{},
+		memory.JSONSerde[string]{},
 	)
-	joined.To("out-topic", "out", gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{})
+	joined.To("out-topic", "out", memory.JSONSerde[string]{}, memory.JSONSerde[string]{})
 
 	bt := b.Build()
 
@@ -71,21 +71,21 @@ func buildSSJoinTopology(t *testing.T, windows gstream.JoinWindows) (
 	return bt, leftStore, rightStore, "out"
 }
 
-// openJoinStores opens two in-memory Pebble stores for a join test.
+// openJoinStores opens two memory stores for a join test.
 // Returns the stores map and a closer function.
 func openJoinStores(t *testing.T, leftStoreName, rightStoreName string) (map[string]any, func()) {
 	t.Helper()
 
-	db, err := state.OpenMemDB()
+	db, err := memory.OpenMemDB()
 	if err != nil {
 		t.Fatalf("OpenMemDB: %v", err)
 	}
 
-	ls := state.NewKeyValueStore[[]byte, []byte](
-		leftStoreName, db, gstream.BytesSerde{}, gstream.BytesSerde{},
+	ls := memory.NewKeyValueStore[[]byte, []byte](
+		leftStoreName, db, memory.BytesSerde{}, memory.BytesSerde{},
 	)
-	rs := state.NewKeyValueStore[[]byte, []byte](
-		rightStoreName, db, gstream.BytesSerde{}, gstream.BytesSerde{},
+	rs := memory.NewKeyValueStore[[]byte, []byte](
+		rightStoreName, db, memory.BytesSerde{}, memory.BytesSerde{},
 	)
 
 	stores := map[string]any{

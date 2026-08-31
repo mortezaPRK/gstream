@@ -43,12 +43,12 @@ func (s KStream[K, V]) GroupByKey(keySerde Serde[K], valSerde Serde[V]) KGrouped
 // Under at-least-once semantics a crash between the store write and the offset
 // commit may replay the batch, causing a double-count. ExactlyOnce eliminates
 // this gap. Count delegates to g.Aggregate.
-func (g KGroupedStream[K, V]) Count(storeName string) KTable[K, int64] {
+func (g KGroupedStream[K, V]) Count(storeName string, countSerde Serde[int64]) KTable[K, int64] {
 	return g.Aggregate[int64](
 		storeName,
 		func() int64 { return 0 },
 		func(_ K, _ V, acc int64) int64 { return acc + 1 },
-		JSONSerde[int64]{},
+		countSerde,
 	)
 }
 

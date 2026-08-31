@@ -13,7 +13,7 @@ import (
 // windowStore is the interface the windowed processor asserts against at runtime.
 // The runtime supplies a *state.KeyValueStore[[]byte,[]byte] which satisfies this
 // interface via its WindowGet/WindowPut methods. Using a narrow interface avoids
-// importing internal/state directly (which would create an import cycle via Serde[T]).
+// importing stores/pebble directly (which would create an import cycle via Serde[T]).
 type windowStore interface {
 	WindowGet(kBytes []byte, windowStart int64) ([]byte, bool, error)
 	WindowPut(kBytes []byte, windowStart int64, val []byte) error
@@ -76,13 +76,13 @@ func (s TimeWindowedStream[K, V]) LateCount() int64 {
 }
 
 // Count accumulates the number of records per windowed key, storing counts in
-// storeName. Delegates to Aggregate[int64] with JSONSerde[int64].
-func (s TimeWindowedStream[K, V]) Count(storeName string) KTable[Windowed[K], int64] {
+// storeName. countSerde controls persisted count encoding.
+func (s TimeWindowedStream[K, V]) Count(storeName string, countSerde Serde[int64]) KTable[Windowed[K], int64] {
 	return s.Aggregate(
 		storeName,
 		func() int64 { return 0 },
 		func(_ K, _ V, acc int64) int64 { return acc + 1 },
-		JSONSerde[int64]{},
+		countSerde,
 	)
 }
 
@@ -191,7 +191,7 @@ func (s TimeWindowedStream[K, V]) Aggregate[A any](
 	// Register a WindowStoreBinding so the runtime can open the store and configure
 	// the window sweeper. EncodeKey/DecodeKey are stubs: the active processing path
 	// uses the windowStore interface (WindowGet/WindowPut). gstream cannot import
-	// internal/state (cycle: internal/state → gstream via Serde[T]).
+	// stores/pebble (cycle: stores/pebble → gstream via Serde[T]).
 	s.builder.windowStores[storeName] = WindowStoreBinding{
 		StoreBinding: StoreBinding{
 			StoreName:      storeName,

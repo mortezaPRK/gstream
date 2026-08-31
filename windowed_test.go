@@ -1,7 +1,7 @@
 // Package gstream_test provides broker-free exit-criterion tests for
 // windowed aggregation. Tests use package gstream_test (external) because
-// internal/state imports gstream, so an internal test that imports
-// internal/state would cause a circular import.
+// stores/memory imports gstream, so an internal test importing it would cause a
+// circular import.
 package gstream_test
 
 import (
@@ -10,13 +10,13 @@ import (
 	"time"
 
 	"github.com/mortezaPRK/gstream"
-	"github.com/mortezaPRK/gstream/internal/state"
+	memory "github.com/mortezaPRK/gstream/internal/testutil"
 	"github.com/mortezaPRK/gstream/internal/topology"
 )
 
 // TestWindowedCount_OutOfOrderAndGrace is the P3 exit-criterion test.
 //
-// Pipeline: KStream[string,string] → GroupByKey → WindowedBy(Tumbling 10s).WithGrace(5s).Count("wc")
+// Pipeline: KStream[string,string] → GroupByKey → WindowedBy(Tumbling 10s).WithGrace(5s).Count("wc", memory.JSONSerde[int64]{})
 //
 // Records fed (key="k"):
 //   - ts=5000   → window [0,10000)      count=1
@@ -37,13 +37,13 @@ func TestWindowedCount_OutOfOrderAndGrace(t *testing.T) {
 
 	b := gstream.NewStreamBuilder()
 	src := gstream.Stream[string, string](b, "input", "src",
-		gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{})
+		memory.JSONSerde[string]{}, memory.JSONSerde[string]{})
 
-	tws := src.GroupByKey(gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{}).
+	tws := src.GroupByKey(memory.JSONSerde[string]{}, memory.JSONSerde[string]{}).
 		WindowedBy(gstream.TumblingWindows(10 * time.Second)).
 		WithGrace(5 * time.Second)
 
-	_ = tws.Count("wc")
+	_ = tws.Count("wc", memory.JSONSerde[int64]{})
 
 	bt := b.Build()
 
@@ -52,17 +52,17 @@ func TestWindowedCount_OutOfOrderAndGrace(t *testing.T) {
 		t.Fatal("expected WindowStoreBindings[\"wc\"] to be registered")
 	}
 
-	// Open an in-memory byte store. Supply *state.KeyValueStore[[]byte,[]byte]
+	// Open an in-memory byte store. Supply *memory.KeyValueStore[[]byte,[]byte]
 	// which satisfies both the DSL's windowStore interface (WindowGet/WindowPut)
 	// and the test's direct WindowGet call below.
-	db, err := state.OpenMemDB()
+	db, err := memory.OpenMemDB()
 	if err != nil {
 		t.Fatalf("OpenMemDB: %v", err)
 	}
 	defer db.Close()
 
-	byteStore := state.NewKeyValueStoreWithChangelog[[]byte, []byte](
-		"wc", db, gstream.BytesSerde{}, gstream.BytesSerde{}, nil,
+	byteStore := memory.NewKeyValueStore[[]byte, []byte](
+		"wc", db, memory.BytesSerde{}, memory.BytesSerde{},
 	)
 
 	var streamTime int64
@@ -84,9 +84,9 @@ func TestWindowedCount_OutOfOrderAndGrace(t *testing.T) {
 	}
 
 	// Assert window counts via byteStore.WindowGet — no hand-rolled composite key.
-	// The format lives once in state.WindowCompositeKey (called internally by WindowGet).
-	keySerde := gstream.JSONSerde[string]{}
-	intSerde := gstream.JSONSerde[int64]{}
+	// The format lives once in memory.WindowCompositeKey (called internally by WindowGet).
+	keySerde := memory.JSONSerde[string]{}
+	intSerde := memory.JSONSerde[int64]{}
 
 	checkCount := func(winStartMs int64, want int64) {
 		t.Helper()
@@ -122,24 +122,24 @@ func TestWindowedCount_AllLate(t *testing.T) {
 
 	b := gstream.NewStreamBuilder()
 	src := gstream.Stream[string, string](b, "input", "src",
-		gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{})
+		memory.JSONSerde[string]{}, memory.JSONSerde[string]{})
 
-	tws := src.GroupByKey(gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{}).
+	tws := src.GroupByKey(memory.JSONSerde[string]{}, memory.JSONSerde[string]{}).
 		WindowedBy(gstream.TumblingWindows(10 * time.Second)).
 		WithGrace(0)
 
-	_ = tws.Count("wc2")
+	_ = tws.Count("wc2", memory.JSONSerde[int64]{})
 
 	bt := b.Build()
 
-	db, err := state.OpenMemDB()
+	db, err := memory.OpenMemDB()
 	if err != nil {
 		t.Fatalf("OpenMemDB: %v", err)
 	}
 	defer db.Close()
 
-	byteStore := state.NewKeyValueStoreWithChangelog[[]byte, []byte](
-		"wc2", db, gstream.BytesSerde{}, gstream.BytesSerde{}, nil,
+	byteStore := memory.NewKeyValueStore[[]byte, []byte](
+		"wc2", db, memory.BytesSerde{}, memory.BytesSerde{},
 	)
 
 	var streamTime int64
@@ -167,11 +167,11 @@ func TestWindowedCount_WindowStoreBinding(t *testing.T) {
 
 	b := gstream.NewStreamBuilder()
 	src := gstream.Stream[string, string](b, "input", "src",
-		gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{})
-	_ = src.GroupByKey(gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{}).
-		WindowedBy(gstream.TumblingWindows(10 * time.Second)).
-		WithGrace(3 * time.Second).
-		Count("my-window-store")
+		memory.JSONSerde[string]{}, memory.JSONSerde[string]{})
+	_ = src.GroupByKey(memory.JSONSerde[string]{}, memory.JSONSerde[string]{}).
+		WindowedBy(gstream.TumblingWindows(10*time.Second)).
+		WithGrace(3*time.Second).
+		Count("my-window-store", memory.JSONSerde[int64]{})
 
 	bt := b.Build()
 

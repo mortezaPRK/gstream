@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/mortezaPRK/gstream"
+	memory "github.com/mortezaPRK/gstream/internal/testutil"
 	"github.com/mortezaPRK/gstream/internal/topology"
 )
 
@@ -15,11 +16,11 @@ func TestRepartition_BindingRegistered(t *testing.T) {
 	t.Parallel()
 
 	b := gstream.NewStreamBuilder()
-	src := gstream.Stream[string, string](b, "input", "src", gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{})
+	src := gstream.Stream[string, string](b, "input", "src", memory.JSONSerde[string]{}, memory.JSONSerde[string]{})
 
 	// Chain a downstream To() so Build() finds at least one sink.
-	src.Repartition("rekey", 4, gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{}).
-		To("output", "out", gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{})
+	src.Repartition("rekey", 4, memory.JSONSerde[string]{}, memory.JSONSerde[string]{}).
+		To("output", "out", memory.JSONSerde[string]{}, memory.JSONSerde[string]{})
 
 	bt := b.Build()
 
@@ -57,9 +58,9 @@ func TestRepartition_TopologyNodes(t *testing.T) {
 	t.Parallel()
 
 	b := gstream.NewStreamBuilder()
-	src := gstream.Stream[string, string](b, "input", "src", gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{})
-	repartitioned := src.Repartition("r2", 8, gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{})
-	repartitioned.To("output", "out", gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{})
+	src := gstream.Stream[string, string](b, "input", "src", memory.JSONSerde[string]{}, memory.JSONSerde[string]{})
+	repartitioned := src.Repartition("r2", 8, memory.JSONSerde[string]{}, memory.JSONSerde[string]{})
+	repartitioned.To("output", "out", memory.JSONSerde[string]{}, memory.JSONSerde[string]{})
 
 	bt := b.Build()
 	rb := bt.RepartitionBindings["r2"]
@@ -98,12 +99,12 @@ func TestRepartition_ChainDownstream(t *testing.T) {
 	t.Parallel()
 
 	b := gstream.NewStreamBuilder()
-	src := gstream.Stream[string, string](b, "input", "src", gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{})
+	src := gstream.Stream[string, string](b, "input", "src", memory.JSONSerde[string]{}, memory.JSONSerde[string]{})
 
 	// Chain: Repartition → Filter → To.  Build() must not panic.
-	src.Repartition("chain", 2, gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{}).
+	src.Repartition("chain", 2, memory.JSONSerde[string]{}, memory.JSONSerde[string]{}).
 		Filter(func(_ string, v string) bool { return v != "" }).
-		To("output", "chain-out", gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{})
+		To("output", "chain-out", memory.JSONSerde[string]{}, memory.JSONSerde[string]{})
 
 	// Build seals; if wiring were wrong it panics.
 	bt := b.Build()
@@ -128,9 +129,9 @@ func TestRepartition_EncodeDecodeRoundTrip(t *testing.T) {
 	t.Parallel()
 
 	b := gstream.NewStreamBuilder()
-	src := gstream.Stream[string, string](b, "input", "src", gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{})
-	src.Repartition("rt", 4, gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{}).
-		To("output", "rt-out", gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{})
+	src := gstream.Stream[string, string](b, "input", "src", memory.JSONSerde[string]{}, memory.JSONSerde[string]{})
+	src.Repartition("rt", 4, memory.JSONSerde[string]{}, memory.JSONSerde[string]{}).
+		To("output", "rt-out", memory.JSONSerde[string]{}, memory.JSONSerde[string]{})
 
 	bt := b.Build()
 	rb := bt.RepartitionBindings["rt"]
@@ -170,9 +171,9 @@ func TestRepartition_EncodeKey_TypeMismatch(t *testing.T) {
 	t.Parallel()
 
 	b := gstream.NewStreamBuilder()
-	src := gstream.Stream[string, string](b, "input", "src", gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{})
-	src.Repartition("tm", 2, gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{}).
-		To("output", "tm-out", gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{})
+	src := gstream.Stream[string, string](b, "input", "src", memory.JSONSerde[string]{}, memory.JSONSerde[string]{})
+	src.Repartition("tm", 2, memory.JSONSerde[string]{}, memory.JSONSerde[string]{}).
+		To("output", "tm-out", memory.JSONSerde[string]{}, memory.JSONSerde[string]{})
 
 	bt := b.Build()
 	rb := bt.RepartitionBindings["tm"]
@@ -190,10 +191,10 @@ func TestRepartition_ExecutorDrivesSource(t *testing.T) {
 	t.Parallel()
 
 	b := gstream.NewStreamBuilder()
-	src := gstream.Stream[string, string](b, "input", "src", gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{})
-	src.Repartition("exec", 4, gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{}).
+	src := gstream.Stream[string, string](b, "input", "src", memory.JSONSerde[string]{}, memory.JSONSerde[string]{})
+	src.Repartition("exec", 4, memory.JSONSerde[string]{}, memory.JSONSerde[string]{}).
 		Filter(func(_ string, v string) bool { return v == "keep" }).
-		To("output", "exec-out", gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{})
+		To("output", "exec-out", memory.JSONSerde[string]{}, memory.JSONSerde[string]{})
 
 	bt := b.Build()
 	rb := bt.RepartitionBindings["exec"]
@@ -229,11 +230,11 @@ func TestAutomaticRepartitionMapBeforeGroupBy(t *testing.T) {
 
 	builder := gstream.NewStreamBuilder()
 	gstream.Stream[string, string](
-		builder, "input", "src", gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{},
+		builder, "input", "src", memory.JSONSerde[string]{}, memory.JSONSerde[string]{},
 	).
 		SelectKey(func(_ string, value string) string { return value }).
-		GroupByKey(gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{}).
-		Count("counts")
+		GroupByKey(memory.JSONSerde[string]{}, memory.JSONSerde[string]{}).
+		Count("counts", memory.JSONSerde[int64]{})
 
 	topology := builder.Build()
 	if len(topology.RepartitionBindings) != 1 {
@@ -251,11 +252,11 @@ func TestAutomaticRepartitionNotAddedWhenKeyUnchanged(t *testing.T) {
 
 	builder := gstream.NewStreamBuilder()
 	gstream.Stream[string, string](
-		builder, "input", "src", gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{},
+		builder, "input", "src", memory.JSONSerde[string]{}, memory.JSONSerde[string]{},
 	).
 		MapValues(func(_ string, value string) string { return value + "!" }).
-		GroupByKey(gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{}).
-		Count("counts")
+		GroupByKey(memory.JSONSerde[string]{}, memory.JSONSerde[string]{}).
+		Count("counts", memory.JSONSerde[int64]{})
 
 	topology := builder.Build()
 	if len(topology.RepartitionBindings) != 0 {

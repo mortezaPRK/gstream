@@ -14,62 +14,50 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/pebble"
-	"github.com/cockroachdb/pebble/vfs"
 	gstream "github.com/mortezaPRK/gstream"
 	"github.com/mortezaPRK/gstream/internal/kafka"
-	"github.com/mortezaPRK/gstream/internal/state"
+	state "github.com/mortezaPRK/gstream/internal/testutil"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
 // helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-// openMemDB opens a fresh in-memory Pebble DB owned by the test.
-func openMemDB(t *testing.T) *pebble.DB {
+func openMemDB(t *testing.T) *state.MemoryBackend {
 	t.Helper()
-	db, err := pebble.Open("", &pebble.Options{FS: vfs.NewMem()})
-	if err != nil {
-		t.Fatalf("openMemDB: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	return db
+	backend := state.NewMemoryBackend()
+	t.Cleanup(func() { _ = backend.Close() })
+	return backend
 }
 
-// readOnlyMemDB opens a pebble DB in ReadOnly mode using a shared MemFS.
-// Writes to this DB return an error (not a panic), simulating an un-retryable
-// disk failure for tests that exercise the ErrStoreWrite path.
-func readOnlyMemDB(t *testing.T) *pebble.DB {
+type failingStore struct{ *state.MemoryStore }
+
+func newFailingStore(t *testing.T) *failingStore {
 	t.Helper()
-	mem := vfs.NewMem()
-	// Seed the MemFS with a valid DB so it can be reopened ReadOnly.
-	seed, err := pebble.Open("", &pebble.Options{FS: mem})
-	if err != nil {
-		t.Fatalf("readOnlyMemDB: seed open: %v", err)
-	}
-	if err := seed.Close(); err != nil {
-		t.Fatalf("readOnlyMemDB: seed close: %v", err)
-	}
-	// Reopen read-only: Set/Delete now return errors instead of panicking.
-	db, err := pebble.Open("", &pebble.Options{FS: mem, ReadOnly: true})
-	if err != nil {
-		t.Fatalf("readOnlyMemDB: readonly open: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	return db
+	_, store := state.NewMemoryStore("test-store", false)
+	return &failingStore{MemoryStore: store}
 }
 
-// newGCWithDB constructs a GlobalConsumer backed by the given db (no Pebble open
-// inside NewGlobalConsumer — used when the test controls the DB directly).
-func newGCWithDB(t *testing.T, db *pebble.DB) *GlobalConsumer {
+func (store *failingStore) Put(_, _ []byte) error {
+	return gstream.ErrStoreWrite{Op: "Put", Err: errors.New("simulated write failure")}
+}
+
+func (store *failingStore) Delete(_ []byte) error {
+	return gstream.ErrStoreWrite{Op: "Delete", Err: errors.New("simulated write failure")}
+}
+
+func (store *failingStore) WindowPut(_ []byte, _ int64, _ []byte) error {
+	return gstream.ErrStoreWrite{Op: "WindowPut", Err: errors.New("simulated write failure")}
+}
+
+func (store *failingStore) WindowDelete(_ []byte, _ int64) error {
+	return gstream.ErrStoreWrite{Op: "WindowDelete", Err: errors.New("simulated write failure")}
+}
+
+func newFailingGC(t *testing.T) *GlobalConsumer {
 	t.Helper()
-	store := state.NewKeyValueStore[[]byte, []byte](
-		"test-store", db,
-		gstream.BytesSerde{}, gstream.BytesSerde{},
-	)
 	return &GlobalConsumer{
-		store:     store,
-		db:        db,
+		store:     newFailingStore(t),
 		storeName: "test-store",
 		logger:    slog.Default(),
 	}
@@ -88,8 +76,7 @@ func newGCWithDB(t *testing.T, db *pebble.DB) *GlobalConsumer {
 // which KeyValueStore.Put wraps as ErrStoreWrite.
 func TestTailConsume_StoreWriteError_TripsHealthAndStops(t *testing.T) {
 	// Build a GlobalConsumer whose Pebble DB is already closed → any write → ErrStoreWrite.
-	db := readOnlyMemDB(t)
-	gc := newGCWithDB(t, db)
+	gc := newFailingGC(t)
 
 	health := &PipelineHealth{}
 	gc.SetHealth(health)
@@ -135,8 +122,7 @@ func TestTailConsume_StoreWriteError_TripsHealthAndStops(t *testing.T) {
 // This is declared inline so the verifier can see the test exercises the exact
 // failing call path.
 func TestTailConsume_ApplyKV_StoreWriteIsDetectable(t *testing.T) {
-	db := readOnlyMemDB(t)
-	gc := newGCWithDB(t, db)
+	gc := newFailingGC(t)
 
 	// Put fails → ErrStoreWrite
 	err := gc.applyKV([]byte("k"), []byte("v"), 0, 0)
@@ -166,20 +152,17 @@ func TestTailConsume_ApplyKV_StoreWriteIsDetectable(t *testing.T) {
 // goroutine via Context cancellation as a proxy, and separately verifies that
 // the ErrStoreWrite path calls health.Fail (proven in the above tests).
 func TestTailConsume_GoroutineExitsOnContextCancel(t *testing.T) {
-	db := openMemDB(t)
-
 	dir := t.TempDir()
 	cfg := gstream.Config{
 		ApplicationID: "hlt-app",
 		Brokers:       []string{"localhost:19092"}, // never dialled
 		StateDir:      dir,
+		StoreProvider: state.MemoryProvider{},
 	}
 	gc, err := NewGlobalConsumer(cfg, dummyBinding("hlt-store", "hlt-topic"), nil)
 	if err != nil {
 		t.Fatalf("NewGlobalConsumer: %v", err)
 	}
-	_ = db // gc owns its own db
-
 	health := &PipelineHealth{}
 	gc.SetHealth(health)
 
@@ -302,7 +285,7 @@ func TestErrStoreWrite_SerdeErrorNotFatal(t *testing.T) {
 	// Write a real value so Get doesn't short-circuit on ErrNotFound.
 	rawStore := state.NewKeyValueStore[[]byte, []byte](
 		"serde-test", db,
-		gstream.BytesSerde{}, gstream.BytesSerde{},
+		state.BytesSerde{}, state.BytesSerde{},
 	)
 	if err := rawStore.Put([]byte("key"), []byte("not-json")); err != nil {
 		t.Fatalf("seed Put: %v", err)
@@ -312,7 +295,7 @@ func TestErrStoreWrite_SerdeErrorNotFatal(t *testing.T) {
 	badSerde := &errDeserializeSerde{}
 	badStore := state.NewKeyValueStore[[]byte, []byte](
 		"serde-test", db,
-		gstream.BytesSerde{}, badSerde,
+		state.BytesSerde{}, badSerde,
 	)
 	_, _, err := badStore.Get([]byte("key"))
 	if err == nil {
@@ -331,21 +314,15 @@ func (errDeserializeSerde) Deserialize([]byte) ([]byte, error) {
 	return nil, errors.New("deserialize: simulated failure")
 }
 
-// TestErrStoreWrite_PebbleWriteIsFatal verifies that a Pebble write error (db.Set
-// on a closed DB) IS classified as ErrStoreWrite.
-func TestErrStoreWrite_PebbleWriteIsFatal(t *testing.T) {
-	db := readOnlyMemDB(t)
-	store := state.NewKeyValueStore[[]byte, []byte](
-		"fatal-test", db,
-		gstream.BytesSerde{}, gstream.BytesSerde{},
-	)
+func TestErrStoreWrite_WriteIsFatal(t *testing.T) {
+	store := newFailingStore(t)
 
 	err := store.Put([]byte("k"), []byte("v"))
 	if err == nil {
 		t.Fatal("expected error on closed DB Put, got nil")
 	}
 	if !errors.Is(err, state.ErrStoreWriteSentinel) {
-		t.Errorf("Pebble write error not classified as ErrStoreWrite; got %T: %v", err, err)
+		t.Errorf("store write error not classified as ErrStoreWrite; got %T: %v", err, err)
 	}
 
 	// Also verify errors.As works.
@@ -366,11 +343,7 @@ func TestErrStoreWrite_PebbleWriteIsFatal(t *testing.T) {
 
 // TestErrStoreWrite_ClassifiesAllWriteOps verifies all write methods return ErrStoreWrite.
 func TestErrStoreWrite_ClassifiesAllWriteOps(t *testing.T) {
-	db := readOnlyMemDB(t)
-	store := state.NewKeyValueStore[[]byte, []byte](
-		"all-ops", db,
-		gstream.BytesSerde{}, gstream.BytesSerde{},
-	)
+	store := newFailingStore(t)
 
 	cases := []struct {
 		name string
@@ -437,8 +410,7 @@ func TestProcessPath_ErrStoreWriteIsRecognized(t *testing.T) {
 // logic manually.  The key behavioral contract: once fatalApply != nil, the
 // loop body sets the flag and does not call applyKV for subsequent records.
 func TestTailConsume_SkipsRemainingRecordsAfterFatal(t *testing.T) {
-	db := readOnlyMemDB(t) // every write fails
-	gc := newGCWithDB(t, db)
+	gc := newFailingGC(t)
 	health := &PipelineHealth{}
 	gc.SetHealth(health)
 
@@ -577,8 +549,8 @@ func minimalBuiltTopology(t *testing.T) *gstream.BuiltTopology {
 	t.Helper()
 	sb := gstream.NewStreamBuilder()
 	ks := gstream.Stream[[]byte, []byte](sb, "test-topic", "src",
-		gstream.BytesSerde{}, gstream.BytesSerde{},
+		state.BytesSerde{}, state.BytesSerde{},
 	)
-	ks.To("test-sink", "sink", gstream.BytesSerde{}, gstream.BytesSerde{})
+	ks.To("test-sink", "sink", state.BytesSerde{}, state.BytesSerde{})
 	return sb.Build()
 }
