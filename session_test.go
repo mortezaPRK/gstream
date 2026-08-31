@@ -1,5 +1,5 @@
 // Package gstream_test provides broker-free tests for session-window aggregation.
-// Uses package gstream_test (external) because store/memory imports gstream,
+// Uses package gstream_test (external) because stores/memory imports gstream,
 // so an internal test importing it would create a circular import.
 package gstream_test
 
@@ -9,13 +9,13 @@ import (
 	"time"
 
 	"github.com/mortezaPRK/gstream"
+	memory "github.com/mortezaPRK/gstream/internal/testutil"
 	"github.com/mortezaPRK/gstream/internal/topology"
-	"github.com/mortezaPRK/gstream/store/memory"
 )
 
 // newSessionCount builds a pipeline:
 //
-//	KStream[string,string] → GroupByKey → SessionWindowedBy(gap).WithGrace(grace).Count(storeName)
+//	KStream[string,string] → GroupByKey → SessionWindowedBy(gap).WithGrace(grace).Count(storeName, memory.JSONSerde[int64]{})
 //
 // Returns the built topology, the stream-time pointer, the executor, the byte store, and the
 // SessionWindowedStream (for LateCount).
@@ -28,13 +28,13 @@ func newSessionCount(
 
 	b := gstream.NewStreamBuilder()
 	src := gstream.Stream[string, string](b, "input", "src",
-		gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{})
+		memory.JSONSerde[string]{}, memory.JSONSerde[string]{})
 
-	sws := src.GroupByKey(gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{}).
+	sws := src.GroupByKey(memory.JSONSerde[string]{}, memory.JSONSerde[string]{}).
 		SessionWindowedBy(gstream.SessionWindow(gap)).
 		WithGrace(grace)
 
-	_ = sws.Count(storeName)
+	_ = sws.Count(storeName, memory.JSONSerde[int64]{})
 
 	bt := b.Build()
 
@@ -45,7 +45,7 @@ func newSessionCount(
 	t.Cleanup(func() { db.Close() })
 
 	byteStore := memory.NewKeyValueStore[[]byte, []byte](
-		storeName, db, gstream.BytesSerde{}, gstream.BytesSerde{},
+		storeName, db, memory.BytesSerde{}, memory.BytesSerde{},
 	)
 
 	var streamTime int64
@@ -60,7 +60,7 @@ func newSessionCount(
 func readSession(t *testing.T, byteStore *memory.KeyValueStore[[]byte, []byte], key string, expectedStart int64) (count int64, sessionStart int64, sessionEnd int64, found bool) {
 	t.Helper()
 
-	keySerde := gstream.JSONSerde[string]{}
+	keySerde := memory.JSONSerde[string]{}
 	kBytes, err := keySerde.Serialize(key)
 	if err != nil {
 		t.Fatalf("serialize key %q: %v", key, err)
@@ -80,7 +80,7 @@ func readSession(t *testing.T, byteStore *memory.KeyValueStore[[]byte, []byte], 
 		t.Fatalf("DecodeSessionValue: %v", err)
 	}
 
-	intSerde := gstream.JSONSerde[int64]{}
+	intSerde := memory.JSONSerde[int64]{}
 	cnt, err := intSerde.Deserialize(accBytes)
 	if err != nil {
 		t.Fatalf("deserialize count: %v", err)
@@ -92,7 +92,7 @@ func readSession(t *testing.T, byteStore *memory.KeyValueStore[[]byte, []byte], 
 func countSessions(t *testing.T, byteStore *memory.KeyValueStore[[]byte, []byte], key string) int {
 	t.Helper()
 
-	keySerde := gstream.JSONSerde[string]{}
+	keySerde := memory.JSONSerde[string]{}
 	kBytes, err := keySerde.Serialize(key)
 	if err != nil {
 		t.Fatalf("serialize key %q: %v", key, err)
@@ -269,11 +269,11 @@ func TestSessionCount_SessionStoreBinding(t *testing.T) {
 
 	b := gstream.NewStreamBuilder()
 	src := gstream.Stream[string, string](b, "input", "src",
-		gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{})
-	_ = src.GroupByKey(gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{}).
-		SessionWindowedBy(gstream.SessionWindow(15 * time.Second)).
-		WithGrace(3 * time.Second).
-		Count("my-session-store")
+		memory.JSONSerde[string]{}, memory.JSONSerde[string]{})
+	_ = src.GroupByKey(memory.JSONSerde[string]{}, memory.JSONSerde[string]{}).
+		SessionWindowedBy(gstream.SessionWindow(15*time.Second)).
+		WithGrace(3*time.Second).
+		Count("my-session-store", memory.JSONSerde[int64]{})
 
 	bt := b.Build()
 
@@ -320,9 +320,9 @@ func newSessionAggregate[A any](
 
 	b := gstream.NewStreamBuilder()
 	src := gstream.Stream[string, string](b, "input", "src",
-		gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{})
+		memory.JSONSerde[string]{}, memory.JSONSerde[string]{})
 
-	_ = src.GroupByKey(gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{}).
+	_ = src.GroupByKey(memory.JSONSerde[string]{}, memory.JSONSerde[string]{}).
 		SessionWindowedBy(gstream.SessionWindow(gap)).
 		WithGrace(grace).
 		Aggregate(storeName, initFn, aggFn, mergeFn, accSerde)
@@ -336,7 +336,7 @@ func newSessionAggregate[A any](
 	t.Cleanup(func() { db.Close() })
 
 	byteStore := memory.NewKeyValueStore[[]byte, []byte](
-		storeName, db, gstream.BytesSerde{}, gstream.BytesSerde{},
+		storeName, db, memory.BytesSerde{}, memory.BytesSerde{},
 	)
 
 	var streamTime int64
@@ -350,7 +350,7 @@ func newSessionAggregate[A any](
 func readSessionA[A any](t *testing.T, byteStore *memory.KeyValueStore[[]byte, []byte], key string, expectedStart int64, accSerde gstream.Serde[A]) (acc A, sessionStart int64, sessionEnd int64, found bool) {
 	t.Helper()
 
-	keySerde := gstream.JSONSerde[string]{}
+	keySerde := memory.JSONSerde[string]{}
 	kBytes, err := keySerde.Serialize(key)
 	if err != nil {
 		t.Fatalf("serialize key %q: %v", key, err)
@@ -425,7 +425,7 @@ func TestSessionAggregate_NonIdentityMerge(t *testing.T) {
 		}
 		return b
 	}
-	accSerde := gstream.JSONSerde[int64]{}
+	accSerde := memory.JSONSerde[int64]{}
 
 	_, _, exec, byteStore := newSessionAggregate(
 		t,

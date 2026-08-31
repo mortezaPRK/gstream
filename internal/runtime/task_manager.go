@@ -8,13 +8,9 @@ import (
 	"path/filepath"
 	"sync"
 
-	"github.com/cockroachdb/pebble"
 	gstream "github.com/mortezaPRK/gstream"
 	"github.com/mortezaPRK/gstream/internal/kafka"
 	"github.com/mortezaPRK/gstream/internal/topology"
-	"github.com/mortezaPRK/gstream/logging"
-	gslog "github.com/mortezaPRK/gstream/logging/slog"
-	state "github.com/mortezaPRK/gstream/store/pebble"
 )
 
 // task holds the per-partition state for stateful stream processing.
@@ -33,11 +29,10 @@ import (
 //     amortization (sweep only once per window-size of stream-time advancement).
 //   - stores retains the concrete store references so PostBatch can access them.
 type task struct {
-	db            *pebble.DB
+	backend       gstream.StoreBackend
 	executor      *topology.Executor
-	collectors    map[string]*state.MutationCollector // keyed by store name
-	producers     map[string]*state.ChangelogProducer // keyed by store name
-	stores        map[string]any                      // keyed by store name; both regular + window
+	producers     map[string]*ChangelogProducer // keyed by store name
+	stores        map[string]any                // keyed by store name; both regular + window
 	partition     int32
 	streamTime    int64 // per-task stream-time watermark; 0 if no windowed stores
 	lastSweepTime int64 // stream-time at last retention sweep (amortization)
@@ -63,7 +58,7 @@ type TaskManager struct {
 
 	bt     *gstream.BuiltTopology
 	cfg    gstream.Config
-	logger logging.Logger
+	logger gstream.Logger
 	appID  string
 }
 
@@ -72,9 +67,9 @@ type TaskManager struct {
 // It is only meaningful when bt.StoreBindings or bt.WindowStoreBindings is
 // non-empty (stateful topologies). The caller must wire its lifecycle methods
 // into the kafka.Client via WithLifecycle and WithPostBatch.
-func NewTaskManager(bt *gstream.BuiltTopology, cfg gstream.Config, logger logging.Logger) *TaskManager {
+func NewTaskManager(bt *gstream.BuiltTopology, cfg gstream.Config, logger gstream.Logger) *TaskManager {
 	if logger == nil {
-		logger = gslog.Default()
+		logger = slog.Default()
 	}
 	return &TaskManager{
 		tasks:        make(map[int32]*task),
@@ -138,7 +133,7 @@ func (tm *TaskManager) PostBatch(ctx context.Context) error {
 	defer tm.mu.Unlock()
 
 	for partition, t := range tm.tasks {
-		if t.db == nil {
+		if t.backend == nil {
 			continue
 		}
 
@@ -151,14 +146,14 @@ func (tm *TaskManager) PostBatch(ctx context.Context) error {
 			}
 		}
 
-		for storeName, collector := range t.collectors {
-			muts := collector.Drain()
+		for storeName, producer := range t.producers {
+			store, ok := t.stores[storeName].(gstream.Store)
+			if !ok {
+				return fmt.Errorf("TaskManager.PostBatch: partition %d store %q: unexpected type %T", partition, storeName, t.stores[storeName])
+			}
+			muts := store.DrainMutations()
 			if len(muts) == 0 {
 				continue
-			}
-			producer := t.producers[storeName]
-			if producer == nil {
-				return fmt.Errorf("TaskManager.PostBatch: partition %d store %q: no producer", partition, storeName)
 			}
 			if err := producer.Flush(ctx, partition, muts); err != nil {
 				return fmt.Errorf("TaskManager.PostBatch: partition %d store %q: flush: %w", partition, storeName, err)
@@ -167,7 +162,7 @@ func (tm *TaskManager) PostBatch(ctx context.Context) error {
 
 		// [SESSION-FROZEN-EXT] OR-extension: persist stream-time for session topologies too.
 		if len(tm.bt.WindowStoreBindings) > 0 || len(tm.bt.SessionStoreBindings) > 0 {
-			if err := state.WriteStreamTime(t.db, t.streamTime); err != nil {
+			if err := t.backend.WriteStreamTime(t.streamTime); err != nil {
 				// Non-fatal: on crash, stream-time will be rebuilt from redelivered records.
 				tm.logger.Warn("PostBatch: WriteStreamTime failed",
 					slog.Int("partition", int(partition)),
@@ -195,7 +190,7 @@ func (tm *TaskManager) PostBatchSweep(ctx context.Context) error {
 	defer tm.mu.Unlock()
 
 	for partition, t := range tm.tasks {
-		if t.db == nil {
+		if t.backend == nil {
 			continue
 		}
 
@@ -210,7 +205,7 @@ func (tm *TaskManager) PostBatchSweep(ctx context.Context) error {
 
 		// [SESSION-FROZEN-EXT] OR-extension: persist stream-time for session topologies too.
 		if len(tm.bt.WindowStoreBindings) > 0 || len(tm.bt.SessionStoreBindings) > 0 {
-			if err := state.WriteStreamTime(t.db, t.streamTime); err != nil {
+			if err := t.backend.WriteStreamTime(t.streamTime); err != nil {
 				// Non-fatal: on crash, stream-time will be rebuilt from redelivered records.
 				tm.logger.Warn("PostBatchSweep: WriteStreamTime failed",
 					slog.Int("partition", int(partition)),
@@ -238,17 +233,17 @@ func (tm *TaskManager) DrainChangelogRecords() ([]kafka.OutRecord, error) {
 
 	var all []kafka.OutRecord
 	for partition, t := range tm.tasks {
-		if t.db == nil {
+		if t.backend == nil {
 			continue
 		}
-		for storeName, collector := range t.collectors {
-			muts := collector.Drain()
+		for storeName, producer := range t.producers {
+			store, ok := t.stores[storeName].(gstream.Store)
+			if !ok {
+				return nil, fmt.Errorf("TaskManager.DrainChangelogRecords: partition %d store %q: unexpected type %T", partition, storeName, t.stores[storeName])
+			}
+			muts := store.DrainMutations()
 			if len(muts) == 0 {
 				continue
-			}
-			producer := t.producers[storeName]
-			if producer == nil {
-				return nil, fmt.Errorf("TaskManager.DrainChangelogRecords: partition %d store %q: no producer", partition, storeName)
 			}
 			all = append(all, producer.Encode(t.partition, muts)...)
 		}
@@ -264,7 +259,7 @@ func (tm *TaskManager) WriteCheckpoints(ctx context.Context, brokers []string) {
 
 	for partition, t := range tm.tasks {
 		for storeName, changelogTopic := range tm.allChangelogTopics() {
-			hw, err := state.RestoreFromChangelog(ctx, brokers, changelogTopic, partition /*checkpointOffset=*/, int64(^uint64(0)>>1), t.db, storeName, tm.cfg.RestoreCatchUpTimeout)
+			hw, err := RestoreFromChangelog(ctx, brokers, changelogTopic, partition /*checkpointOffset=*/, int64(^uint64(0)>>1), t.backend, storeName, tm.cfg.RestoreCatchUpTimeout)
 			if err != nil {
 				tm.logger.Warn("WriteCheckpoints: fetch HW via restore failed",
 					slog.Int("partition", int(partition)),
@@ -276,7 +271,7 @@ func (tm *TaskManager) WriteCheckpoints(ctx context.Context, brokers []string) {
 			if hw == 0 {
 				continue
 			}
-			if err := state.WriteCheckpointSync(t.db, storeName, hw-1); err != nil {
+			if err := t.backend.WriteCheckpoint(storeName, hw-1); err != nil {
 				tm.logger.Warn("WriteCheckpoints: WriteCheckpointSync failed",
 					slog.Int("partition", int(partition)),
 					slog.String("store", storeName),
@@ -306,9 +301,8 @@ func (tm *TaskManager) Executor(partition int32) *topology.Executor {
 			stores[name] = gs
 		}
 		t := &task{
-			db:         nil,
-			collectors: make(map[string]*state.MutationCollector),
-			producers:  make(map[string]*state.ChangelogProducer),
+			backend:    nil,
+			producers:  make(map[string]*ChangelogProducer),
 			stores:     stores,
 			partition:  partition,
 			streamTime: 0,
@@ -340,20 +334,16 @@ func (tm *TaskManager) allChangelogTopics() map[string]string {
 // openTask creates and restores a single per-partition task. Called from OnAssigned.
 // Zero-store topologies skip Pebble entirely; an Executor is still created.
 func (tm *TaskManager) openTask(ctx context.Context, partition int32) error {
-	// [SESSION-FROZEN-EXT] OR-extension: include session stores in total count.
 	totalStores := len(tm.bt.StoreBindings) + len(tm.bt.WindowStoreBindings) + len(tm.bt.SessionStoreBindings)
 	stores := make(map[string]any, totalStores)
-	collectors := make(map[string]*state.MutationCollector, totalStores)
-	producers := make(map[string]*state.ChangelogProducer, totalStores)
+	producers := make(map[string]*ChangelogProducer, totalStores)
 
 	if totalStores == 0 {
-		// Merge global stores so JoinGlobal processors resolve even in zero-store topologies.
 		for name, gs := range tm.globalStores {
 			stores[name] = gs
 		}
 		t := &task{
-			db:         nil,
-			collectors: collectors,
+			backend:    nil,
 			producers:  producers,
 			stores:     stores,
 			partition:  partition,
@@ -369,125 +359,67 @@ func (tm *TaskManager) openTask(ctx context.Context, partition int32) error {
 		return nil
 	}
 
-	dbDir := filepath.Join(tm.cfg.StateDir, tm.appID, fmt.Sprintf("partition-%d", partition))
-	db, err := state.OpenDB(dbDir)
+	if tm.cfg.StoreProvider == nil {
+		return fmt.Errorf("stateful topology requires StoreProvider")
+	}
+	backendPath := filepath.Join(tm.cfg.StateDir, tm.appID, fmt.Sprintf("partition-%d", partition))
+	backend, err := tm.cfg.StoreProvider.Open(backendPath)
 	if err != nil {
-		return fmt.Errorf("open pebble at %q: %w", dbDir, err)
+		return fmt.Errorf("open store backend at %q: %w", backendPath, err)
+	}
+	cleanup := func() {
+		for _, producer := range producers {
+			producer.Close()
+		}
+		_ = backend.Close()
+	}
+	openStore := func(storeName, changelogName string) error {
+		changelogTopic := tm.appID + "-" + changelogName + "-changelog"
+		checkpoint, found, err := backend.ReadCheckpoint(storeName)
+		if err != nil {
+			return fmt.Errorf("ReadCheckpoint %q: %w", storeName, err)
+		}
+		if !found {
+			checkpoint = -1
+		}
+		_, err = RestoreFromChangelog(
+			ctx, tm.cfg.Brokers, changelogTopic, partition, checkpoint,
+			backend, storeName, tm.cfg.RestoreCatchUpTimeout,
+		)
+		if err != nil {
+			return fmt.Errorf("RestoreFromChangelog store %q partition %d: %w", storeName, partition, err)
+		}
+		producer, err := NewChangelogProducer(tm.cfg.Brokers, changelogTopic)
+		if err != nil {
+			return fmt.Errorf("NewChangelogProducer store %q: %w", storeName, err)
+		}
+		store, err := backend.OpenStore(storeName, true)
+		if err != nil {
+			producer.Close()
+			return fmt.Errorf("OpenStore %q: %w", storeName, err)
+		}
+		stores[storeName] = store
+		producers[storeName] = producer
+		return nil
 	}
 
 	for storeName, binding := range tm.bt.StoreBindings {
-		changelogTopic := tm.appID + "-" + binding.ChangelogTopic + "-changelog"
-
-		checkpoint, found, err := state.ReadCheckpoint(db, storeName)
-		if err != nil {
-			_ = db.Close()
-			return fmt.Errorf("ReadCheckpoint store %q: %w", storeName, err)
+		if err := openStore(storeName, binding.ChangelogTopic); err != nil {
+			cleanup()
+			return err
 		}
-		if !found {
-			checkpoint = -1 // RestoreFromChangelog: start from beginning
-		}
-
-		_, err = state.RestoreFromChangelog(ctx, tm.cfg.Brokers, changelogTopic, partition, checkpoint, db, storeName, tm.cfg.RestoreCatchUpTimeout)
-		if err != nil {
-			_ = db.Close()
-			return fmt.Errorf("RestoreFromChangelog store %q partition %d: %w", storeName, partition, err)
-		}
-
-		collector := &state.MutationCollector{}
-		producer, err := state.NewChangelogProducer(tm.cfg.Brokers, changelogTopic)
-		if err != nil {
-			_ = db.Close()
-			return fmt.Errorf("NewChangelogProducer store %q: %w", storeName, err)
-		}
-
-		store := state.NewKeyValueStoreWithChangelog[[]byte, []byte](
-			storeName,
-			db,
-			gstream.BytesSerde{},
-			gstream.BytesSerde{},
-			collector,
-		)
-
-		stores[storeName] = store
-		collectors[storeName] = collector
-		producers[storeName] = producer
 	}
-
 	for storeName, binding := range tm.bt.WindowStoreBindings {
-		changelogTopic := tm.appID + "-" + binding.ChangelogTopic + "-changelog"
-
-		checkpoint, found, err := state.ReadCheckpoint(db, storeName)
-		if err != nil {
-			_ = db.Close()
-			return fmt.Errorf("ReadCheckpoint window store %q: %w", storeName, err)
+		if err := openStore(storeName, binding.ChangelogTopic); err != nil {
+			cleanup()
+			return err
 		}
-		if !found {
-			checkpoint = -1
-		}
-
-		_, err = state.RestoreFromChangelog(ctx, tm.cfg.Brokers, changelogTopic, partition, checkpoint, db, storeName, tm.cfg.RestoreCatchUpTimeout)
-		if err != nil {
-			_ = db.Close()
-			return fmt.Errorf("RestoreFromChangelog window store %q partition %d: %w", storeName, partition, err)
-		}
-
-		collector := &state.MutationCollector{}
-		producer, err := state.NewChangelogProducer(tm.cfg.Brokers, changelogTopic)
-		if err != nil {
-			_ = db.Close()
-			return fmt.Errorf("NewChangelogProducer window store %q: %w", storeName, err)
-		}
-
-		store := state.NewKeyValueStoreWithChangelog[[]byte, []byte](
-			storeName,
-			db,
-			gstream.BytesSerde{},
-			gstream.BytesSerde{},
-			collector,
-		)
-
-		stores[storeName] = store
-		collectors[storeName] = collector
-		producers[storeName] = producer
 	}
-
-	// [SESSION-FROZEN-EXT] Session store wiring — mirrors window store loop above.
 	for storeName, binding := range tm.bt.SessionStoreBindings {
-		changelogTopic := tm.appID + "-" + binding.ChangelogTopic + "-changelog"
-
-		checkpoint, found, err := state.ReadCheckpoint(db, storeName)
-		if err != nil {
-			_ = db.Close()
-			return fmt.Errorf("ReadCheckpoint session store %q: %w", storeName, err)
+		if err := openStore(storeName, binding.ChangelogTopic); err != nil {
+			cleanup()
+			return err
 		}
-		if !found {
-			checkpoint = -1
-		}
-
-		_, err = state.RestoreFromChangelog(ctx, tm.cfg.Brokers, changelogTopic, partition, checkpoint, db, storeName, tm.cfg.RestoreCatchUpTimeout)
-		if err != nil {
-			_ = db.Close()
-			return fmt.Errorf("RestoreFromChangelog session store %q partition %d: %w", storeName, partition, err)
-		}
-
-		collector := &state.MutationCollector{}
-		producer, err := state.NewChangelogProducer(tm.cfg.Brokers, changelogTopic)
-		if err != nil {
-			_ = db.Close()
-			return fmt.Errorf("NewChangelogProducer session store %q: %w", storeName, err)
-		}
-
-		store := state.NewKeyValueStoreWithChangelog[[]byte, []byte](
-			storeName,
-			db,
-			gstream.BytesSerde{},
-			gstream.BytesSerde{},
-			collector,
-		)
-
-		stores[storeName] = store
-		collectors[storeName] = collector
-		producers[storeName] = producer
 	}
 
 	// Merge global stores into the per-partition stores map AFTER per-partition stores
@@ -501,12 +433,9 @@ func (tm *TaskManager) openTask(ctx context.Context, partition int32) error {
 	var streamTime int64
 	// [SESSION-FROZEN-EXT] OR-extension: use stream-time executor for session stores too.
 	if len(tm.bt.WindowStoreBindings) > 0 || len(tm.bt.SessionStoreBindings) > 0 {
-		ts, _, err := state.ReadStreamTime(db)
+		ts, _, err := backend.ReadStreamTime()
 		if err != nil {
-			for _, p := range producers {
-				p.Close()
-			}
-			_ = db.Close()
+			cleanup()
 			return fmt.Errorf("ReadStreamTime partition %d: %w", partition, err)
 		}
 		streamTime = ts
@@ -515,8 +444,7 @@ func (tm *TaskManager) openTask(ctx context.Context, partition int32) error {
 	// Create the task first so its streamTime field has a stable address for the Executor
 	// (NewExecutorWithStreamTime stores &t.streamTime).
 	t := &task{
-		db:         db,
-		collectors: collectors,
+		backend:    backend,
 		producers:  producers,
 		stores:     stores,
 		partition:  partition,
@@ -556,15 +484,19 @@ func (tm *TaskManager) closeTask(ctx context.Context, partition int32) {
 		return
 	}
 
-	if t.db == nil {
+	if t.backend == nil {
 		tm.logger.Info("task closed (zero-store)", slog.Int("partition", int(partition)))
 		return
 	}
 
-	for storeName, collector := range t.collectors {
-		muts := collector.Drain()
+	for storeName, producer := range t.producers {
+		store, storeOK := t.stores[storeName].(gstream.Store)
+		if !storeOK {
+			continue
+		}
+		muts := store.DrainMutations()
 		if len(muts) > 0 {
-			if err := t.producers[storeName].Flush(ctx, partition, muts); err != nil {
+			if err := producer.Flush(ctx, partition, muts); err != nil {
 				tm.logger.Warn("closeTask: flush failed",
 					slog.Int("partition", int(partition)),
 					slog.String("store", storeName),
@@ -576,7 +508,7 @@ func (tm *TaskManager) closeTask(ctx context.Context, partition int32) {
 
 	// [SESSION-FROZEN-EXT] OR-extension: persist stream-time when session stores present.
 	if len(tm.bt.WindowStoreBindings) > 0 || len(tm.bt.SessionStoreBindings) > 0 {
-		if err := state.WriteStreamTime(t.db, t.streamTime); err != nil {
+		if err := t.backend.WriteStreamTime(t.streamTime); err != nil {
 			tm.logger.Warn("closeTask: WriteStreamTime failed",
 				slog.Int("partition", int(partition)),
 				slog.Any("error", err),
@@ -585,9 +517,9 @@ func (tm *TaskManager) closeTask(ctx context.Context, partition int32) {
 	}
 
 	for storeName, changelogTopic := range tm.allChangelogTopics() {
-		hw, err := state.RestoreFromChangelog(ctx, tm.cfg.Brokers, changelogTopic, partition, int64(^uint64(0)>>1), t.db, storeName, tm.cfg.RestoreCatchUpTimeout)
+		hw, err := RestoreFromChangelog(ctx, tm.cfg.Brokers, changelogTopic, partition, int64(^uint64(0)>>1), t.backend, storeName, tm.cfg.RestoreCatchUpTimeout)
 		if err == nil && hw > 0 {
-			if err := state.WriteCheckpointSync(t.db, storeName, hw-1); err != nil {
+			if err := t.backend.WriteCheckpoint(storeName, hw-1); err != nil {
 				tm.logger.Warn("closeTask: WriteCheckpointSync failed",
 					slog.Int("partition", int(partition)),
 					slog.String("store", storeName),
@@ -600,9 +532,14 @@ func (tm *TaskManager) closeTask(ctx context.Context, partition int32) {
 	for _, producer := range t.producers {
 		producer.Close()
 	}
+	for storeName := range t.producers {
+		if store, ok := t.stores[storeName].(gstream.Store); ok {
+			_ = store.Close()
+		}
+	}
 
-	if err := t.db.Close(); err != nil {
-		tm.logger.Warn("closeTask: pebble close failed",
+	if err := t.backend.Close(); err != nil {
+		tm.logger.Warn("closeTask: store backend close failed",
 			slog.Int("partition", int(partition)),
 			slog.Any("error", err),
 		)
@@ -644,7 +581,7 @@ func (tm *TaskManager) runSweep(t *task) error {
 	}
 
 	for storeName, binding := range tm.bt.WindowStoreBindings {
-		store, ok := t.stores[storeName].(*state.KeyValueStore[[]byte, []byte])
+		store, ok := t.stores[storeName].(gstream.Store)
 		if !ok {
 			return fmt.Errorf("runSweep: store %q: unexpected type %T", storeName, t.stores[storeName])
 		}
@@ -654,7 +591,7 @@ func (tm *TaskManager) runSweep(t *task) error {
 	}
 	// [SESSION-FROZEN-EXT] Session sweep — appended loop, no change to window path.
 	for storeName, binding := range tm.bt.SessionStoreBindings {
-		store, ok := t.stores[storeName].(*state.KeyValueStore[[]byte, []byte])
+		store, ok := t.stores[storeName].(gstream.Store)
 		if !ok {
 			return fmt.Errorf("runSweep: session store %q: unexpected type %T", storeName, t.stores[storeName])
 		}
@@ -686,7 +623,7 @@ func (tm *TaskManager) runSweep(t *task) error {
 // sweepWindowStore is a package-level function (not a method) so it can be exercised
 // in unit tests without a running Kafka broker.
 func sweepWindowStore(
-	store *state.KeyValueStore[[]byte, []byte],
+	store gstream.Store,
 	windowDef gstream.WindowDefinition,
 	graceMs, streamTime int64,
 ) (int, error) {
@@ -699,7 +636,7 @@ func sweepWindowStore(
 	// and must be copied before the next iterator step invalidates them.
 	var expired [][]byte
 	if err := store.Range(func(compositeKey, _ []byte) bool {
-		_, windowStart, decErr := state.DecodeWindowCompositeKey(compositeKey)
+		_, windowStart, decErr := decodeWindowCompositeKey(compositeKey)
 		if decErr != nil {
 			// Malformed key (should not happen with well-formed topologies): skip.
 			return true
@@ -740,7 +677,7 @@ func sweepWindowStore(
 // Each store.WindowDelete appends a tombstone Mutation to the store's MutationCollector.
 // The caller (PostBatch) drains the collector and flushes tombstones to the changelog.
 func sweepSessionStore(
-	store *state.KeyValueStore[[]byte, []byte],
+	store gstream.Store,
 	gapMs, graceMs, streamTime int64,
 ) (int, error) {
 	expiryBoundary := streamTime - gapMs - graceMs
@@ -755,7 +692,7 @@ func sweepSessionStore(
 
 	var expired []expiredEntry
 	if err := store.Range(func(compositeKey, val []byte) bool {
-		kBytes, sessionStart, decErr := state.DecodeWindowCompositeKey(compositeKey)
+		kBytes, sessionStart, decErr := decodeWindowCompositeKey(compositeKey)
 		if decErr != nil {
 			// Malformed composite key: skip.
 			return true
@@ -782,6 +719,19 @@ func sweepSessionStore(
 		}
 	}
 	return len(expired), nil
+}
+
+func decodeWindowCompositeKey(raw []byte) ([]byte, int64, error) {
+	if len(raw) < 12 {
+		return nil, 0, fmt.Errorf("window composite key too short: %d", len(raw))
+	}
+	keyLength := int(binary.BigEndian.Uint32(raw[:4]))
+	if len(raw) != 4+keyLength+8 {
+		return nil, 0, fmt.Errorf("window composite key length mismatch")
+	}
+	key := append([]byte(nil), raw[4:4+keyLength]...)
+	start := int64(binary.BigEndian.Uint64(raw[4+keyLength:]))
+	return key, start, nil
 }
 
 // collectPartitions flattens a topic→[]partition map into a deduplicated slice.

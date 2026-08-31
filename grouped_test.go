@@ -1,7 +1,7 @@
 // Package gstream_test provides broker-free tests for the stateful DSL
 // operators: GroupByKey, Count, and Aggregate. Tests live in package
 // gstream_test (external) rather than package gstream because
-// store/memory imports gstream (for Serde[T]), so a package-internal test
+// stores/memory imports gstream (for Serde[T]), so a package-internal test
 // that imports it would create a circular import.
 //
 // # Store type: []byte/[]byte (Option A)
@@ -19,8 +19,8 @@ import (
 	"testing"
 
 	"github.com/mortezaPRK/gstream"
+	memory "github.com/mortezaPRK/gstream/internal/testutil"
 	"github.com/mortezaPRK/gstream/internal/topology"
-	"github.com/mortezaPRK/gstream/store/memory"
 )
 
 // ---------------------------------------------------------------------------
@@ -32,7 +32,7 @@ import (
 // wired into a topology.Executor, and asserts store contents by decoding with
 // JSONSerde[int64].
 //
-// Pipeline: source[string,string] → GroupByKey → Count("wc")
+// Pipeline: source[string,string] → GroupByKey → Count("wc", memory.JSONSerde[int64]{})
 //
 // This test exercises store.Get/Put through public memory store, using same
 // byte-store contract as runtime. Aggregate StatefulProcessFunc encodes keys and
@@ -41,9 +41,9 @@ func TestGroupByKey_Count(t *testing.T) {
 	t.Parallel()
 
 	b := gstream.NewStreamBuilder()
-	src := gstream.Stream[string, string](b, "input", "src", gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{})
-	grouped := src.GroupByKey(gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{})
-	_ = grouped.Count("wc")
+	src := gstream.Stream[string, string](b, "input", "src", memory.JSONSerde[string]{}, memory.JSONSerde[string]{})
+	grouped := src.GroupByKey(memory.JSONSerde[string]{}, memory.JSONSerde[string]{})
+	_ = grouped.Count("wc", memory.JSONSerde[int64]{})
 
 	bt := b.Build()
 
@@ -65,7 +65,7 @@ func TestGroupByKey_Count(t *testing.T) {
 
 	// BytesSerde is the identity serde used by the runtime for the bytes boundary.
 	byteStore := memory.NewKeyValueStore[[]byte, []byte](
-		"wc", db, gstream.BytesSerde{}, gstream.BytesSerde{},
+		"wc", db, memory.BytesSerde{}, memory.BytesSerde{},
 	)
 
 	stores := map[string]any{"wc": byteStore}
@@ -84,8 +84,8 @@ func TestGroupByKey_Count(t *testing.T) {
 	// The Aggregate processor serialises counts via JSONSerde[int64] (Count delegates
 	// to Aggregate with accSerde = JSONSerde[int64]). The key is serialised by
 	// JSONSerde[string] — so "a" becomes the JSON bytes `"a"` (with quotes).
-	intSerde := gstream.JSONSerde[int64]{}
-	keySerde := gstream.JSONSerde[string]{}
+	intSerde := memory.JSONSerde[int64]{}
+	keySerde := memory.JSONSerde[string]{}
 
 	checkCount := func(key string, want int64) {
 		t.Helper()
@@ -129,8 +129,8 @@ func TestCount_NoBufferLeak(t *testing.T) {
 	t.Parallel()
 
 	b := gstream.NewStreamBuilder()
-	src := gstream.Stream[string, string](b, "input", "src", gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{})
-	_ = src.GroupByKey(gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{}).Count("wc-leak")
+	src := gstream.Stream[string, string](b, "input", "src", memory.JSONSerde[string]{}, memory.JSONSerde[string]{})
+	_ = src.GroupByKey(memory.JSONSerde[string]{}, memory.JSONSerde[string]{}).Count("wc-leak", memory.JSONSerde[int64]{})
 
 	bt := b.Build()
 
@@ -146,7 +146,7 @@ func TestCount_NoBufferLeak(t *testing.T) {
 	defer db.Close()
 
 	byteStore := memory.NewKeyValueStore[[]byte, []byte](
-		"wc-leak", db, gstream.BytesSerde{}, gstream.BytesSerde{},
+		"wc-leak", db, memory.BytesSerde{}, memory.BytesSerde{},
 	)
 	exec := topology.NewExecutor(bt.Topology, map[string]any{"wc-leak": byteStore})
 
@@ -177,8 +177,8 @@ func TestCount_NoBufferLeak(t *testing.T) {
 	}
 
 	// Sanity: the store actually counted all 1000 records.
-	keySerde := gstream.JSONSerde[string]{}
-	intSerde := gstream.JSONSerde[int64]{}
+	keySerde := memory.JSONSerde[string]{}
+	intSerde := memory.JSONSerde[int64]{}
 	kb, _ := keySerde.Serialize("k")
 	valBytes, found, err := byteStore.Get(kb)
 	if err != nil {
@@ -212,14 +212,14 @@ func TestGroupByKey_Aggregate(t *testing.T) {
 	t.Parallel()
 
 	b := gstream.NewStreamBuilder()
-	src := gstream.Stream[string, string](b, "input", "src", gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{})
-	grouped := src.GroupByKey(gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{})
+	src := gstream.Stream[string, string](b, "input", "src", memory.JSONSerde[string]{}, memory.JSONSerde[string]{})
+	grouped := src.GroupByKey(memory.JSONSerde[string]{}, memory.JSONSerde[string]{})
 
 	_ = grouped.Aggregate[int64](
 		"lensum",
 		func() int64 { return 0 },
 		func(_ string, v string, acc int64) int64 { return acc + int64(len(v)) },
-		gstream.JSONSerde[int64]{},
+		memory.JSONSerde[int64]{},
 	)
 
 	bt := b.Build()
@@ -237,7 +237,7 @@ func TestGroupByKey_Aggregate(t *testing.T) {
 	defer db.Close()
 
 	byteStore := memory.NewKeyValueStore[[]byte, []byte](
-		"lensum", db, gstream.BytesSerde{}, gstream.BytesSerde{},
+		"lensum", db, memory.BytesSerde{}, memory.BytesSerde{},
 	)
 	exec := topology.NewExecutor(bt.Topology, map[string]any{"lensum": byteStore})
 
@@ -250,8 +250,8 @@ func TestGroupByKey_Aggregate(t *testing.T) {
 	}
 
 	// Decode stored results and assert values.
-	keySerde := gstream.JSONSerde[string]{}
-	intSerde := gstream.JSONSerde[int64]{}
+	keySerde := memory.JSONSerde[string]{}
+	intSerde := memory.JSONSerde[int64]{}
 
 	checkSum := func(key string, want int64) {
 		t.Helper()
@@ -292,8 +292,8 @@ func TestKTable_StoreBinding_Fields(t *testing.T) {
 	t.Parallel()
 
 	b := gstream.NewStreamBuilder()
-	src := gstream.Stream[string, string](b, "input", "src", gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{})
-	_ = src.GroupByKey(gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{}).Count("my-store")
+	src := gstream.Stream[string, string](b, "input", "src", memory.JSONSerde[string]{}, memory.JSONSerde[string]{})
+	_ = src.GroupByKey(memory.JSONSerde[string]{}, memory.JSONSerde[string]{}).Count("my-store", memory.JSONSerde[int64]{})
 	bt := b.Build()
 
 	sb, ok := bt.StoreBindings["my-store"]
@@ -331,8 +331,8 @@ func TestAggregate_ByteStoreAssertionSucceeds(t *testing.T) {
 	t.Parallel()
 
 	b := gstream.NewStreamBuilder()
-	src := gstream.Stream[string, string](b, "input", "src", gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{})
-	_ = src.GroupByKey(gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{}).Count("tstore")
+	src := gstream.Stream[string, string](b, "input", "src", memory.JSONSerde[string]{}, memory.JSONSerde[string]{})
+	_ = src.GroupByKey(memory.JSONSerde[string]{}, memory.JSONSerde[string]{}).Count("tstore", memory.JSONSerde[int64]{})
 	bt := b.Build()
 
 	db, err := memory.OpenMemDB()
@@ -343,7 +343,7 @@ func TestAggregate_ByteStoreAssertionSucceeds(t *testing.T) {
 
 	// Supply the CORRECT byte store type.
 	byteStore := memory.NewKeyValueStore[[]byte, []byte](
-		"tstore", db, gstream.BytesSerde{}, gstream.BytesSerde{},
+		"tstore", db, memory.BytesSerde{}, memory.BytesSerde{},
 	)
 	exec := topology.NewExecutor(bt.Topology, map[string]any{"tstore": byteStore})
 
@@ -366,9 +366,9 @@ func TestKTable_To_SinkBindingRegistered(t *testing.T) {
 	t.Parallel()
 
 	b := gstream.NewStreamBuilder()
-	src := gstream.Stream[string, string](b, "input", "src", gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{})
-	table := src.GroupByKey(gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{}).Count("tosink-store")
-	table.To("my-sink-topic", gstream.JSONSerde[string]{}, gstream.JSONSerde[int64]{})
+	src := gstream.Stream[string, string](b, "input", "src", memory.JSONSerde[string]{}, memory.JSONSerde[string]{})
+	table := src.GroupByKey(memory.JSONSerde[string]{}, memory.JSONSerde[string]{}).Count("tosink-store", memory.JSONSerde[int64]{})
+	table.To("my-sink-topic", memory.JSONSerde[string]{}, memory.JSONSerde[int64]{})
 
 	bt := b.Build()
 
@@ -399,7 +399,7 @@ func TestKTable_To_SinkBindingRegistered(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EncodeKey(%q): %v", "hello", err)
 	}
-	gotKey, err := gstream.JSONSerde[string]{}.Deserialize(kb)
+	gotKey, err := memory.JSONSerde[string]{}.Deserialize(kb)
 	if err != nil {
 		t.Fatalf("decode EncodeKey result: %v", err)
 	}
@@ -412,7 +412,7 @@ func TestKTable_To_SinkBindingRegistered(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EncodeVal(42): %v", err)
 	}
-	gotVal, err := gstream.JSONSerde[int64]{}.Deserialize(vb)
+	gotVal, err := memory.JSONSerde[int64]{}.Deserialize(vb)
 	if err != nil {
 		t.Fatalf("decode EncodeVal result: %v", err)
 	}
@@ -437,8 +437,8 @@ func TestKTable_To_Absent(t *testing.T) {
 	t.Parallel()
 
 	b := gstream.NewStreamBuilder()
-	src := gstream.Stream[string, string](b, "input", "src", gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{})
-	_ = src.GroupByKey(gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{}).Count("no-to-store")
+	src := gstream.Stream[string, string](b, "input", "src", memory.JSONSerde[string]{}, memory.JSONSerde[string]{})
+	_ = src.GroupByKey(memory.JSONSerde[string]{}, memory.JSONSerde[string]{}).Count("no-to-store", memory.JSONSerde[int64]{})
 
 	bt := b.Build()
 
@@ -458,9 +458,9 @@ func TestKTable_To_RecordsReachSink(t *testing.T) {
 	t.Parallel()
 
 	b := gstream.NewStreamBuilder()
-	src := gstream.Stream[string, string](b, "input", "src", gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{})
-	table := src.GroupByKey(gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{}).Count("reach-store")
-	table.To("out-topic", gstream.JSONSerde[string]{}, gstream.JSONSerde[int64]{})
+	src := gstream.Stream[string, string](b, "input", "src", memory.JSONSerde[string]{}, memory.JSONSerde[string]{})
+	table := src.GroupByKey(memory.JSONSerde[string]{}, memory.JSONSerde[string]{}).Count("reach-store", memory.JSONSerde[int64]{})
+	table.To("out-topic", memory.JSONSerde[string]{}, memory.JSONSerde[int64]{})
 
 	bt := b.Build()
 
@@ -471,12 +471,12 @@ func TestKTable_To_RecordsReachSink(t *testing.T) {
 	defer db.Close()
 
 	byteStore := memory.NewKeyValueStore[[]byte, []byte](
-		"reach-store", db, gstream.BytesSerde{}, gstream.BytesSerde{},
+		"reach-store", db, memory.BytesSerde{}, memory.BytesSerde{},
 	)
 	exec := topology.NewExecutor(bt.Topology, map[string]any{"reach-store": byteStore})
 
-	keySerde := gstream.JSONSerde[string]{}
-	valSerde := gstream.JSONSerde[int64]{}
+	keySerde := memory.JSONSerde[string]{}
+	valSerde := memory.JSONSerde[int64]{}
 
 	// Find sink name for out-topic.
 	var sinkName string

@@ -12,7 +12,7 @@ package runtime_test
 // Topology:
 //
 //	Stream[string,string](input, "src") → SelectKey(rekey) →
-//	Repartition("rp", 2) → GroupByKey → Count("cnt")
+//	Repartition("rp", 2) → GroupByKey → Count("cnt", JSONSerde[int64]{})
 //
 // Repartition topic: <appID>-rp-repartition (2 partitions, cleanup.policy=delete)
 // Changelog topic:   <appID>-cnt-changelog  (2 partitions, cleanup.policy=compact)
@@ -54,7 +54,6 @@ import (
 	gstream "github.com/mortezaPRK/gstream"
 	kafkamodule "github.com/mortezaPRK/gstream/integration/kafka"
 	"github.com/mortezaPRK/gstream/internal/kafka"
-	"github.com/mortezaPRK/gstream/internal/runtime"
 	kgo "github.com/twmb/franz-go/pkg/kgo"
 )
 
@@ -138,7 +137,7 @@ func TestE2E_RepartitionDSL(t *testing.T) {
 		t.Logf("topics created: input=%s (2p), changelog=%s (2p compact), repartition=%s (2p delete)",
 			inputTopic, changelogTopic, repartTopic)
 
-		adapter, err := runtime.NewAdapter(bt, cfg, slog.Default())
+		adapter, err := newTestAdapter(bt, cfg, slog.Default())
 		if err != nil {
 			t.Fatalf("NewAdapter: %v", err)
 		}
@@ -286,7 +285,7 @@ func TestE2E_RepartitionDSL(t *testing.T) {
 		// Mirrors stateful E2E: cancel AFTER changelog confirms correct state so
 		// that the crash scenario is "commit race" not "incomplete state write".
 
-		adapter1, err := runtime.NewAdapter(bt1, cfg, slog.Default())
+		adapter1, err := newTestAdapter(bt1, cfg, slog.Default())
 		if err != nil {
 			t.Fatalf("NewAdapter run1: %v", err)
 		}
@@ -333,7 +332,7 @@ func TestE2E_RepartitionDSL(t *testing.T) {
 		// pass. If commit succeeded: no redelivery, counts stay at 1x.
 
 		bt2 := buildRepartCountTopology(inputTopic, storeName)
-		adapter2, err := runtime.NewAdapter(bt2, cfg, slog.Default())
+		adapter2, err := newTestAdapter(bt2, cfg, slog.Default())
 		if err != nil {
 			t.Fatalf("NewAdapter run2: %v", err)
 		}
@@ -434,14 +433,14 @@ func TestE2E_RepartitionDSL(t *testing.T) {
 // buildRepartCountTopology builds:
 //
 //	Stream[string,string](inputTopic, "src") → SelectKey → Repartition("rp",2) →
-//	GroupByKey → Count(storeName)
+//	GroupByKey → Count(storeName, JSONSerde[int64]{})
 //
 // SelectKey fn: key starting with 'a' or 'b' → "A", else → "D".
 // Repartition uses 2 partitions; repartition topic = <appID>-rp-repartition.
 func buildRepartCountTopology(inputTopic, storeName string) *gstream.BuiltTopology {
 	b := gstream.NewStreamBuilder()
-	ks := gstream.JSONSerde[string]{}
-	vs := gstream.JSONSerde[string]{}
+	ks := JSONSerde[string]{}
+	vs := JSONSerde[string]{}
 
 	gstream.Stream[string, string](b, inputTopic, "src", ks, vs).
 		SelectKey(func(k, _ string) string {
@@ -452,7 +451,7 @@ func buildRepartCountTopology(inputTopic, storeName string) *gstream.BuiltTopolo
 		}).
 		Repartition("rp", 2, ks, vs).
 		GroupByKey(ks, vs).
-		Count(storeName)
+		Count(storeName, JSONSerde[int64]{})
 
 	return b.Build()
 }
@@ -463,7 +462,7 @@ func buildRepartCountTopology(inputTopic, storeName string) *gstream.BuiltTopolo
 // and value — matching the topology's ks/vs serdes.
 func repartProduce(t *testing.T, ctx context.Context, brokers []string, topic string, inputs []struct{ key, value string }) {
 	t.Helper()
-	serde := gstream.JSONSerde[string]{}
+	serde := JSONSerde[string]{}
 	producer, err := kgo.NewClient(kgo.SeedBrokers(brokers...))
 	if err != nil {
 		t.Fatalf("repartProduce: new client: %v", err)

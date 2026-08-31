@@ -1,6 +1,6 @@
 // Package gstream_test provides broker-free tests for the stream-stream windowed
 // inner join (KStream.Join). Tests live in package gstream_test (external) to avoid
-// the import cycle: store/memory imports gstream via Serde[T].
+// the import cycle: stores/memory imports gstream via Serde[T].
 //
 // All tests use topology.NewExecutorWithStreamTime so stream-time advances correctly
 // and late-drop semantics are exercised. Two in-memory stores are wired
@@ -13,8 +13,8 @@ import (
 	"time"
 
 	"github.com/mortezaPRK/gstream"
+	memory "github.com/mortezaPRK/gstream/internal/testutil"
 	"github.com/mortezaPRK/gstream/internal/topology"
-	"github.com/mortezaPRK/gstream/store/memory"
 )
 
 // buildSSJoinTopology constructs the test topology:
@@ -33,23 +33,23 @@ func buildSSJoinTopology(t *testing.T, windows gstream.JoinWindows) (
 
 	left := gstream.Stream[string, string](
 		b, "left-topic", "lsrc",
-		gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{},
+		memory.JSONSerde[string]{}, memory.JSONSerde[string]{},
 	)
 	right := gstream.Stream[string, string](
 		b, "right-topic", "rsrc",
-		gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{},
+		memory.JSONSerde[string]{}, memory.JSONSerde[string]{},
 	)
 
 	joined := left.Join[string, string](
 		right,
 		func(v1, v2 string) string { return v1 + ":" + v2 },
 		windows,
-		gstream.JSONSerde[string]{},
-		gstream.JSONSerde[string]{},
-		gstream.JSONSerde[string]{},
-		gstream.JSONSerde[string]{},
+		memory.JSONSerde[string]{},
+		memory.JSONSerde[string]{},
+		memory.JSONSerde[string]{},
+		memory.JSONSerde[string]{},
 	)
-	joined.To("out-topic", "out", gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{})
+	joined.To("out-topic", "out", memory.JSONSerde[string]{}, memory.JSONSerde[string]{})
 
 	bt := b.Build()
 
@@ -82,10 +82,10 @@ func openJoinStores(t *testing.T, leftStoreName, rightStoreName string) (map[str
 	}
 
 	ls := memory.NewKeyValueStore[[]byte, []byte](
-		leftStoreName, db, gstream.BytesSerde{}, gstream.BytesSerde{},
+		leftStoreName, db, memory.BytesSerde{}, memory.BytesSerde{},
 	)
 	rs := memory.NewKeyValueStore[[]byte, []byte](
-		rightStoreName, db, gstream.BytesSerde{}, gstream.BytesSerde{},
+		rightStoreName, db, memory.BytesSerde{}, memory.BytesSerde{},
 	)
 
 	stores := map[string]any{

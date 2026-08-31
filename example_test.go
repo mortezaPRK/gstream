@@ -6,10 +6,11 @@ import (
 	"time"
 
 	gstream "github.com/mortezaPRK/gstream"
+	memory "github.com/mortezaPRK/gstream/internal/testutil"
 )
 
 func ExampleBytesSerde() {
-	s := gstream.BytesSerde{}
+	s := memory.BytesSerde{}
 	in := []byte("hello")
 
 	enc, _ := s.Serialize(in)
@@ -22,7 +23,7 @@ func ExampleBytesSerde() {
 func ExampleJSONSerde() {
 	type Point struct{ X, Y int }
 
-	s := gstream.JSONSerde[Point]{}
+	s := memory.JSONSerde[Point]{}
 	in := Point{X: 3, Y: 7}
 
 	enc, _ := s.Serialize(in)
@@ -40,12 +41,12 @@ func ExampleStream() {
 	b := gstream.NewStreamBuilder()
 
 	src := gstream.Stream[string, string](b, "input-topic", "src",
-		gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{})
+		memory.JSONSerde[string]{}, memory.JSONSerde[string]{})
 
 	src.
 		Filter(func(k, v string) bool { return strings.HasPrefix(v, "keep:") }).
 		MapValues(func(_ string, v string) string { return strings.TrimPrefix(v, "keep:") }).
-		To("output-topic", "sink", gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{})
+		To("output-topic", "sink", memory.JSONSerde[string]{}, memory.JSONSerde[string]{})
 
 	bt := b.Build()
 
@@ -61,11 +62,11 @@ func ExampleStream() {
 func ExampleKStream_Filter() {
 	b := gstream.NewStreamBuilder()
 	src := gstream.Stream[string, int](b, "events", "src",
-		gstream.JSONSerde[string]{}, gstream.JSONSerde[int]{})
+		memory.JSONSerde[string]{}, memory.JSONSerde[int]{})
 
 	src.
 		Filter(func(_ string, v int) bool { return v > 0 }).
-		To("positive-events", "sink", gstream.JSONSerde[string]{}, gstream.JSONSerde[int]{})
+		To("positive-events", "sink", memory.JSONSerde[string]{}, memory.JSONSerde[int]{})
 
 	_ = b.Build() // topology sealed; ready to pass to runtime.NewAdapter
 }
@@ -77,11 +78,11 @@ func ExampleKStream_Map() {
 
 	// Map changes both key and value type; marks a repartition boundary.
 	gstream.Stream[string, int](b, "numbers", "src",
-		gstream.JSONSerde[string]{}, gstream.JSONSerde[int]{}).
+		memory.JSONSerde[string]{}, memory.JSONSerde[int]{}).
 		Map(func(k string, v int) (string, string) {
 			return k + "-mapped", fmt.Sprintf("%d", v*2)
 		}).
-		To("doubled", "sink", gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{})
+		To("doubled", "sink", memory.JSONSerde[string]{}, memory.JSONSerde[string]{})
 
 	_ = b.Build()
 }
@@ -90,11 +91,11 @@ func ExampleKStream_Map() {
 func ExampleKStream_GroupByKey() {
 	b := gstream.NewStreamBuilder()
 	src := gstream.Stream[string, string](b, "clicks", "src",
-		gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{})
+		memory.JSONSerde[string]{}, memory.JSONSerde[string]{})
 
 	src.
-		GroupByKey(gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{}).
-		Count("click-counts")
+		GroupByKey(memory.JSONSerde[string]{}, memory.JSONSerde[string]{}).
+		Count("click-counts", memory.JSONSerde[int64]{})
 
 	bt := b.Build()
 	_, hasStore := bt.StoreBindings["click-counts"]

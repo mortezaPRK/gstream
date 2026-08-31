@@ -1,7 +1,7 @@
 package kafka
 
 import (
-	"github.com/mortezaPRK/gstream/logging"
+	gstream "github.com/mortezaPRK/gstream"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
@@ -9,10 +9,10 @@ import (
 // emitted through the application's structured logger. This keeps franz-go
 // internal details hidden from the public API (§13).
 type kgoLogger struct {
-	l logging.Logger
+	l gstream.Logger
 }
 
-func newKgoLogger(l logging.Logger) kgo.Logger {
+func newKgoLogger(l gstream.Logger) kgo.Logger {
 	return &kgoLogger{l: l}
 }
 

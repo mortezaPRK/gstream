@@ -15,11 +15,11 @@ import (
 // runtime. The runtime supplies a *state.KeyValueStore[[]byte,[]byte] which
 // satisfies this interface via its RangeForKey / WindowPut / WindowDelete methods.
 //
-// Using a narrow interface avoids importing store/pebble directly (which would
-// create an import cycle: store/pebble → gstream via Serde[T]).
+// Using a narrow interface avoids importing stores/pebble directly (which would
+// create an import cycle: stores/pebble → gstream via Serde[T]).
 //
 // RangeForKey is a T1-amendment method that decodes composite keys store-side and
-// hands sessionStart directly to the DSL, keeping key-format knowledge in store/pebble.
+// hands sessionStart directly to the DSL, keeping key-format knowledge in stores/pebble.
 type sessionStore interface {
 	// RangeForKey iterates all entries stored under kBytes, calling fn with each
 	// entry's sessionStart (int64) and raw value bytes (safe to retain).
@@ -99,14 +99,14 @@ func (s SessionWindowedStream[K, V]) LateCount() int64 {
 }
 
 // Count accumulates the number of records per session key, storing counts in storeName.
-// Delegates to Aggregate[int64] with zero=0, agg=+1, merge=a+b, JSONSerde[int64].
-func (s SessionWindowedStream[K, V]) Count(storeName string) KTable[Windowed[K], int64] {
+// countSerde controls persisted count encoding.
+func (s SessionWindowedStream[K, V]) Count(storeName string, countSerde Serde[int64]) KTable[Windowed[K], int64] {
 	return s.Aggregate[int64](
 		storeName,
 		func() int64 { return 0 },
 		func(_ K, _ V, acc int64) int64 { return acc + 1 },
 		func(_ K, a, b int64) int64 { return a + b },
-		JSONSerde[int64]{},
+		countSerde,
 	)
 }
 
@@ -272,7 +272,7 @@ func (s SessionWindowedStream[K, V]) Aggregate[A any](
 
 	// Register SessionStoreBinding so the runtime can open the store and configure
 	// the session sweeper. EncodeKey/DecodeKey are stubs: the active processing path
-	// uses the sessionStore interface. gstream cannot import store/pebble (cycle).
+	// uses the sessionStore interface. gstream cannot import stores/pebble (cycle).
 	s.builder.sessionStores[storeName] = SessionStoreBinding{
 		StoreBinding: StoreBinding{
 			StoreName:      storeName,
@@ -311,8 +311,8 @@ func (s SessionWindowedStream[K, V]) Aggregate[A any](
 //
 //	int64(sessionEnd) big-endian (8 bytes) ‖ accBytes
 //
-// This format is owned by the gstream package (not store/pebble), so the DSL
-// can decode it without importing store/pebble.
+// This format is owned by the gstream package (not stores/pebble), so the DSL
+// can decode it without importing stores/pebble.
 // Exported so T4 runtime sweep can reuse it.
 func EncodeSessionValue(sessionEnd int64, accBytes []byte) []byte {
 	out := make([]byte, 8+len(accBytes))

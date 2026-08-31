@@ -9,6 +9,7 @@ import (
 	"time"
 
 	gstream "github.com/mortezaPRK/gstream"
+	state "github.com/mortezaPRK/gstream/internal/testutil"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
@@ -340,12 +341,12 @@ func TestPrepareTopologyCreatesOnlyInternalTopics(t *testing.T) {
 
 	builder := gstream.NewStreamBuilder()
 	gstream.Stream[string, string](
-		builder, "input", "source", gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{},
+		builder, "input", "source", state.JSONSerde[string]{}, state.JSONSerde[string]{},
 	).
 		SelectKey(func(_ string, value string) string { return value }).
-		GroupByKey(gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{}).
-		Count("counts").
-		To("output", gstream.JSONSerde[string]{}, gstream.JSONSerde[int64]{})
+		GroupByKey(state.JSONSerde[string]{}, state.JSONSerde[string]{}).
+		Count("counts", state.JSONSerde[int64]{}).
+		To("output", state.JSONSerde[string]{}, state.JSONSerde[int64]{})
 	topology := builder.Build()
 	cfg := gstream.Config{ApplicationID: "planner", Brokers: brokers}
 	if err := PrepareTopology(ctx, cfg, topology); err != nil {
@@ -383,8 +384,8 @@ func TestPrepareTopologyCreatesOnlyInternalTopics(t *testing.T) {
 	missingBuilder := gstream.NewStreamBuilder()
 	gstream.Stream[string, string](
 		missingBuilder, "missing-input", "source",
-		gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{},
-	).To("output", "sink", gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{})
+		state.JSONSerde[string]{}, state.JSONSerde[string]{},
+	).To("output", "sink", state.JSONSerde[string]{}, state.JSONSerde[string]{})
 	err = PrepareTopology(ctx, cfg, missingBuilder.Build())
 	if err == nil || !strings.Contains(err.Error(), "missing-input") {
 		t.Fatalf("missing caller topic error = %v, want named failure", err)

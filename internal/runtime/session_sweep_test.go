@@ -8,7 +8,7 @@ import (
 	"testing"
 
 	gstream "github.com/mortezaPRK/gstream"
-	state "github.com/mortezaPRK/gstream/store/pebble"
+	state "github.com/mortezaPRK/gstream/internal/testutil"
 )
 
 // encodeSessionValue builds the session value wire format:
@@ -44,7 +44,7 @@ func TestSweepSessionStore_DeletesExpiredByEnd(t *testing.T) {
 
 	collector := &state.MutationCollector{}
 	store := state.NewKeyValueStoreWithChangelog[[]byte, []byte](
-		"sess", db, gstream.BytesSerde{}, gstream.BytesSerde{}, collector,
+		"sess", db, state.BytesSerde{}, state.BytesSerde{}, collector,
 	)
 
 	kBytes := []byte("alice")
@@ -122,7 +122,7 @@ func TestSweepSessionStore_AmortizationSkip(t *testing.T) {
 
 	collector := &state.MutationCollector{}
 	store := state.NewKeyValueStoreWithChangelog[[]byte, []byte](
-		"sess", db, gstream.BytesSerde{}, gstream.BytesSerde{}, collector,
+		"sess", db, state.BytesSerde{}, state.BytesSerde{}, collector,
 	)
 
 	kBytes := []byte("bob")

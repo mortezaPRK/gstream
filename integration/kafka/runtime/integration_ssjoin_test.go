@@ -59,7 +59,6 @@ import (
 
 	gstream "github.com/mortezaPRK/gstream"
 	"github.com/mortezaPRK/gstream/internal/kafka"
-	"github.com/mortezaPRK/gstream/internal/runtime"
 	"github.com/testcontainers/testcontainers-go"
 	kafkamodule "github.com/testcontainers/testcontainers-go/modules/kafka"
 	kgo "github.com/twmb/franz-go/pkg/kgo"
@@ -157,7 +156,7 @@ func TestE2E_StreamStreamJoin(t *testing.T) {
 
 	bt1 := buildSSJoinTopology(leftTopic, rightTopic, outTopic)
 
-	adapter1, err := runtime.NewAdapter(bt1, cfg, slog.Default())
+	adapter1, err := newTestAdapter(bt1, cfg, slog.Default())
 	if err != nil {
 		t.Fatalf("NewAdapter p1: %v", err)
 	}
@@ -206,7 +205,7 @@ func TestE2E_StreamStreamJoin(t *testing.T) {
 	done1 := make(chan error, 1)
 	go func() { done1 <- client1.Run(run1Ctx, adapter1.ProcessFunc()) }()
 
-	ks := gstream.JSONSerde[string]{}
+	ks := JSONSerde[string]{}
 
 	// --- Case 1: LEFT_THEN_RIGHT ---
 	// left(k1, "L1", ts=10000) then right(k1, "R1", ts=10001).
@@ -314,7 +313,7 @@ func TestE2E_StreamStreamJoin(t *testing.T) {
 	// ==========================================================================
 
 	bt1b := buildSSJoinTopology(leftTopic, rightTopic, outTopic)
-	adapter1b, err := runtime.NewAdapter(bt1b, cfg, slog.Default())
+	adapter1b, err := newTestAdapter(bt1b, cfg, slog.Default())
 	if err != nil {
 		t.Fatalf("NewAdapter p1b: %v", err)
 	}
@@ -373,7 +372,7 @@ func TestE2E_StreamStreamJoin(t *testing.T) {
 
 	// Build client2 — same appID+stateDir → same store names → same changelog topics.
 	bt2 := buildSSJoinTopology(leftTopic, rightTopic, outTopic)
-	adapter2, err := runtime.NewAdapter(bt2, cfg, slog.Default())
+	adapter2, err := newTestAdapter(bt2, cfg, slog.Default())
 	if err != nil {
 		t.Fatalf("NewAdapter p2: %v", err)
 	}
@@ -468,9 +467,9 @@ func TestE2E_StreamStreamJoin(t *testing.T) {
 // JoinWindows{Before:5s, After:5s, Grace:1s}: symmetric, much larger than test deltas.
 func buildSSJoinTopology(leftTopic, rightTopic, outTopic string) *gstream.BuiltTopology {
 	b := gstream.NewStreamBuilder()
-	ks := gstream.JSONSerde[string]{}
-	vs := gstream.JSONSerde[string]{}
-	outSerde := gstream.JSONSerde[string]{}
+	ks := JSONSerde[string]{}
+	vs := JSONSerde[string]{}
+	outSerde := JSONSerde[string]{}
 
 	left := gstream.Stream[string, string](b, leftTopic, "lsrc", ks, vs)
 	right := gstream.Stream[string, string](b, rightTopic, "rsrc", ks, vs)
@@ -510,7 +509,7 @@ func produceSSJoinRecord(
 	brokers []string,
 	topic, key, value string,
 	tsMs int64,
-	serde gstream.JSONSerde[string],
+	serde JSONSerde[string],
 ) {
 	t.Helper()
 	kb, _ := serde.Serialize(key)
@@ -546,7 +545,7 @@ func pollSSJoinChangelog(
 	ctx context.Context,
 	brokers []string,
 	topic, storeName string,
-	serde gstream.JSONSerde[string],
+	serde JSONSerde[string],
 	wantKey string,
 	wantWindowStart int64,
 ) {
@@ -611,7 +610,7 @@ func ssJoinWaitOutput(
 	timeout time.Duration,
 ) []ssJoinOutputRecord {
 	t.Helper()
-	serde := gstream.JSONSerde[string]{}
+	serde := JSONSerde[string]{}
 	readyCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -663,7 +662,7 @@ func ssJoinDecodeWindowKey(raw []byte) (kBytes []byte, windowStart int64, ok boo
 // Not called in production paths; left for diagnosing hangs.
 func ssJoinDumpChangelog(t *testing.T, ctx context.Context, brokers []string, topic, storeName string) {
 	t.Helper()
-	serde := gstream.JSONSerde[string]{}
+	serde := JSONSerde[string]{}
 	readyCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 

@@ -1,6 +1,6 @@
 // Package winkey owns the single canonical composite-key format used by all
 // windowed and stream-stream-join stores.  It has zero dependencies outside the
-// standard library, which means both store/pebble and gstream (which cannot
+// standard library, which means both stores/pebble and gstream (which cannot
 // import each other due to a Serde[T] import cycle) can safely import it.
 //
 // Format: uint32(len(kBytes)) big-endian | kBytes | int64(windowStart) big-endian

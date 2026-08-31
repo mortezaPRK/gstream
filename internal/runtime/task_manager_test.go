@@ -8,8 +8,8 @@ import (
 	gstream "github.com/mortezaPRK/gstream"
 	"github.com/mortezaPRK/gstream/internal/kafka"
 	"github.com/mortezaPRK/gstream/internal/runtime"
+	state "github.com/mortezaPRK/gstream/internal/testutil"
 	"github.com/mortezaPRK/gstream/internal/topology"
-	state "github.com/mortezaPRK/gstream/store/pebble"
 )
 
 // ---------------------------------------------------------------------------
@@ -27,12 +27,12 @@ func buildStatefulTopology(t *testing.T) *gstream.BuiltTopology {
 		b,
 		"input-topic",
 		"source",
-		gstream.JSONSerde[string]{},
-		gstream.JSONSerde[string]{},
+		state.JSONSerde[string]{},
+		state.JSONSerde[string]{},
 	)
 	// Count produces a ktable-out internal sink; the public sinks map is empty.
-	src.GroupByKey(gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{}).
-		Count("word-count")
+	src.GroupByKey(state.JSONSerde[string]{}, state.JSONSerde[string]{}).
+		Count("word-count", state.JSONSerde[int64]{})
 	return b.Build()
 }
 
@@ -336,7 +336,7 @@ func TestExecutor_PerPartitionIndependence(t *testing.T) {
 
 // TestBuildByteStoreAndExecuteCount verifies the EXACT construction path used by
 // TaskManager.openTask (OnAssigned): a stores map built with
-// NewKeyValueStoreWithChangelog[[]byte,[]byte] using gstream.BytesSerde{} is wired
+// NewKeyValueStoreWithChangelog[[]byte,[]byte] using state.BytesSerde{} is wired
 // into a topology.Executor, and a Count processor runs end-to-end without error.
 //
 // This test is the runtime-level regression guard for the type-erasure boundary bug
@@ -358,10 +358,10 @@ func TestBuildByteStoreAndExecuteCount(t *testing.T) {
 	b := gstream.NewStreamBuilder()
 	src := gstream.Stream[string, string](
 		b, "input-topic", "source",
-		gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{},
+		state.JSONSerde[string]{}, state.JSONSerde[string]{},
 	)
-	src.GroupByKey(gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{}).
-		Count("word-count")
+	src.GroupByKey(state.JSONSerde[string]{}, state.JSONSerde[string]{}).
+		Count("word-count", state.JSONSerde[int64]{})
 	bt := b.Build()
 
 	// Construct the stores map the same way TaskManager.openTask does.
@@ -377,8 +377,8 @@ func TestBuildByteStoreAndExecuteCount(t *testing.T) {
 		byteStore := state.NewKeyValueStoreWithChangelog[[]byte, []byte](
 			storeName,
 			db,
-			gstream.BytesSerde{},
-			gstream.BytesSerde{},
+			state.BytesSerde{},
+			state.BytesSerde{},
 			nil, // no changelog capture needed for this unit test
 		)
 		stores[storeName] = byteStore
@@ -395,8 +395,8 @@ func TestBuildByteStoreAndExecuteCount(t *testing.T) {
 
 	// Read back from the byte store and verify counts.
 	byteStore := stores["word-count"].(*state.KeyValueStore[[]byte, []byte])
-	keySerde := gstream.JSONSerde[string]{}
-	intSerde := gstream.JSONSerde[int64]{}
+	keySerde := state.JSONSerde[string]{}
+	intSerde := state.JSONSerde[int64]{}
 
 	checkCount := func(key string, want int64) {
 		t.Helper()
@@ -436,7 +436,7 @@ func buildZeroStoreBuiltTopology(t *testing.T) *gstream.BuiltTopology {
 	src := b.AddSource("source")
 	b.AddSink("sink", src)
 	topo := b.Build()
-	strSerde := gstream.JSONSerde[string]{}
+	strSerde := state.JSONSerde[string]{}
 	return &gstream.BuiltTopology{
 		Topology: topo,
 		Sources: map[string]gstream.SourceBinding{
@@ -543,10 +543,10 @@ func TestAllChangelogTopics_ExcludesGlobalStores(t *testing.T) {
 	b := gstream.NewStreamBuilder()
 	src := gstream.Stream[string, string](
 		b, "input-topic", "source",
-		gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{},
+		state.JSONSerde[string]{}, state.JSONSerde[string]{},
 	)
-	src.GroupByKey(gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{}).
-		Count("regular-store")
+	src.GroupByKey(state.JSONSerde[string]{}, state.JSONSerde[string]{}).
+		Count("regular-store", state.JSONSerde[int64]{})
 	bt := b.Build()
 
 	// Manually inject a GlobalTableBinding into the built topology so the test
@@ -602,7 +602,7 @@ func TestCloseTask_DoesNotCloseGlobalStore(t *testing.T) {
 	defer db.Close()
 
 	sharedStore := state.NewKeyValueStore[[]byte, []byte](
-		"global-store", db, gstream.BytesSerde{}, gstream.BytesSerde{},
+		"global-store", db, state.BytesSerde{}, state.BytesSerde{},
 	)
 	tm.RegisterGlobalStore("global-store", sharedStore)
 
@@ -738,7 +738,7 @@ func TestDrainChangelogRecords_EncodesAndPinsPartition(t *testing.T) {
 
 	collector := &state.MutationCollector{}
 	byteStore := state.NewKeyValueStoreWithChangelog[[]byte, []byte](
-		storeName, db, gstream.BytesSerde{}, gstream.BytesSerde{}, collector,
+		storeName, db, state.BytesSerde{}, state.BytesSerde{}, collector,
 	)
 
 	// Write a value so the collector captures a Put mutation.
@@ -809,7 +809,7 @@ func TestDrainChangelogRecords_DeleteProducesTombstone(t *testing.T) {
 
 	collector := &state.MutationCollector{}
 	byteStore := state.NewKeyValueStoreWithChangelog[[]byte, []byte](
-		storeName, db, gstream.BytesSerde{}, gstream.BytesSerde{}, collector,
+		storeName, db, state.BytesSerde{}, state.BytesSerde{}, collector,
 	)
 
 	// Put then Delete so only the Delete remains in the collector.

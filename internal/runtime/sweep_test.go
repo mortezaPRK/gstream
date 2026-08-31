@@ -9,13 +9,13 @@ import (
 	"time"
 
 	gstream "github.com/mortezaPRK/gstream"
+	state "github.com/mortezaPRK/gstream/internal/testutil"
 	"github.com/mortezaPRK/gstream/internal/topology"
-	state "github.com/mortezaPRK/gstream/store/pebble"
 )
 
 // buildWindowedTopology builds a BuiltTopology with a windowed Count store:
 //
-//	KStream[string,string] → GroupByKey → WindowedBy(Tumbling 10s).WithGrace(0s).Count("wc")
+//	KStream[string,string] → GroupByKey → WindowedBy(Tumbling 10s).WithGrace(0s).Count("wc", state.JSONSerde[int64]{})
 //
 // Returns the BuiltTopology and the WindowStoreBinding for "wc".
 func buildWindowedTopology(t *testing.T) *gstream.BuiltTopology {
@@ -25,13 +25,13 @@ func buildWindowedTopology(t *testing.T) *gstream.BuiltTopology {
 		b,
 		"input-topic",
 		"source",
-		gstream.JSONSerde[string]{},
-		gstream.JSONSerde[string]{},
+		state.JSONSerde[string]{},
+		state.JSONSerde[string]{},
 	)
-	src.GroupByKey(gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{}).
-		WindowedBy(gstream.TumblingWindows(10 * time.Second)).
+	src.GroupByKey(state.JSONSerde[string]{}, state.JSONSerde[string]{}).
+		WindowedBy(gstream.TumblingWindows(10*time.Second)).
 		WithGrace(0).
-		Count("wc")
+		Count("wc", state.JSONSerde[int64]{})
 	return b.Build()
 }
 
@@ -63,8 +63,8 @@ func TestSweepWindowStore_DeletesExpiredAndEmitsTombstone(t *testing.T) {
 	store := state.NewKeyValueStoreWithChangelog[[]byte, []byte](
 		"wc",
 		db,
-		gstream.BytesSerde{},
-		gstream.BytesSerde{},
+		state.BytesSerde{},
+		state.BytesSerde{},
 		collector,
 	)
 
@@ -77,7 +77,7 @@ func TestSweepWindowStore_DeletesExpiredAndEmitsTombstone(t *testing.T) {
 
 	feed := func(key string, tsMs int64) {
 		t.Helper()
-		kbytes, err := gstream.JSONSerde[string]{}.Serialize(key)
+		kbytes, err := state.JSONSerde[string]{}.Serialize(key)
 		if err != nil {
 			t.Fatalf("serialize key: %v", err)
 		}
@@ -102,7 +102,7 @@ func TestSweepWindowStore_DeletesExpiredAndEmitsTombstone(t *testing.T) {
 	// Verify counts via the byte store.
 	checkWindowCount := func(key string, windowStartMs int64, wantCount int64) {
 		t.Helper()
-		kbytes, err := gstream.JSONSerde[string]{}.Serialize(key)
+		kbytes, err := state.JSONSerde[string]{}.Serialize(key)
 		if err != nil {
 			t.Fatalf("serialize key %q: %v", key, err)
 		}
@@ -113,7 +113,7 @@ func TestSweepWindowStore_DeletesExpiredAndEmitsTombstone(t *testing.T) {
 		if !found {
 			t.Fatalf("WindowGet(%q, %d): key not found", key, windowStartMs)
 		}
-		got, err := gstream.JSONSerde[int64]{}.Deserialize(valBytes)
+		got, err := state.JSONSerde[int64]{}.Deserialize(valBytes)
 		if err != nil {
 			t.Fatalf("deserialize count: %v", err)
 		}
@@ -152,7 +152,7 @@ func TestSweepWindowStore_DeletesExpiredAndEmitsTombstone(t *testing.T) {
 	}
 
 	// Verify the key is gone from the store.
-	kbytes, _ := gstream.JSONSerde[string]{}.Serialize("foo")
+	kbytes, _ := state.JSONSerde[string]{}.Serialize("foo")
 	_, found, err := store.WindowGet(kbytes, 0)
 	if err != nil {
 		t.Fatalf("WindowGet after sweep: %v", err)
@@ -206,12 +206,12 @@ func TestSweepWindowStore_AmortizationSkipsEarlyCall(t *testing.T) {
 
 	collector := &state.MutationCollector{}
 	store := state.NewKeyValueStoreWithChangelog[[]byte, []byte](
-		"wc", db, gstream.BytesSerde{}, gstream.BytesSerde{}, collector,
+		"wc", db, state.BytesSerde{}, state.BytesSerde{}, collector,
 	)
 
 	// Write an entry that would be expired at high stream-time.
-	kbytes, _ := gstream.JSONSerde[string]{}.Serialize("key")
-	valBytes, _ := gstream.JSONSerde[int64]{}.Serialize(1)
+	kbytes, _ := state.JSONSerde[string]{}.Serialize("key")
+	valBytes, _ := state.JSONSerde[int64]{}.Serialize(1)
 	if err := store.WindowPut(kbytes, 0, valBytes); err != nil {
 		t.Fatalf("WindowPut: %v", err)
 	}
@@ -228,9 +228,8 @@ func TestSweepWindowStore_AmortizationSkipsEarlyCall(t *testing.T) {
 
 	// Set up a fake task where lastSweepTime == streamTime (no advancement).
 	fakeTask := &task{
-		db:            db,
+		backend:       db,
 		stores:        map[string]any{"wc": store},
-		collectors:    map[string]*state.MutationCollector{"wc": collector},
 		streamTime:    25000,
 		lastSweepTime: 25000, // no advancement since last sweep
 	}
@@ -274,7 +273,7 @@ func TestWindowStoreWiring_ExecutorProcessesAndSweep(t *testing.T) {
 	// Build stores map the same way openTask does.
 	collector := &state.MutationCollector{}
 	store := state.NewKeyValueStoreWithChangelog[[]byte, []byte](
-		"wc", db, gstream.BytesSerde{}, gstream.BytesSerde{}, collector,
+		"wc", db, state.BytesSerde{}, state.BytesSerde{}, collector,
 	)
 	stores := map[string]any{"wc": store}
 
@@ -304,12 +303,12 @@ func TestWindowStoreWiring_ExecutorProcessesAndSweep(t *testing.T) {
 	}
 
 	// "bar" in [0, 10000) should have count=2 (the ts=25000 record opened [20000, 30000)).
-	kbytes, _ := gstream.JSONSerde[string]{}.Serialize("bar")
+	kbytes, _ := state.JSONSerde[string]{}.Serialize("bar")
 	valBytes, found, err := store.WindowGet(kbytes, 0)
 	if err != nil || !found {
 		t.Fatalf("WindowGet('bar',0): found=%v err=%v", found, err)
 	}
-	count, _ := gstream.JSONSerde[int64]{}.Deserialize(valBytes)
+	count, _ := state.JSONSerde[int64]{}.Deserialize(valBytes)
 	if count != 2 {
 		t.Errorf("count['bar'][0]: got %d, want 2", count)
 	}
@@ -344,7 +343,7 @@ func TestWindowStoreWiring_ExecutorProcessesAndSweep(t *testing.T) {
 	if !found2 {
 		t.Error("window [20000,30000) should NOT have been deleted by sweep")
 	}
-	count2, _ := gstream.JSONSerde[int64]{}.Deserialize(valBytes2)
+	count2, _ := state.JSONSerde[int64]{}.Deserialize(valBytes2)
 	if count2 != 1 {
 		t.Errorf("count['bar'][20000]: got %d, want 1", count2)
 	}

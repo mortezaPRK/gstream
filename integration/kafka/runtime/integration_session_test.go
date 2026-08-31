@@ -73,8 +73,7 @@ import (
 	gstream "github.com/mortezaPRK/gstream"
 	kafkamodule "github.com/mortezaPRK/gstream/integration/kafka"
 	"github.com/mortezaPRK/gstream/internal/kafka"
-	"github.com/mortezaPRK/gstream/internal/runtime"
-	state "github.com/mortezaPRK/gstream/store/pebble"
+	state "github.com/mortezaPRK/gstream/stores/pebble"
 	kgo "github.com/twmb/franz-go/pkg/kgo"
 )
 
@@ -161,7 +160,7 @@ func TestE2E_SessionCountRestoreAfterRestart(t *testing.T) {
 	// =========================================================================
 
 	bt1 := buildSessionCountTopology(srcTopic, storeName)
-	adapter1, err := runtime.NewAdapter(bt1, cfg, slog.Default())
+	adapter1, err := newTestAdapter(bt1, cfg, slog.Default())
 	if err != nil {
 		t.Fatalf("NewAdapter p1: %v", err)
 	}
@@ -180,7 +179,7 @@ func TestE2E_SessionCountRestoreAfterRestart(t *testing.T) {
 
 	// Batch A: create session a[1000,3000]=2.
 	// gap=10000ms; 3000-1000=2000ms < gap → both records merge.
-	produceWindowedRecords(t, ctx, brokers, srcTopic, gstream.JSONSerde[string]{}, []windowedRecord{
+	produceWindowedRecords(t, ctx, brokers, srcTopic, JSONSerde[string]{}, []windowedRecord{
 		{key: "a", value: "x", tsMs: 1_000},
 		{key: "a", value: "x", tsMs: 3_000},
 	})
@@ -196,7 +195,7 @@ func TestE2E_SessionCountRestoreAfterRestart(t *testing.T) {
 
 	// Batch B: create session a[14000,16000]=2.
 	// 14000-3000=11000ms > gap=10000ms → second session does NOT merge with first.
-	produceWindowedRecords(t, ctx, brokers, srcTopic, gstream.JSONSerde[string]{}, []windowedRecord{
+	produceWindowedRecords(t, ctx, brokers, srcTopic, JSONSerde[string]{}, []windowedRecord{
 		{key: "a", value: "x", tsMs: 14_000},
 		{key: "a", value: "x", tsMs: 16_000},
 	})
@@ -215,7 +214,7 @@ func TestE2E_SessionCountRestoreAfterRestart(t *testing.T) {
 	//   session[1000,3000]:   3000+10000=13000 >= 8000 ✓;  1000-10000=-9000 <= 8000 ✓
 	//   session[14000,16000]: 16000+10000=26000 >= 8000 ✓; 14000-10000=4000 <= 8000 ✓
 	// → merge [1000,16000] count=5; tombstones for sStart=1000 and sStart=14000.
-	produceWindowedRecords(t, ctx, brokers, srcTopic, gstream.JSONSerde[string]{}, []windowedRecord{
+	produceWindowedRecords(t, ctx, brokers, srcTopic, JSONSerde[string]{}, []windowedRecord{
 		{key: "a", value: "x", tsMs: 8_000},
 	})
 	t.Log("phase-1 batchC: produced bridge a@8000 (merges [1000,3000] and [14000,16000] → [1000,16000] count=5)")
@@ -243,7 +242,7 @@ func TestE2E_SessionCountRestoreAfterRestart(t *testing.T) {
 	t.Log("phase-1 batchC: MERGE PROVEN — bridge correctly joined two separate sessions")
 
 	// Batch D: key "b" single session.
-	produceWindowedRecords(t, ctx, brokers, srcTopic, gstream.JSONSerde[string]{}, []windowedRecord{
+	produceWindowedRecords(t, ctx, brokers, srcTopic, JSONSerde[string]{}, []windowedRecord{
 		{key: "b", value: "y", tsMs: 50_000},
 	})
 	t.Log("phase-1 batchD: produced b@50000 (→ session[50000,50000] count=1)")
@@ -297,7 +296,7 @@ func TestE2E_SessionCountRestoreAfterRestart(t *testing.T) {
 	t.Logf("phase-2: deleted partition dir %s", partitionDir)
 
 	bt2 := buildSessionCountTopology(srcTopic, storeName)
-	adapter2, err := runtime.NewAdapter(bt2, cfg, slog.Default())
+	adapter2, err := newTestAdapter(bt2, cfg, slog.Default())
 	if err != nil {
 		t.Fatalf("NewAdapter p2: %v", err)
 	}
@@ -342,7 +341,7 @@ func TestE2E_SessionCountRestoreAfterRestart(t *testing.T) {
 	// If restore was correct: count = 5+1 = 6.
 	// If restore failed (fresh state): count = 0+1 = 1.
 	// count=6 definitively proves restored baseline=5.
-	produceWindowedRecords(t, ctx, brokers, srcTopic, gstream.JSONSerde[string]{}, []windowedRecord{
+	produceWindowedRecords(t, ctx, brokers, srcTopic, JSONSerde[string]{}, []windowedRecord{
 		{key: "a", value: "x", tsMs: postRestoreTsMs},
 	})
 	t.Logf("phase-2: produced a@%d (→ extends session; restored baseline=5 → expect count=%d)",
@@ -396,18 +395,18 @@ func TestE2E_SessionCountRestoreAfterRestart(t *testing.T) {
 
 // buildSessionCountTopology builds:
 //
-//	Stream[string,string] → GroupByKey → SessionWindowedBy(10s, grace=30s) → Count(storeName)
+//	Stream[string,string] → GroupByKey → SessionWindowedBy(10s, grace=30s) → Count(storeName, JSONSerde[int64]{})
 //
 // grace=30s prevents the sweeper from expiring sessions before the bridge record
 // is processed (expiryBoundary = streamTime - gapMs - graceMs stays negative).
 func buildSessionCountTopology(srcTopic, storeName string) *gstream.BuiltTopology {
 	b := gstream.NewStreamBuilder()
 	gstream.Stream[string, string](b, srcTopic, "session-source",
-		gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{}).
-		GroupByKey(gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{}).
-		SessionWindowedBy(gstream.SessionWindow(10 * time.Second)).
-		WithGrace(30 * time.Second).
-		Count(storeName)
+		JSONSerde[string]{}, JSONSerde[string]{}).
+		GroupByKey(JSONSerde[string]{}, JSONSerde[string]{}).
+		SessionWindowedBy(gstream.SessionWindow(10*time.Second)).
+		WithGrace(30*time.Second).
+		Count(storeName, JSONSerde[int64]{})
 	return b.Build()
 }
 
@@ -485,7 +484,7 @@ func pollSessionChangelog(
 		return true
 	}
 
-	serde := gstream.JSONSerde[string]{}
+	serde := JSONSerde[string]{}
 
 	for !allMatch() {
 		fetches := consumer.PollFetches(readyCtx)
@@ -556,8 +555,8 @@ func assertSessionPebble(
 	}
 	defer db.Close()
 
-	store := state.NewKeyValueStore[[]byte, []byte](storeName, db, gstream.BytesSerde{}, gstream.BytesSerde{})
-	kBytes, err := gstream.JSONSerde[string]{}.Serialize(key)
+	store := state.NewKeyValueStore[[]byte, []byte](storeName, db, BytesSerde{}, BytesSerde{})
+	kBytes, err := JSONSerde[string]{}.Serialize(key)
 	if err != nil {
 		t.Fatalf("assertSessionPebble: serialize key %q: %v", key, err)
 	}
@@ -614,8 +613,8 @@ func checkSessionPresentInPebble(t *testing.T, dbDir, storeName, key string, sSt
 	}
 	defer db.Close()
 
-	store := state.NewKeyValueStore[[]byte, []byte](storeName, db, gstream.BytesSerde{}, gstream.BytesSerde{})
-	kBytes, err := gstream.JSONSerde[string]{}.Serialize(key)
+	store := state.NewKeyValueStore[[]byte, []byte](storeName, db, BytesSerde{}, BytesSerde{})
+	kBytes, err := JSONSerde[string]{}.Serialize(key)
 	if err != nil {
 		t.Fatalf("checkSessionPresentInPebble: serialize key %q: %v", key, err)
 	}

@@ -12,7 +12,7 @@ package runtime_test
 //     It must NOT.
 //
 // Extended from state.RestoreFromChangelog's single-partition ConsumePartitions pattern
-// (store/pebble/restore.go lines 69–76, 86–138).
+// (stores/pebble/restore.go lines 69–76, 86–138).
 
 import (
 	"context"

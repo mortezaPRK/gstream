@@ -4,6 +4,7 @@ go 1.27
 
 require (
 	github.com/mortezaPRK/gstream v0.0.0
+	github.com/mortezaPRK/gstream/stores/pebble v0.0.0
 	github.com/testcontainers/testcontainers-go v0.44.0
 	github.com/testcontainers/testcontainers-go/modules/kafka v0.44.0
 	github.com/twmb/franz-go v1.21.6
@@ -11,6 +12,8 @@ require (
 )
 
 replace github.com/mortezaPRK/gstream => ../..
+
+replace github.com/mortezaPRK/gstream/stores/pebble => ../../stores/pebble
 
 require (
 	dario.cat/mergo v1.0.2 // indirect

@@ -47,7 +47,6 @@ import (
 	gstream "github.com/mortezaPRK/gstream"
 	kafkamodule "github.com/mortezaPRK/gstream/integration/kafka"
 	"github.com/mortezaPRK/gstream/internal/kafka"
-	"github.com/mortezaPRK/gstream/internal/runtime"
 	kgo "github.com/twmb/franz-go/pkg/kgo"
 )
 
@@ -131,8 +130,8 @@ func TestE2E_GlobalKTableJoin(t *testing.T) {
 	// Produce user profiles to explicit partitions.
 	// alice → p0 (profile "alice-profile")
 	// bob   → p1 (profile "bob-profile")
-	ks := gstream.JSONSerde[string]{}
-	vs := gstream.JSONSerde[string]{}
+	ks := JSONSerde[string]{}
+	vs := JSONSerde[string]{}
 
 	type userRecord struct {
 		userID  string
@@ -173,7 +172,7 @@ func TestE2E_GlobalKTableJoin(t *testing.T) {
 	// ============================================================
 
 	bt1 := buildGKTTopology()
-	adapter1, err := runtime.NewAdapter(bt1, cfg, slog.Default())
+	adapter1, err := newTestAdapter(bt1, cfg, slog.Default())
 	if err != nil {
 		t.Fatalf("NewAdapter p1: %v", err)
 	}
@@ -330,7 +329,7 @@ func TestE2E_GlobalKTableJoin(t *testing.T) {
 
 	t.Log("--- PHASE 2: R2 NEGATIVE ---")
 	bt2neg := buildGKTTopology()
-	adapter2neg, err := runtime.NewAdapter(bt2neg, cfg, slog.Default())
+	adapter2neg, err := newTestAdapter(bt2neg, cfg, slog.Default())
 	if err != nil {
 		t.Fatalf("NewAdapter p2neg: %v", err)
 	}
@@ -430,7 +429,7 @@ func TestE2E_GlobalKTableJoin(t *testing.T) {
 	}
 
 	bt3 := buildGKTTopology()
-	adapter3, err := runtime.NewAdapter(bt3, cfgRestart, slog.Default())
+	adapter3, err := newTestAdapter(bt3, cfgRestart, slog.Default())
 	if err != nil {
 		t.Fatalf("NewAdapter p3: %v", err)
 	}
@@ -529,8 +528,8 @@ func TestE2E_GlobalKTableJoin(t *testing.T) {
 //	joiner:     order + "|" + profile
 func buildGKTTopology() *gstream.BuiltTopology {
 	b := gstream.NewStreamBuilder()
-	ks := gstream.JSONSerde[string]{}
-	vs := gstream.JSONSerde[string]{}
+	ks := JSONSerde[string]{}
+	vs := JSONSerde[string]{}
 
 	// GlobalTable: key=userID, val=profile. NOT in SourceTopics().
 	gkt := gstream.GlobalTable[string, string](b, gktUsersTopic, "users-global", ks, vs)
@@ -568,8 +567,8 @@ func (r gktOutputRecord) String() string {
 // orderID is the record key; userID is the record value (the join key comes from value).
 func produceGKTOrder(t *testing.T, ctx context.Context, brokers []string, orderID, userID string) {
 	t.Helper()
-	ks := gstream.JSONSerde[string]{}
-	vs := gstream.JSONSerde[string]{}
+	ks := JSONSerde[string]{}
+	vs := JSONSerde[string]{}
 	kb, _ := ks.Serialize(orderID)
 	vb, _ := vs.Serialize(userID)
 	producer, err := kgo.NewClient(kgo.SeedBrokers(brokers...))
@@ -592,8 +591,8 @@ func waitGKTOutput(t *testing.T, ctx context.Context, consumer *kgo.Client, n in
 // waitGKTOutputBounded collects up to n records within timeout.
 func waitGKTOutputBounded(t *testing.T, ctx context.Context, consumer *kgo.Client, n int, timeout time.Duration) []gktOutputRecord {
 	t.Helper()
-	ks := gstream.JSONSerde[string]{}
-	vs := gstream.JSONSerde[string]{}
+	ks := JSONSerde[string]{}
+	vs := JSONSerde[string]{}
 	readyCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -651,8 +650,8 @@ func waitGKTOutputUntilKeys(t *testing.T, ctx context.Context, consumer *kgo.Cli
 	wantKeyValues map[string]string, timeout time.Duration,
 ) []gktOutputRecord {
 	t.Helper()
-	ks := gstream.JSONSerde[string]{}
-	vs := gstream.JSONSerde[string]{}
+	ks := JSONSerde[string]{}
+	vs := JSONSerde[string]{}
 	readyCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 

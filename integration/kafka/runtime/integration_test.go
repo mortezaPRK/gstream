@@ -14,7 +14,6 @@ import (
 	gstream "github.com/mortezaPRK/gstream"
 	kafkamodule "github.com/mortezaPRK/gstream/integration/kafka"
 	"github.com/mortezaPRK/gstream/internal/kafka"
-	"github.com/mortezaPRK/gstream/internal/runtime"
 	"github.com/mortezaPRK/gstream/internal/topology"
 	kgo "github.com/twmb/franz-go/pkg/kgo"
 )
@@ -108,7 +107,7 @@ func TestE2E_StatelessFilterMap(t *testing.T) {
 		{"key5", "ab"},     // len 2 → filtered
 	}
 
-	serde := gstream.JSONSerde[string]{}
+	serde := JSONSerde[string]{}
 	for _, inp := range inputs {
 		encoded, err := serde.Serialize(inp.value)
 		if err != nil {
@@ -197,7 +196,7 @@ func TestE2E_StatelessFilterMap(t *testing.T) {
 		t.Fatalf("Configure: %v", err)
 	}
 
-	adapter, err := runtime.NewAdapter(bt, cfg, slog.Default())
+	adapter, err := newTestAdapter(bt, cfg, slog.Default())
 	if err != nil {
 		t.Fatalf("NewAdapter: %v", err)
 	}

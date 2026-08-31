@@ -2,12 +2,10 @@ package runtime
 
 import (
 	"context"
-	"os"
-	"path/filepath"
 	"testing"
 
 	gstream "github.com/mortezaPRK/gstream"
-	state "github.com/mortezaPRK/gstream/store/pebble"
+	state "github.com/mortezaPRK/gstream/internal/testutil"
 )
 
 // dummyBinding returns a minimal GlobalTableBinding for tests that do not
@@ -25,14 +23,13 @@ func dummyBinding(storeName, topic string) gstream.GlobalTableBinding {
 	}
 }
 
-// TestNewGlobalConsumer_DBPath verifies that NewGlobalConsumer opens Pebble at
-// filepath.Join(StateDir, ApplicationID, "global-"+StoreName).
-func TestNewGlobalConsumer_DBPath(t *testing.T) {
+func TestNewGlobalConsumer_OpensConfiguredStore(t *testing.T) {
 	dir := t.TempDir()
 	cfg := gstream.Config{
 		ApplicationID: "test-app",
 		Brokers:       []string{"localhost:9092"}, // not contacted in this test
 		StateDir:      dir,
+		StoreProvider: state.MemoryProvider{},
 	}
 	binding := dummyBinding("my-store", "my-topic")
 
@@ -51,15 +48,6 @@ func TestNewGlobalConsumer_DBPath(t *testing.T) {
 		t.Fatalf("store.Get: got=%q ok=%v err=%v", got, ok, err)
 	}
 
-	// The Pebble OPTIONS file exists under the expected path (Pebble writes it on open).
-	wantDir := filepath.Join(dir, "test-app", "global-my-store")
-	entries, err := os.ReadDir(wantDir)
-	if err != nil {
-		t.Fatalf("pebble dir %q not found: %v", wantDir, err)
-	}
-	if len(entries) == 0 {
-		t.Errorf("expected Pebble files under %q, dir is empty", wantDir)
-	}
 }
 
 // TestGlobalConsumer_StoreRoundTrip verifies that Store() returns the live
@@ -70,6 +58,7 @@ func TestGlobalConsumer_StoreRoundTrip(t *testing.T) {
 		ApplicationID: "rt-app",
 		Brokers:       []string{"localhost:9092"},
 		StateDir:      dir,
+		StoreProvider: state.MemoryProvider{},
 	}
 	gc, err := NewGlobalConsumer(cfg, dummyBinding("rt-store", "rt-topic"), nil)
 	if err != nil {
@@ -81,9 +70,9 @@ func TestGlobalConsumer_StoreRoundTrip(t *testing.T) {
 	if raw == nil {
 		t.Fatal("Store() returned nil")
 	}
-	kvStore, ok := raw.(*state.KeyValueStore[[]byte, []byte])
+	kvStore, ok := raw.(gstream.Store)
 	if !ok {
-		t.Fatalf("Store() returned %T, want *state.KeyValueStore[[]byte,[]byte]", raw)
+		t.Fatalf("Store() returned %T, want gstream.Store", raw)
 	}
 
 	if err := kvStore.Put([]byte("hello"), []byte("world")); err != nil {
@@ -114,9 +103,9 @@ func TestGlobalConsumer_ApplyKV(t *testing.T) {
 
 	store := state.NewKeyValueStore[[]byte, []byte](
 		"kv-test", db,
-		gstream.BytesSerde{}, gstream.BytesSerde{},
+		state.BytesSerde{}, state.BytesSerde{},
 	)
-	gc := &GlobalConsumer{store: store, db: db, storeName: "kv-test"}
+	gc := &GlobalConsumer{store: store, backend: db, storeName: "kv-test"}
 
 	t.Run("put_non_tombstone", func(t *testing.T) {
 		if err := gc.applyKV([]byte("k1"), []byte("v1"), 0, 0); err != nil {
@@ -164,6 +153,7 @@ func TestGlobalConsumer_CloseWithoutTail(t *testing.T) {
 		ApplicationID: "close-app",
 		Brokers:       []string{"localhost:9092"},
 		StateDir:      dir,
+		StoreProvider: state.MemoryProvider{},
 	}
 	gc, err := NewGlobalConsumer(cfg, dummyBinding("cs", "ct"), nil)
 	if err != nil {
@@ -182,6 +172,7 @@ func TestGlobalConsumer_TailConsume_NilClientGuard(t *testing.T) {
 		ApplicationID: "nil-client-app",
 		Brokers:       []string{"localhost:9092"},
 		StateDir:      dir,
+		StoreProvider: state.MemoryProvider{},
 	}
 	gc, err := NewGlobalConsumer(cfg, dummyBinding("nc", "nt"), nil)
 	if err != nil {

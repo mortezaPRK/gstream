@@ -5,7 +5,7 @@ import (
 	"log/slog"
 	"sync"
 
-	"github.com/mortezaPRK/gstream/logging"
+	gstream "github.com/mortezaPRK/gstream"
 )
 
 // processBatch runs Step 1 of the ALO loop for a single polled batch: it calls
@@ -23,7 +23,7 @@ import (
 // offsets are never committed, and it defers per-record retry logic to a later phase.
 func processBatch(
 	ctx context.Context,
-	logger logging.Logger,
+	logger gstream.Logger,
 	inRecords []InRecord,
 	process ProcessFunc,
 ) (outputs []OutRecord, ok bool) {
@@ -50,7 +50,7 @@ func processBatch(
 // first partition appearance in fetched batch.
 func processBatchConcurrent(
 	ctx context.Context,
-	logger logging.Logger,
+	logger gstream.Logger,
 	inRecords []InRecord,
 	process ProcessFunc,
 	maxThreads int,

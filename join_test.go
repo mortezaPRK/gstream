@@ -1,6 +1,6 @@
 // Package gstream_test provides broker-free tests for the stream-table inner join
 // (JoinTable). Tests live in package gstream_test (external) rather than package
-// gstream because store/memory imports gstream (for Serde[T]), so a
+// gstream because stores/memory imports gstream (for Serde[T]), so a
 // package-internal test that imports it would create a circular import.
 //
 // Store type: []byte/[]byte (same as grouped_test — Option A type-erasure pattern).
@@ -14,13 +14,13 @@ import (
 	"testing"
 
 	"github.com/mortezaPRK/gstream"
+	memory "github.com/mortezaPRK/gstream/internal/testutil"
 	"github.com/mortezaPRK/gstream/internal/topology"
-	"github.com/mortezaPRK/gstream/store/memory"
 )
 
 // buildJoinTopology constructs the test topology:
 //
-//	table-source[string,string] → GroupByKey → Count("t") (table sub-graph)
+//	table-source[string,string] → GroupByKey → Count("t", memory.JSONSerde[int64]{}) (table sub-graph)
 //	stream-source[string,string] → JoinTable(table, joiner, outSerde) → out-sink
 //
 // Returns the BuiltTopology and the store name ("t") so callers can wire the store.
@@ -32,16 +32,16 @@ func buildJoinTopology(t *testing.T) (*gstream.BuiltTopology, string) {
 	// table sub-graph: count occurrences per key
 	tableSrc := gstream.Stream[string, string](
 		b, "table-topic", "tsrc",
-		gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{},
+		memory.JSONSerde[string]{}, memory.JSONSerde[string]{},
 	)
 	table := tableSrc.
-		GroupByKey(gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{}).
-		Count("t")
+		GroupByKey(memory.JSONSerde[string]{}, memory.JSONSerde[string]{}).
+		Count("t", memory.JSONSerde[int64]{})
 
 	// stream sub-graph: join against table
 	streamSrc := gstream.Stream[string, string](
 		b, "stream-topic", "ssrc",
-		gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{},
+		memory.JSONSerde[string]{}, memory.JSONSerde[string]{},
 	)
 
 	// joiner: concatenate stream value + ":" + formatted count
@@ -50,11 +50,11 @@ func buildJoinTopology(t *testing.T) (*gstream.BuiltTopology, string) {
 		func(v string, count int64) string {
 			return v + ":" + string(rune('0'+count))
 		},
-		gstream.JSONSerde[string]{},
-		gstream.JSONSerde[string]{},
+		memory.JSONSerde[string]{},
+		memory.JSONSerde[string]{},
 	)
 
-	joined.To("out-topic", "out", gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{})
+	joined.To("out-topic", "out", memory.JSONSerde[string]{}, memory.JSONSerde[string]{})
 
 	return b.Build(), "t"
 }
@@ -65,21 +65,21 @@ func TestJoinTableAutomaticallyRepartitionsChangedStreamKey(t *testing.T) {
 	builder := gstream.NewStreamBuilder()
 	table := gstream.Stream[string, string](
 		builder, "table-topic", "table-source",
-		gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{},
+		memory.JSONSerde[string]{}, memory.JSONSerde[string]{},
 	).
-		GroupByKey(gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{}).
-		Count("table")
+		GroupByKey(memory.JSONSerde[string]{}, memory.JSONSerde[string]{}).
+		Count("table", memory.JSONSerde[int64]{})
 
 	gstream.Stream[string, string](
 		builder, "stream-topic", "stream-source",
-		gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{},
+		memory.JSONSerde[string]{}, memory.JSONSerde[string]{},
 	).
 		SelectKey(func(_ string, value string) string { return value }).
 		JoinTable(
 			table,
 			func(value string, count int64) string { return value },
-			gstream.JSONSerde[string]{},
-			gstream.JSONSerde[string]{},
+			memory.JSONSerde[string]{},
+			memory.JSONSerde[string]{},
 		)
 
 	if got := len(builder.Build().RepartitionBindings); got != 1 {
@@ -101,7 +101,7 @@ func TestJoinTable_Miss(t *testing.T) {
 	defer db.Close()
 
 	byteStore := memory.NewKeyValueStore[[]byte, []byte](
-		storeName, db, gstream.BytesSerde{}, gstream.BytesSerde{},
+		storeName, db, memory.BytesSerde{}, memory.BytesSerde{},
 	)
 	exec := topology.NewExecutor(bt.Topology, map[string]any{storeName: byteStore})
 
@@ -135,7 +135,7 @@ func TestJoinTable_Hit(t *testing.T) {
 	defer db.Close()
 
 	byteStore := memory.NewKeyValueStore[[]byte, []byte](
-		storeName, db, gstream.BytesSerde{}, gstream.BytesSerde{},
+		storeName, db, memory.BytesSerde{}, memory.BytesSerde{},
 	)
 	exec := topology.NewExecutor(bt.Topology, map[string]any{storeName: byteStore})
 	ctx := context.Background()
@@ -186,7 +186,7 @@ func TestJoinTable_StreamBeforeTable(t *testing.T) {
 	defer db.Close()
 
 	byteStore := memory.NewKeyValueStore[[]byte, []byte](
-		storeName, db, gstream.BytesSerde{}, gstream.BytesSerde{},
+		storeName, db, memory.BytesSerde{}, memory.BytesSerde{},
 	)
 	exec := topology.NewExecutor(bt.Topology, map[string]any{storeName: byteStore})
 	ctx := context.Background()
@@ -232,7 +232,7 @@ func TestJoinTable_TwoKeys(t *testing.T) {
 	defer db.Close()
 
 	byteStore := memory.NewKeyValueStore[[]byte, []byte](
-		storeName, db, gstream.BytesSerde{}, gstream.BytesSerde{},
+		storeName, db, memory.BytesSerde{}, memory.BytesSerde{},
 	)
 	exec := topology.NewExecutor(bt.Topology, map[string]any{storeName: byteStore})
 	ctx := context.Background()
@@ -322,13 +322,13 @@ func buildJoinGlobalTopology(t *testing.T) (*gstream.BuiltTopology, string) {
 	// GlobalKTable: keyed by userID (string) → userProfile (string)
 	gkt := gstream.GlobalTable[string, string](
 		b, "profiles-topic", "profiles-node",
-		gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{},
+		memory.JSONSerde[string]{}, memory.JSONSerde[string]{},
 	)
 
 	// Stream: keyed by orderID (string), value is Order
 	streamSrc := gstream.Stream[string, Order](
 		b, "orders-topic", "orders-src",
-		gstream.JSONSerde[string]{}, gstream.JSONSerde[Order]{},
+		memory.JSONSerde[string]{}, memory.JSONSerde[Order]{},
 	)
 
 	// keyMapper extracts userID from Order — stream key "order-1" != lookup key "u5"
@@ -336,9 +336,9 @@ func buildJoinGlobalTopology(t *testing.T) (*gstream.BuiltTopology, string) {
 		gkt,
 		func(_ string, order Order) string { return order.UserID },
 		func(order Order, profile string) string { return order.ID + ":" + profile },
-		gstream.JSONSerde[string]{},
+		memory.JSONSerde[string]{},
 	)
-	joined.To("join-out", "join-out-sink", gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{})
+	joined.To("join-out", "join-out-sink", memory.JSONSerde[string]{}, memory.JSONSerde[string]{})
 
 	bt := b.Build()
 
@@ -366,11 +366,11 @@ func openGlobalStore(t *testing.T, storeName string, pairs map[string]string) (a
 	}
 
 	byteStore := memory.NewKeyValueStore[[]byte, []byte](
-		storeName, db, gstream.BytesSerde{}, gstream.BytesSerde{},
+		storeName, db, memory.BytesSerde{}, memory.BytesSerde{},
 	)
 
-	keySerde := gstream.JSONSerde[string]{}
-	valSerde := gstream.JSONSerde[string]{}
+	keySerde := memory.JSONSerde[string]{}
+	valSerde := memory.JSONSerde[string]{}
 
 	for k, v := range pairs {
 		kBytes, err := keySerde.Serialize(k)
@@ -581,7 +581,7 @@ func TestJoinTable_UpdatedTableValue(t *testing.T) {
 	defer db.Close()
 
 	byteStore := memory.NewKeyValueStore[[]byte, []byte](
-		storeName, db, gstream.BytesSerde{}, gstream.BytesSerde{},
+		storeName, db, memory.BytesSerde{}, memory.BytesSerde{},
 	)
 	exec := topology.NewExecutor(bt.Topology, map[string]any{storeName: byteStore})
 	ctx := context.Background()

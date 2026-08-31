@@ -15,8 +15,7 @@ import (
 	gstream "github.com/mortezaPRK/gstream"
 	kafkamodule "github.com/mortezaPRK/gstream/integration/kafka"
 	"github.com/mortezaPRK/gstream/internal/kafka"
-	"github.com/mortezaPRK/gstream/internal/runtime"
-	state "github.com/mortezaPRK/gstream/store/pebble"
+	state "github.com/mortezaPRK/gstream/stores/pebble"
 	kgo "github.com/twmb/franz-go/pkg/kgo"
 )
 
@@ -114,11 +113,11 @@ func TestE2E_StatefulCountRestoreAfterRestart(t *testing.T) {
 	// PHASE 1: materialize
 	// =========================================================================
 
-	// 4. Build topology: Stream[string,string] → GroupByKey → Count("counts").
+	// 4. Build topology: Stream[string,string] → GroupByKey → Count("counts", JSONSerde[int64]{}).
 	bt1 := buildCountTopology(srcTopic, storeName)
 
 	// 5. Adapter + client.
-	adapter1, err := runtime.NewAdapter(bt1, cfg, slog.Default())
+	adapter1, err := newTestAdapter(bt1, cfg, slog.Default())
 	if err != nil {
 		t.Fatalf("NewAdapterWithConfig p1: %v", err)
 	}
@@ -184,7 +183,7 @@ func TestE2E_StatefulCountRestoreAfterRestart(t *testing.T) {
 
 	// 11. New adapter + client — same AppID, same stateDir, same brokers.
 	bt2 := buildCountTopology(srcTopic, storeName)
-	adapter2, err := runtime.NewAdapter(bt2, cfg, slog.Default())
+	adapter2, err := newTestAdapter(bt2, cfg, slog.Default())
 	if err != nil {
 		t.Fatalf("NewAdapterWithConfig p2: %v", err)
 	}
@@ -260,13 +259,13 @@ func TestE2E_StatefulCountRestoreAfterRestart(t *testing.T) {
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
-// buildCountTopology builds Stream[string,string] → GroupByKey → Count(storeName).
+// buildCountTopology builds Stream[string,string] → GroupByKey → Count(storeName, JSONSerde[int64]{}).
 func buildCountTopology(srcTopic, storeName string) *gstream.BuiltTopology {
 	b := gstream.NewStreamBuilder()
 	gstream.Stream[string, string](b, srcTopic, "source",
-		gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{}).
-		GroupByKey(gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{}).
-		Count(storeName)
+		JSONSerde[string]{}, JSONSerde[string]{}).
+		GroupByKey(JSONSerde[string]{}, JSONSerde[string]{}).
+		Count(storeName, JSONSerde[int64]{})
 	return b.Build()
 }
 
@@ -274,7 +273,7 @@ func buildCountTopology(srcTopic, storeName string) *gstream.BuiltTopology {
 // JSON-encoded strings (matching JSONSerde[string] used in the topology).
 func produceStringKeys(t *testing.T, ctx context.Context, brokers []string, topic string, keys []string) {
 	t.Helper()
-	serde := gstream.JSONSerde[string]{}
+	serde := JSONSerde[string]{}
 	producer, err := kgo.NewClient(kgo.SeedBrokers(brokers...))
 	if err != nil {
 		t.Fatalf("produceStringKeys: new client: %v", err)
@@ -381,9 +380,9 @@ func assertPebbleStoreCounts(t *testing.T, dbDir, storeName string, expected map
 	defer db.Close()
 
 	store := state.NewKeyValueStore[[]byte, []byte](
-		storeName, db, gstream.BytesSerde{}, gstream.BytesSerde{},
+		storeName, db, BytesSerde{}, BytesSerde{},
 	)
-	keySerde := gstream.JSONSerde[string]{}
+	keySerde := JSONSerde[string]{}
 
 	for k, want := range expected {
 		kb, err := keySerde.Serialize(k)

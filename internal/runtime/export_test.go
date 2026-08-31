@@ -1,9 +1,9 @@
 package runtime
 
 import (
-	"github.com/cockroachdb/pebble"
+	gstream "github.com/mortezaPRK/gstream"
+	state "github.com/mortezaPRK/gstream/internal/testutil"
 	"github.com/mortezaPRK/gstream/internal/topology"
-	state "github.com/mortezaPRK/gstream/store/pebble"
 )
 
 // TaskManagerStoresForPartition returns the stores map for the given partition's
@@ -44,19 +44,34 @@ func TaskManagerInjectTask(
 	partition int32,
 	storeName, changelogTopic string,
 	collector *state.MutationCollector,
-	db *pebble.DB,
+	backend *state.MemoryBackend,
 ) {
 	// NewChangelogProducer requires live brokers; use the stub constructor that
 	// returns a ChangelogProducer with a nil kc. Encode does not use kc, so
 	// this is safe for tests that only call DrainChangelogRecords (never Flush).
 	producer := newTestChangelogProducer(changelogTopic)
+	store, err := backend.OpenStore(storeName, true)
+	if err != nil {
+		panic("TaskManagerInjectTask: " + err.Error())
+	}
+	for _, mutation := range collector.Drain() {
+		switch mutation := mutation.(type) {
+		case state.Put:
+			if err := store.Put(mutation.Key, mutation.Value); err != nil {
+				panic("TaskManagerInjectTask: " + err.Error())
+			}
+		case state.Delete:
+			if err := store.Delete(mutation.Key); err != nil {
+				panic("TaskManagerInjectTask: " + err.Error())
+			}
+		}
+	}
 
-	stores := make(map[string]any, 1)
+	stores := map[string]any{storeName: store}
 	t := &task{
-		db:         db,
+		backend:    backend,
 		executor:   topology.NewExecutor(tm.bt.Topology, stores),
-		collectors: map[string]*state.MutationCollector{storeName: collector},
-		producers:  map[string]*state.ChangelogProducer{storeName: producer},
+		producers:  map[string]*ChangelogProducer{storeName: producer},
 		stores:     stores,
 		partition:  partition,
 		streamTime: 0,
@@ -70,10 +85,12 @@ func TaskManagerInjectTask(
 // broker address. kgo.NewClient does not dial at construction time, so this
 // succeeds without a live broker. Only Encode is safe to call on the result
 // (Flush will block waiting for a broker that never responds).
-func newTestChangelogProducer(topic string) *state.ChangelogProducer {
-	p, err := state.NewChangelogProducer([]string{"localhost:19092"}, topic)
+func newTestChangelogProducer(topic string) *ChangelogProducer {
+	p, err := NewChangelogProducer([]string{"localhost:19092"}, topic)
 	if err != nil {
 		panic("newTestChangelogProducer: " + err.Error())
 	}
 	return p
 }
+
+var _ gstream.Store = (*state.MemoryStore)(nil)

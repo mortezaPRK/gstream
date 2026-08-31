@@ -9,6 +9,7 @@ import (
 	gstream "github.com/mortezaPRK/gstream"
 	"github.com/mortezaPRK/gstream/internal/kafka"
 	"github.com/mortezaPRK/gstream/internal/runtime"
+	state "github.com/mortezaPRK/gstream/internal/testutil"
 	"github.com/mortezaPRK/gstream/internal/topology"
 )
 
@@ -58,7 +59,7 @@ func buildSimpleBuiltTopology(t *testing.T) *gstream.BuiltTopology {
 	b.AddSink("sink", mapped)
 	topo := b.Build()
 
-	strSerde := gstream.JSONSerde[string]{}
+	strSerde := state.JSONSerde[string]{}
 
 	return &gstream.BuiltTopology{
 		Topology: topo,
@@ -99,7 +100,7 @@ func buildSimpleBuiltTopology(t *testing.T) *gstream.BuiltTopology {
 // inRecord returns a kafka.InRecord whose value is a JSON-encoded string.
 func inRecord(t *testing.T, key, value string) kafka.InRecord {
 	t.Helper()
-	b, err := gstream.JSONSerde[string]{}.Serialize(value)
+	b, err := state.JSONSerde[string]{}.Serialize(value)
 	if err != nil {
 		t.Fatalf("inRecord: serialize(%q): %v", value, err)
 	}
@@ -275,7 +276,7 @@ func TestAdapter_TopicFromSinkBinding(t *testing.T) {
 	topo := b.Build()
 
 	const wantTopic = "the-output-topic"
-	strSerde := gstream.JSONSerde[string]{}
+	strSerde := state.JSONSerde[string]{}
 	bt := &gstream.BuiltTopology{
 		Topology: topo,
 		Sources: map[string]gstream.SourceBinding{
@@ -343,8 +344,8 @@ func TestAdapter_TypeChangingPipeline_NoSilentDrop(t *testing.T) {
 	b.AddSink("sink", lengthProc)
 	topo := b.Build()
 
-	strSerde := gstream.JSONSerde[string]{}
-	intSerde := gstream.JSONSerde[int]{}
+	strSerde := state.JSONSerde[string]{}
+	intSerde := state.JSONSerde[int]{}
 
 	bt := &gstream.BuiltTopology{
 		Topology: topo,
@@ -432,7 +433,7 @@ func TestAdapter_EncodeValError(t *testing.T) {
 	b.AddSink("sink", src)
 	topo := b.Build()
 
-	strSerde := gstream.JSONSerde[string]{}
+	strSerde := state.JSONSerde[string]{}
 	bt := &gstream.BuiltTopology{
 		Topology: topo,
 		Sources: map[string]gstream.SourceBinding{
@@ -477,7 +478,7 @@ func TestAdapter_ProcessorError(t *testing.T) {
 	b.AddSink("sink", fail)
 	topo := b.Build()
 
-	strSerde := gstream.JSONSerde[string]{}
+	strSerde := state.JSONSerde[string]{}
 	bt := &gstream.BuiltTopology{
 		Topology: topo,
 		Sources: map[string]gstream.SourceBinding{
@@ -550,7 +551,7 @@ func TestAdapter_TimestampPreserved(t *testing.T) {
 	b.AddSink("sink", pass)
 	topo := b.Build()
 
-	strSerde := gstream.JSONSerde[string]{}
+	strSerde := state.JSONSerde[string]{}
 	bt := &gstream.BuiltTopology{
 		Topology: topo,
 		Sources: map[string]gstream.SourceBinding{
@@ -596,7 +597,7 @@ func TestAdapter_TimestampPreserved(t *testing.T) {
 
 func mustSerialize(t *testing.T, v string) []byte {
 	t.Helper()
-	b, err := gstream.JSONSerde[string]{}.Serialize(v)
+	b, err := state.JSONSerde[string]{}.Serialize(v)
 	if err != nil {
 		t.Fatalf("mustSerialize(%q): %v", v, err)
 	}
@@ -628,7 +629,7 @@ func buildRepartitionBuiltTopology(t *testing.T) (*gstream.BuiltTopology, string
 	const repartName = "mykey"
 	fullTopic := appID + "-" + repartName + "-repartition"
 
-	strSerde := gstream.JSONSerde[string]{}
+	strSerde := state.JSONSerde[string]{}
 
 	// Encode/decode closures shared between user source and repartition binding.
 	encKey := func(x any) ([]byte, error) { return []byte(x.(string)), nil }
@@ -941,7 +942,7 @@ func buildGlobalTableBuiltTopology(t *testing.T) (*gstream.BuiltTopology, string
 	const globalTopic = "global-user-table"
 	const globalStore = "user-store"
 
-	strSerde := gstream.JSONSerde[string]{}
+	strSerde := state.JSONSerde[string]{}
 
 	bt := &gstream.BuiltTopology{
 		Topology: topo,
@@ -1015,7 +1016,7 @@ func TestAdapter_GlobalTopicExcludedFromTopicToSource(t *testing.T) {
 		t.Fatalf("NewAdapter: %v", err)
 	}
 
-	strSerde := gstream.JSONSerde[string]{}
+	strSerde := state.JSONSerde[string]{}
 	val, _ := strSerde.Serialize("some-value")
 
 	_, procErr := adapter.ProcessFunc()(context.Background(), kafka.InRecord{
@@ -1042,7 +1043,7 @@ func TestAdapter_HasStoresTrueWhenOnlyGlobalTable(t *testing.T) {
 	b.AddSink("internal-sink", src) // no SinkBinding — would error without hasStores
 	topo := b.Build()
 
-	strSerde := gstream.JSONSerde[string]{}
+	strSerde := state.JSONSerde[string]{}
 
 	bt := &gstream.BuiltTopology{
 		Topology: topo,

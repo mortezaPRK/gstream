@@ -16,7 +16,6 @@ import (
 	gstream "github.com/mortezaPRK/gstream"
 	kafkamodule "github.com/mortezaPRK/gstream/integration/kafka"
 	"github.com/mortezaPRK/gstream/internal/kafka"
-	"github.com/mortezaPRK/gstream/internal/runtime"
 	kgo "github.com/twmb/franz-go/pkg/kgo"
 )
 
@@ -32,7 +31,7 @@ import (
 //
 // Topology (two co-partitioned topics, 1 partition each):
 //
-//	tableTopic  → Stream[string,string] → GroupByKey → Count("join-store") → KTable[string,int64]
+//	tableTopic  → Stream[string,string] → GroupByKey → Count("join-store", JSONSerde[int64]{}) → KTable[string,int64]
 //	streamTopic → Stream[string,string] → JoinTable(table, joiner, ...) → outTopic
 //
 // Joiner: func(v string, c int64) string { return fmt.Sprintf("%s#%d", v, c) }
@@ -128,7 +127,7 @@ func TestE2E_StreamTableJoin(t *testing.T) {
 
 	bt1 := buildJoinE2ETopology(tableTopic, streamTopic, storeName, outTopic)
 
-	adapter1, err := runtime.NewAdapter(bt1, cfg, slog.Default())
+	adapter1, err := newTestAdapter(bt1, cfg, slog.Default())
 	if err != nil {
 		t.Fatalf("NewAdapter p1: %v", err)
 	}
@@ -240,7 +239,7 @@ func TestE2E_StreamTableJoin(t *testing.T) {
 	t.Logf("phase-2: deleted partition dir %s", partitionDir)
 
 	bt2 := buildJoinE2ETopology(tableTopic, streamTopic, storeName, outTopic)
-	adapter2, err := runtime.NewAdapter(bt2, cfg, slog.Default())
+	adapter2, err := newTestAdapter(bt2, cfg, slog.Default())
 	if err != nil {
 		t.Fatalf("NewAdapter p2: %v", err)
 	}
@@ -329,7 +328,7 @@ func TestE2E_StreamTableJoin(t *testing.T) {
 
 // buildJoinE2ETopology constructs the join topology:
 //
-//	tableTopic  → Stream[string,string] → GroupByKey → Count(storeName) → KTable[string,int64]
+//	tableTopic  → Stream[string,string] → GroupByKey → Count(storeName, JSONSerde[int64]{}) → KTable[string,int64]
 //	streamTopic → Stream[string,string] → JoinTable(table, joiner, ...) → outTopic
 //
 // Joiner: "%s#%d" % (streamValue, count)
@@ -339,26 +338,26 @@ func buildJoinE2ETopology(tableTopic, streamTopic, storeName, outTopic string) *
 	// table sub-graph
 	tableSrc := gstream.Stream[string, string](
 		b, tableTopic, "tsrc",
-		gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{},
+		JSONSerde[string]{}, JSONSerde[string]{},
 	)
 	table := tableSrc.
-		GroupByKey(gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{}).
-		Count(storeName)
+		GroupByKey(JSONSerde[string]{}, JSONSerde[string]{}).
+		Count(storeName, JSONSerde[int64]{})
 
 	// stream sub-graph
 	streamSrc := gstream.Stream[string, string](
 		b, streamTopic, "ssrc",
-		gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{},
+		JSONSerde[string]{}, JSONSerde[string]{},
 	)
 
 	joined := streamSrc.JoinTable[int64, string](
 		table,
 		func(v string, c int64) string { return fmt.Sprintf("%s#%d", v, c) },
-		gstream.JSONSerde[string]{},
-		gstream.JSONSerde[string]{},
+		JSONSerde[string]{},
+		JSONSerde[string]{},
 	)
 
-	joined.To(outTopic, "out", gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{})
+	joined.To(outTopic, "out", JSONSerde[string]{}, JSONSerde[string]{})
 
 	return b.Build()
 }
@@ -379,7 +378,7 @@ func (r joinOutputRecord) String() string {
 // value is JSON-encoded string (matching JSONSerde[string] in the topology).
 func produceJoinRecord(t *testing.T, ctx context.Context, brokers []string, topic, key, value string) {
 	t.Helper()
-	serde := gstream.JSONSerde[string]{}
+	serde := JSONSerde[string]{}
 	kb, _ := serde.Serialize(key)
 	vb, _ := serde.Serialize(value)
 	producer, err := kgo.NewClient(kgo.SeedBrokers(brokers...))
@@ -472,7 +471,7 @@ func waitJoinOutput(t *testing.T, ctx context.Context, consumer *kgo.Client, n i
 // waitJoinOutputBounded collects up to n records from consumer within timeout.
 func waitJoinOutputBounded(t *testing.T, ctx context.Context, consumer *kgo.Client, n int, timeout time.Duration) []joinOutputRecord {
 	t.Helper()
-	serde := gstream.JSONSerde[string]{}
+	serde := JSONSerde[string]{}
 	readyCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 

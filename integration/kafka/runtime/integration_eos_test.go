@@ -284,7 +284,7 @@ func TestE2E_EOS(t *testing.T) {
 	t.Log("--- CASE 1: HAPPY PATH ---")
 
 	bt1 := buildCountTopology(srcTopic, storeName)
-	adapter1, err := runtime.NewAdapter(bt1, cfg, slog.Default())
+	adapter1, err := newTestAdapter(bt1, cfg, slog.Default())
 	if err != nil {
 		t.Fatalf("NewAdapter c1: %v", err)
 	}
@@ -357,7 +357,7 @@ func TestE2E_EOS(t *testing.T) {
 
 	// -- client2: restore from committed changelog (a=2, b=1) then crash --
 	bt2 := buildCountTopology(srcTopic, storeName)
-	adapter2, err := runtime.NewAdapter(bt2, cfg, slog.Default())
+	adapter2, err := newTestAdapter(bt2, cfg, slog.Default())
 	if err != nil {
 		t.Fatalf("NewAdapter c2: %v", err)
 	}
@@ -467,7 +467,7 @@ func TestE2E_EOS(t *testing.T) {
 	t.Log("--- CASE 3: RESTORE NO HANG ---")
 
 	bt3 := buildCountTopology(srcTopic, storeName)
-	adapter3, err := runtime.NewAdapter(bt3, cfg, slog.Default())
+	adapter3, err := newTestAdapter(bt3, cfg, slog.Default())
 	if err != nil {
 		t.Fatalf("NewAdapter c3: %v", err)
 	}
@@ -591,7 +591,7 @@ func TestE2E_EOS(t *testing.T) {
 // TestE2E_EOS_KTableTo proves that KTable.To() emits per-key count updates to a
 // real Kafka sink topic under EOS (exactly-once semantics).
 //
-// Topology: Stream[string,string] → GroupByKey → Count("kto-counts") → KTable.To("kto-sink")
+// Topology: Stream[string,string] → GroupByKey → Count("kto-counts", JSONSerde[int64]{}) → KTable.To("kto-sink")
 //
 // Assertions:
 //  1. HAPPY PATH: produce a,a,b → EOS commits → ReadCommitted poll on kto-sink
@@ -670,10 +670,10 @@ func TestE2E_EOS_KTableTo(t *testing.T) {
 	buildKToTopology := func() *gstream.BuiltTopology {
 		b := gstream.NewStreamBuilder()
 		table := gstream.Stream[string, string](b, srcTopic, "source",
-			gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{}).
-			GroupByKey(gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{}).
-			Count(storeName)
-		table.To(sinkTopic, gstream.JSONSerde[string]{}, gstream.JSONSerde[int64]{})
+			JSONSerde[string]{}, JSONSerde[string]{}).
+			GroupByKey(JSONSerde[string]{}, JSONSerde[string]{}).
+			Count(storeName, JSONSerde[int64]{})
+		table.To(sinkTopic, JSONSerde[string]{}, JSONSerde[int64]{})
 		return b.Build()
 	}
 
@@ -685,7 +685,7 @@ func TestE2E_EOS_KTableTo(t *testing.T) {
 	t.Log("kto case1: HAPPY PATH")
 
 	bt1 := buildKToTopology()
-	adapter1, err := runtime.NewAdapter(bt1, cfg, slog.Default())
+	adapter1, err := newTestAdapter(bt1, cfg, slog.Default())
 	if err != nil {
 		t.Fatalf("kto NewAdapter c1: %v", err)
 	}
@@ -737,7 +737,7 @@ func TestE2E_EOS_KTableTo(t *testing.T) {
 	t.Log("kto case2: produced one more 'a'")
 
 	bt2 := buildKToTopology()
-	adapter2, err := runtime.NewAdapter(bt2, cfg, slog.Default())
+	adapter2, err := newTestAdapter(bt2, cfg, slog.Default())
 	if err != nil {
 		t.Fatalf("kto NewAdapter c2: %v", err)
 	}
@@ -807,7 +807,7 @@ func TestE2E_EOS_KTableTo(t *testing.T) {
 
 	// client3: restart, fences client2, commits a=3 exactly once.
 	bt3 := buildKToTopology()
-	adapter3, err := runtime.NewAdapter(bt3, cfg, slog.Default())
+	adapter3, err := newTestAdapter(bt3, cfg, slog.Default())
 	if err != nil {
 		t.Fatalf("kto NewAdapter c3: %v", err)
 	}

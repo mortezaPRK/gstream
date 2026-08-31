@@ -43,7 +43,7 @@ func TestRootWhiteBoxSuites(t *testing.T) {
 	command := exec.CommandContext(
 		ctx,
 		"go", "test", "-p", "1", "-tags", "integration",
-		"./internal/kafka", "./store/pebble",
+		"./internal/kafka",
 	)
 	command.Dir = repositoryRoot
 	command.Env = append(

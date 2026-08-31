@@ -85,8 +85,7 @@ import (
 	gstream "github.com/mortezaPRK/gstream"
 	kafkamodule "github.com/mortezaPRK/gstream/integration/kafka"
 	"github.com/mortezaPRK/gstream/internal/kafka"
-	"github.com/mortezaPRK/gstream/internal/runtime"
-	state "github.com/mortezaPRK/gstream/store/pebble"
+	state "github.com/mortezaPRK/gstream/stores/pebble"
 	kgo "github.com/twmb/franz-go/pkg/kgo"
 )
 
@@ -164,7 +163,7 @@ func TestE2E_WindowedCountRestoreAfterRestart(t *testing.T) {
 	// =========================================================================
 
 	bt1 := buildWindowedCountTopology(srcTopic, storeName)
-	adapter1, err := runtime.NewAdapter(bt1, cfg, slog.Default())
+	adapter1, err := newTestAdapter(bt1, cfg, slog.Default())
 	if err != nil {
 		t.Fatalf("NewAdapterWithConfig p1: %v", err)
 	}
@@ -181,7 +180,7 @@ func TestE2E_WindowedCountRestoreAfterRestart(t *testing.T) {
 	done1 := make(chan error, 1)
 	go func() { done1 <- client1.Run(run1Ctx, adapter1.ProcessFunc()) }()
 
-	serde := gstream.JSONSerde[string]{}
+	serde := JSONSerde[string]{}
 
 	// Batch A: three records → all land in window [0,10000).
 	// streamTime after batchA = max(1000,3000,2000) = 3000.
@@ -260,7 +259,7 @@ func TestE2E_WindowedCountRestoreAfterRestart(t *testing.T) {
 	t.Logf("phase-2: deleted partition dir %s", partitionDir)
 
 	bt2 := buildWindowedCountTopology(srcTopic, storeName)
-	adapter2, err := runtime.NewAdapter(bt2, cfg, slog.Default())
+	adapter2, err := newTestAdapter(bt2, cfg, slog.Default())
 	if err != nil {
 		t.Fatalf("NewAdapterWithConfig p2: %v", err)
 	}
@@ -343,14 +342,14 @@ func TestE2E_WindowedCountRestoreAfterRestart(t *testing.T) {
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
 // buildWindowedCountTopology builds:
-// Stream[string,string] → GroupByKey → WindowedBy(TumblingWindows(10s)) → Count(storeName).
+// Stream[string,string] → GroupByKey → WindowedBy(TumblingWindows(10s)) → Count(storeName, JSONSerde[int64]{}).
 func buildWindowedCountTopology(srcTopic, storeName string) *gstream.BuiltTopology {
 	b := gstream.NewStreamBuilder()
 	gstream.Stream[string, string](b, srcTopic, "win-source",
-		gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{}).
-		GroupByKey(gstream.JSONSerde[string]{}, gstream.JSONSerde[string]{}).
-		WindowedBy(gstream.TumblingWindows(10 * time.Second)).
-		Count(storeName)
+		JSONSerde[string]{}, JSONSerde[string]{}).
+		GroupByKey(JSONSerde[string]{}, JSONSerde[string]{}).
+		WindowedBy(gstream.TumblingWindows(10*time.Second)).
+		Count(storeName, JSONSerde[int64]{})
 	return b.Build()
 }
 
@@ -372,7 +371,7 @@ func produceWindowedRecords(
 	ctx context.Context,
 	brokers []string,
 	topic string,
-	serde gstream.JSONSerde[string],
+	serde JSONSerde[string],
 	records []windowedRecord,
 ) {
 	t.Helper()
@@ -424,7 +423,7 @@ func pollWindowedChangelog(
 	ctx context.Context,
 	brokers []string,
 	topic, storeName string,
-	serde gstream.JSONSerde[string],
+	serde JSONSerde[string],
 	expected []windowedExpected,
 ) map[windowKey]int64 {
 	t.Helper()
@@ -521,7 +520,7 @@ func decodeWindowChangelogKey(raw []byte) (kBytes []byte, windowStart int64, ok 
 func assertWindowedPebbleCounts(
 	t *testing.T,
 	dbDir, storeName string,
-	serde gstream.JSONSerde[string],
+	serde JSONSerde[string],
 	key string,
 	windowStart int64,
 	wantCount int64,
@@ -534,7 +533,7 @@ func assertWindowedPebbleCounts(
 	}
 	defer db.Close()
 
-	store := state.NewKeyValueStore[[]byte, []byte](storeName, db, gstream.BytesSerde{}, gstream.BytesSerde{})
+	store := state.NewKeyValueStore[[]byte, []byte](storeName, db, BytesSerde{}, BytesSerde{})
 	kBytes, err := serde.Serialize(key)
 	if err != nil {
 		t.Fatalf("assertWindowedPebbleCounts[%s]: serialize key %q: %v", label, key, err)
@@ -561,7 +560,7 @@ func assertWindowedPebbleCounts(
 func checkWindowAbsentInPebble(
 	t *testing.T,
 	dbDir, storeName string,
-	serde gstream.JSONSerde[string],
+	serde JSONSerde[string],
 	key string,
 	windowStart int64,
 ) bool {
@@ -572,7 +571,7 @@ func checkWindowAbsentInPebble(
 	}
 	defer db.Close()
 
-	store := state.NewKeyValueStore[[]byte, []byte](storeName, db, gstream.BytesSerde{}, gstream.BytesSerde{})
+	store := state.NewKeyValueStore[[]byte, []byte](storeName, db, BytesSerde{}, BytesSerde{})
 	kBytes, err := serde.Serialize(key)
 	if err != nil {
 		t.Fatalf("checkWindowAbsentInPebble: serialize key %q: %v", key, err)
@@ -592,7 +591,7 @@ func checkFinalChangelogState(
 	ctx context.Context,
 	brokers []string,
 	topic, storeName string,
-	serde gstream.JSONSerde[string],
+	serde JSONSerde[string],
 	key string,
 	windowStart int64,
 ) bool {
