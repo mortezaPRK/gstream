@@ -35,7 +35,25 @@ func newTestAdapter(bt *gstream.BuiltTopology, cfg gstream.Config, logger gstrea
 	if cfg.StoreProvider == nil {
 		cfg.StoreProvider = state.NewProvider()
 	}
-	return newTestAdapter(bt, cfg, logger)
+	return runtime.NewAdapter(bt, cfg, logger)
+}
+
+func TestNewTestAdapter(t *testing.T) {
+	builder := gstream.NewStreamBuilder()
+	gstream.Stream[string, string](
+		builder, "input", "source", JSONSerde[string]{}, JSONSerde[string]{},
+	).To("output", "sink", JSONSerde[string]{}, JSONSerde[string]{})
+	cfg, err := gstream.Configure(
+		gstream.WithName("adapter-helper"),
+		gstream.WithBrokers("localhost:9092"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter, err := newTestAdapter(builder.Build(), cfg, nil)
+	if err != nil || adapter == nil {
+		t.Fatalf("newTestAdapter() = %v, %v", adapter, err)
+	}
 }
 
 // createTopics creates the named Kafka topics on the given broker addresses
