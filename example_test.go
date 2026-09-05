@@ -5,8 +5,8 @@ import (
 	"strings"
 	"time"
 
-	gstream "github.com/mortezaPRK/gstream"
-	memory "github.com/mortezaPRK/gstream/internal/testutil"
+	gstream "mortz.dev/go/gstream"
+	memory "mortz.dev/go/gstream/internal/testutil"
 )
 
 func ExampleBytesSerde() {

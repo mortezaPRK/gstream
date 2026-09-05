@@ -1,10 +1,10 @@
-module github.com/mortezaPRK/gstream/examples
+module mortz.dev/go/gstream/examples
 
 go 1.27
 
 require (
-	github.com/mortezaPRK/gstream v0.0.0
-	github.com/mortezaPRK/gstream/serdes/json v0.0.0
+	mortz.dev/go/gstream v0.0.0
+	mortz.dev/go/gstream/serdes/json v0.0.0
 )
 
 require (
@@ -14,6 +14,6 @@ require (
 	github.com/twmb/franz-go/pkg/kmsg v1.13.1 // indirect
 )
 
-replace github.com/mortezaPRK/gstream => ..
+replace mortz.dev/go/gstream => ..
 
-replace github.com/mortezaPRK/gstream/serdes/json => ../serdes/json
+replace mortz.dev/go/gstream/serdes/json => ../serdes/json

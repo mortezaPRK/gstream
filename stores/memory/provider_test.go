@@ -3,8 +3,8 @@ package memory_test
 import (
 	"testing"
 
-	gstream "github.com/mortezaPRK/gstream"
-	"github.com/mortezaPRK/gstream/stores/memory"
+	gstream "mortz.dev/go/gstream"
+	"mortz.dev/go/gstream/stores/memory"
 )
 
 func TestProviderRestoreRoundTrip(t *testing.T) {

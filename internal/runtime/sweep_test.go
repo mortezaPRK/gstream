@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	gstream "github.com/mortezaPRK/gstream"
-	state "github.com/mortezaPRK/gstream/internal/testutil"
-	"github.com/mortezaPRK/gstream/internal/topology"
+	gstream "mortz.dev/go/gstream"
+	state "mortz.dev/go/gstream/internal/testutil"
+	"mortz.dev/go/gstream/internal/topology"
 )
 
 // buildWindowedTopology builds a BuiltTopology with a windowed Count store:

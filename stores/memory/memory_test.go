@@ -3,7 +3,7 @@ package memory_test
 import (
 	"testing"
 
-	"github.com/mortezaPRK/gstream/stores/memory"
+	"mortz.dev/go/gstream/stores/memory"
 )
 
 type bytesSerde struct{}

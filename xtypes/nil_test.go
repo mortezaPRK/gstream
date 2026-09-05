@@ -4,7 +4,7 @@ import (
 	"encoding/json/v2"
 	"testing"
 
-	"github.com/mortezaPRK/gstream/xtypes"
+	"mortz.dev/go/gstream/xtypes"
 )
 
 // Compile-time interface checks.

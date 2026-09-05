@@ -3,7 +3,7 @@ package protoserde_test
 import (
 	"fmt"
 
-	protoserde "github.com/mortezaPRK/gstream/serdes/proto"
+	protoserde "mortz.dev/go/gstream/serdes/proto"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 

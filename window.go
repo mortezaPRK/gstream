@@ -3,7 +3,7 @@ package gstream
 import (
 	"time"
 
-	"github.com/mortezaPRK/gstream/internal/topology"
+	"mortz.dev/go/gstream/internal/topology"
 )
 
 // Window is a half-open time interval [Start, End) in Unix milliseconds.

@@ -8,7 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/mortezaPRK/gstream/internal/topology"
+	"mortz.dev/go/gstream/internal/topology"
 )
 
 // sessionStore is the interface the session-merge processor asserts against at

@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/mortezaPRK/gstream/internal/topology"
+	"mortz.dev/go/gstream/internal/topology"
 )
 
 // kvBytesStore is the interface stateful operators assert against at runtime.

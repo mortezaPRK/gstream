@@ -23,7 +23,7 @@ import (
 	"testing"
 	"time"
 
-	kafkamodule "github.com/mortezaPRK/gstream/integration/kafka"
+	kafkamodule "mortz.dev/go/gstream/integration/kafka"
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kmsg"

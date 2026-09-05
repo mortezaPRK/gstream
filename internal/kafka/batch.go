@@ -5,7 +5,7 @@ import (
 	"log/slog"
 	"sync"
 
-	gstream "github.com/mortezaPRK/gstream"
+	gstream "mortz.dev/go/gstream"
 )
 
 // processBatch runs Step 1 of the ALO loop for a single polled batch: it calls

@@ -70,10 +70,10 @@ import (
 	"testing"
 	"time"
 
-	gstream "github.com/mortezaPRK/gstream"
-	kafkamodule "github.com/mortezaPRK/gstream/integration/kafka"
-	"github.com/mortezaPRK/gstream/internal/kafka"
-	state "github.com/mortezaPRK/gstream/stores/pebble"
+	gstream "mortz.dev/go/gstream"
+	kafkamodule "mortz.dev/go/gstream/integration/kafka"
+	"mortz.dev/go/gstream/internal/kafka"
+	state "mortz.dev/go/gstream/stores/pebble"
 	kgo "github.com/twmb/franz-go/pkg/kgo"
 )
 

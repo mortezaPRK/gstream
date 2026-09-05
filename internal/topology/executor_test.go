@@ -7,7 +7,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/mortezaPRK/gstream/internal/topology"
+	"mortz.dev/go/gstream/internal/topology"
 )
 
 // buildStatelessPipeline constructs a source → filter → map → sink topology

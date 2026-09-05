@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	kafkatest "github.com/mortezaPRK/gstream/integration/kafka"
+	kafkatest "mortz.dev/go/gstream/integration/kafka"
 )
 
 func TestRootWhiteBoxSuites(t *testing.T) {

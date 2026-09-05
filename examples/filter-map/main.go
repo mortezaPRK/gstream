@@ -22,10 +22,10 @@ import (
 	"strings"
 	"syscall"
 
-	gstream "github.com/mortezaPRK/gstream"
-	"github.com/mortezaPRK/gstream/internal/kafka"
-	"github.com/mortezaPRK/gstream/internal/runtime"
-	jsonserde "github.com/mortezaPRK/gstream/serdes/json"
+	gstream "mortz.dev/go/gstream"
+	"mortz.dev/go/gstream/internal/kafka"
+	"mortz.dev/go/gstream/internal/runtime"
+	jsonserde "mortz.dev/go/gstream/serdes/json"
 )
 
 func main() {

@@ -7,8 +7,8 @@ import (
 	"encoding/binary"
 	"testing"
 
-	gstream "github.com/mortezaPRK/gstream"
-	state "github.com/mortezaPRK/gstream/internal/testutil"
+	gstream "mortz.dev/go/gstream"
+	state "mortz.dev/go/gstream/internal/testutil"
 )
 
 // encodeSessionValue builds the session value wire format:

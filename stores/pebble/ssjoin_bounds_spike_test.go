@@ -35,7 +35,7 @@ import (
 	"math"
 	"testing"
 
-	state "github.com/mortezaPRK/gstream/stores/pebble"
+	state "mortz.dev/go/gstream/stores/pebble"
 )
 
 // ssjoinLoMs computes the inclusive lower bound timestamp for the B-side scan.

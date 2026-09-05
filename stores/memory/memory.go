@@ -9,8 +9,8 @@ import (
 	"sync"
 	"sync/atomic"
 
-	gstream "github.com/mortezaPRK/gstream"
-	"github.com/mortezaPRK/gstream/internal/winkey"
+	gstream "mortz.dev/go/gstream"
+	"mortz.dev/go/gstream/internal/winkey"
 )
 
 // DB owns shared in-memory data. Multiple named stores may share one DB.

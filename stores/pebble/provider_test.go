@@ -3,8 +3,8 @@ package pebble_test
 import (
 	"testing"
 
-	gstream "github.com/mortezaPRK/gstream"
-	state "github.com/mortezaPRK/gstream/stores/pebble"
+	gstream "mortz.dev/go/gstream"
+	state "mortz.dev/go/gstream/stores/pebble"
 )
 
 func TestProviderRestoreRoundTrip(t *testing.T) {

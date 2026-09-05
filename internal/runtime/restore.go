@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"time"
 
-	gstream "github.com/mortezaPRK/gstream"
+	gstream "mortz.dev/go/gstream"
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kmsg"

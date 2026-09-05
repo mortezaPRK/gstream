@@ -5,7 +5,7 @@ import (
 	"encoding/binary"
 	"testing"
 
-	state "github.com/mortezaPRK/gstream/stores/pebble"
+	state "mortz.dev/go/gstream/stores/pebble"
 )
 
 // TestWindowCompositeKey_RoundTrip verifies that DecodeWindowCompositeKey reverses

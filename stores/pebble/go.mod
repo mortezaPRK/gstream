@@ -1,10 +1,10 @@
-module github.com/mortezaPRK/gstream/stores/pebble
+module mortz.dev/go/gstream/stores/pebble
 
 go 1.27
 
 require (
 	github.com/cockroachdb/pebble v1.1.5
-	github.com/mortezaPRK/gstream v0.0.0
+	mortz.dev/go/gstream v0.0.0
 )
 
 require (
@@ -36,4 +36,4 @@ require (
 	google.golang.org/protobuf v1.36.12 // indirect
 )
 
-replace github.com/mortezaPRK/gstream => ../..
+replace mortz.dev/go/gstream => ../..

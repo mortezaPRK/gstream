@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mortezaPRK/gstream"
-	memory "github.com/mortezaPRK/gstream/internal/testutil"
-	"github.com/mortezaPRK/gstream/internal/topology"
+	"mortz.dev/go/gstream"
+	memory "mortz.dev/go/gstream/internal/testutil"
+	"mortz.dev/go/gstream/internal/topology"
 )
 
 // TestWindowedCount_OutOfOrderAndGrace is the P3 exit-criterion test.

@@ -4,9 +4,9 @@ import (
 	"context"
 	"testing"
 
-	"github.com/mortezaPRK/gstream"
-	memory "github.com/mortezaPRK/gstream/internal/testutil"
-	"github.com/mortezaPRK/gstream/internal/topology"
+	"mortz.dev/go/gstream"
+	memory "mortz.dev/go/gstream/internal/testutil"
+	"mortz.dev/go/gstream/internal/topology"
 )
 
 // TestRepartition_BindingRegistered verifies that Repartition registers exactly

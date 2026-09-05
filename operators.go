@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/mortezaPRK/gstream/internal/topology"
+	"mortz.dev/go/gstream/internal/topology"
 )
 
 // Filter keeps only records where fn(k, v) returns true. The key and value

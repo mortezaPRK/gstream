@@ -3,7 +3,7 @@ package gstream
 import (
 	"fmt"
 
-	"github.com/mortezaPRK/gstream/internal/topology"
+	"mortz.dev/go/gstream/internal/topology"
 )
 
 // StreamBuilder assembles a typed topology.

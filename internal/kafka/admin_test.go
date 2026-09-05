@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	gstream "github.com/mortezaPRK/gstream"
-	state "github.com/mortezaPRK/gstream/internal/testutil"
+	gstream "mortz.dev/go/gstream"
+	state "mortz.dev/go/gstream/internal/testutil"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 

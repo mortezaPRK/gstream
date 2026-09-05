@@ -8,9 +8,9 @@ import (
 	"errors"
 	"testing"
 
-	gstream "github.com/mortezaPRK/gstream"
-	"github.com/mortezaPRK/gstream/internal/runtime"
-	state "github.com/mortezaPRK/gstream/stores/pebble"
+	gstream "mortz.dev/go/gstream"
+	"mortz.dev/go/gstream/internal/runtime"
+	state "mortz.dev/go/gstream/stores/pebble"
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kmsg"

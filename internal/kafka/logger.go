@@ -1,7 +1,7 @@
 package kafka
 
 import (
-	gstream "github.com/mortezaPRK/gstream"
+	gstream "mortz.dev/go/gstream"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 

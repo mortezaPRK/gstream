@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	gstream "github.com/mortezaPRK/gstream"
+	gstream "mortz.dev/go/gstream"
 )
 
 func TestInternalTopicSpecs(t *testing.T) {

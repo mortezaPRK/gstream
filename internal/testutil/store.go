@@ -7,7 +7,7 @@ import (
 	"sort"
 	"sync"
 
-	gstream "github.com/mortezaPRK/gstream"
+	gstream "mortz.dev/go/gstream"
 )
 
 type MemoryProvider struct{}
