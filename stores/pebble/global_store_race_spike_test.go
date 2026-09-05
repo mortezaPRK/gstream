@@ -15,7 +15,7 @@ import (
 	"sync"
 	"testing"
 
-	state "github.com/mortezaPRK/gstream/stores/pebble"
+	state "mortz.dev/go/gstream/stores/pebble"
 )
 
 func TestGlobalStoreRace(t *testing.T) {

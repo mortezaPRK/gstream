@@ -14,9 +14,9 @@ import (
 	"testing"
 	"time"
 
-	gstream "github.com/mortezaPRK/gstream"
-	"github.com/mortezaPRK/gstream/internal/kafka"
-	state "github.com/mortezaPRK/gstream/internal/testutil"
+	gstream "mortz.dev/go/gstream"
+	"mortz.dev/go/gstream/internal/kafka"
+	state "mortz.dev/go/gstream/internal/testutil"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────

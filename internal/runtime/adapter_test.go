@@ -6,11 +6,11 @@ import (
 	"testing"
 	"time"
 
-	gstream "github.com/mortezaPRK/gstream"
-	"github.com/mortezaPRK/gstream/internal/kafka"
-	"github.com/mortezaPRK/gstream/internal/runtime"
-	state "github.com/mortezaPRK/gstream/internal/testutil"
-	"github.com/mortezaPRK/gstream/internal/topology"
+	gstream "mortz.dev/go/gstream"
+	"mortz.dev/go/gstream/internal/kafka"
+	"mortz.dev/go/gstream/internal/runtime"
+	state "mortz.dev/go/gstream/internal/testutil"
+	"mortz.dev/go/gstream/internal/topology"
 )
 
 // ---------------------------------------------------------------------------

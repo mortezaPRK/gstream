@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"hash/fnv"
 
-	gstream "github.com/mortezaPRK/gstream"
-	"github.com/mortezaPRK/gstream/internal/kafka"
-	"github.com/mortezaPRK/gstream/xtypes"
+	gstream "mortz.dev/go/gstream"
+	"mortz.dev/go/gstream/internal/kafka"
+	"mortz.dev/go/gstream/xtypes"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 

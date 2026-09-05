@@ -2,7 +2,7 @@ package gstream
 
 // Serde is the serialization/deserialization interface for a value of type T.
 // It is the single extension point for encoding. Users implement this interface
-// or use an implementation from github.com/mortezaPRK/gstream/serdes.
+// or use an implementation from mortz.dev/go/gstream/serdes.
 //
 // Serdes are attached at source, sink, and store creation; a store's changelog
 // reuses that store's serde so encoding is consistent between local state

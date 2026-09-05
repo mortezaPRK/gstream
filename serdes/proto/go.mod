@@ -1,4 +1,4 @@
-module github.com/mortezaPRK/gstream/serdes/proto
+module mortz.dev/go/gstream/serdes/proto
 
 go 1.27
 

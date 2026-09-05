@@ -1,4 +1,4 @@
-module github.com/mortezaPRK/gstream
+module mortz.dev/go/gstream
 
 go 1.27
 

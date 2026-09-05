@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"log/slog"
 
-	gstream "github.com/mortezaPRK/gstream"
-	"github.com/mortezaPRK/gstream/internal/kafka"
-	"github.com/mortezaPRK/gstream/internal/topology"
+	gstream "mortz.dev/go/gstream"
+	"mortz.dev/go/gstream/internal/kafka"
+	"mortz.dev/go/gstream/internal/topology"
 )
 
 // Adapter bridges the kafka.ProcessFunc protocol and a *gstream.BuiltTopology.

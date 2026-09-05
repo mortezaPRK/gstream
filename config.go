@@ -103,7 +103,7 @@ type Config struct {
 
 	// StoreProvider opens local state backends for stateful topologies. It may be
 	// nil for stateless topologies. Implementations live under
-	// github.com/mortezaPRK/gstream/stores.
+	// mortz.dev/go/gstream/stores.
 	StoreProvider StoreProvider
 }
 

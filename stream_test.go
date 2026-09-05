@@ -11,7 +11,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/mortezaPRK/gstream/internal/topology"
+	"mortz.dev/go/gstream/internal/topology"
 )
 
 // ---------------------------------------------------------------------------

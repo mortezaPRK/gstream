@@ -7,8 +7,8 @@ import (
 	"math"
 	"time"
 
-	"github.com/mortezaPRK/gstream/internal/topology"
-	"github.com/mortezaPRK/gstream/internal/winkey"
+	"mortz.dev/go/gstream/internal/topology"
+	"mortz.dev/go/gstream/internal/winkey"
 )
 
 // JoinWindows configures a stream-stream windowed inner join.

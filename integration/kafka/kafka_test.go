@@ -5,7 +5,7 @@ package kafka_test
 import (
 	"testing"
 
-	kafkatest "github.com/mortezaPRK/gstream/integration/kafka"
+	kafkatest "mortz.dev/go/gstream/integration/kafka"
 )
 
 func TestOptions(t *testing.T) {

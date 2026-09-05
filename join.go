@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/mortezaPRK/gstream/internal/topology"
+	"mortz.dev/go/gstream/internal/topology"
 )
 
 // JoinGlobal performs a stream × GlobalKTable inner join.

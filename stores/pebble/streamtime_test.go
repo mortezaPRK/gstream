@@ -5,7 +5,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/pebble"
-	state "github.com/mortezaPRK/gstream/stores/pebble"
+	state "mortz.dev/go/gstream/stores/pebble"
 )
 
 // TestStreamTime_MissingReturnsZero verifies that ReadStreamTime on a fresh

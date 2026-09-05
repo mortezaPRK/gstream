@@ -13,8 +13,8 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kmsg"
 
-	gstream "github.com/mortezaPRK/gstream"
-	"github.com/mortezaPRK/gstream/internal/kafka"
+	gstream "mortz.dev/go/gstream"
+	"mortz.dev/go/gstream/internal/kafka"
 )
 
 // GlobalConsumer bootstraps a GlobalKTable from a Kafka topic — reading ALL

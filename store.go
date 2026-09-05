@@ -40,7 +40,7 @@ type StoreBackend interface {
 }
 
 // StoreProvider opens one backend at path. Root runtime depends only on this
-// contract; concrete implementations live under github.com/mortezaPRK/gstream/stores.
+// contract; concrete implementations live under mortz.dev/go/gstream/stores.
 type StoreProvider interface {
 	Open(path string) (StoreBackend, error)
 }

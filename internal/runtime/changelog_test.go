@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"testing"
 
-	gstream "github.com/mortezaPRK/gstream"
+	gstream "mortz.dev/go/gstream"
 )
 
 func TestChangelogProducerEncode(t *testing.T) {

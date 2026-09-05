@@ -1,7 +1,7 @@
-module github.com/mortezaPRK/gstream/stores/memory
+module mortz.dev/go/gstream/stores/memory
 
 go 1.27
 
-require github.com/mortezaPRK/gstream v0.0.0
+require mortz.dev/go/gstream v0.0.0
 
-replace github.com/mortezaPRK/gstream => ../..
+replace mortz.dev/go/gstream => ../..

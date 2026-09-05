@@ -1,9 +1,9 @@
 package runtime
 
 import (
-	gstream "github.com/mortezaPRK/gstream"
-	state "github.com/mortezaPRK/gstream/internal/testutil"
-	"github.com/mortezaPRK/gstream/internal/topology"
+	gstream "mortz.dev/go/gstream"
+	state "mortz.dev/go/gstream/internal/testutil"
+	"mortz.dev/go/gstream/internal/topology"
 )
 
 // TaskManagerStoresForPartition returns the stores map for the given partition's

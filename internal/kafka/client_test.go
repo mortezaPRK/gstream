@@ -11,8 +11,8 @@ import (
 	"time"
 	"uuid"
 
-	gstream "github.com/mortezaPRK/gstream"
-	"github.com/mortezaPRK/gstream/xtypes"
+	gstream "mortz.dev/go/gstream"
+	"mortz.dev/go/gstream/xtypes"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 

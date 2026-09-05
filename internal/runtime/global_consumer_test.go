@@ -4,8 +4,8 @@ import (
 	"context"
 	"testing"
 
-	gstream "github.com/mortezaPRK/gstream"
-	state "github.com/mortezaPRK/gstream/internal/testutil"
+	gstream "mortz.dev/go/gstream"
+	state "mortz.dev/go/gstream/internal/testutil"
 )
 
 // dummyBinding returns a minimal GlobalTableBinding for tests that do not

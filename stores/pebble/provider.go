@@ -4,7 +4,7 @@ import (
 	"fmt"
 
 	pebbledb "github.com/cockroachdb/pebble"
-	gstream "github.com/mortezaPRK/gstream"
+	gstream "mortz.dev/go/gstream"
 )
 
 // Provider opens Pebble-backed state backends.

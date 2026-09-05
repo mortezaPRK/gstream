@@ -3,7 +3,7 @@ package jsonserde_test
 import (
 	"testing"
 
-	jsonserde "github.com/mortezaPRK/gstream/serdes/json"
+	jsonserde "mortz.dev/go/gstream/serdes/json"
 )
 
 type someStruct struct {

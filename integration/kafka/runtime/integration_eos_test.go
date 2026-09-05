@@ -43,10 +43,10 @@ import (
 	"testing"
 	"time"
 
-	gstream "github.com/mortezaPRK/gstream"
-	kafkamodule "github.com/mortezaPRK/gstream/integration/kafka"
-	"github.com/mortezaPRK/gstream/internal/kafka"
-	"github.com/mortezaPRK/gstream/internal/runtime"
+	gstream "mortz.dev/go/gstream"
+	kafkamodule "mortz.dev/go/gstream/integration/kafka"
+	"mortz.dev/go/gstream/internal/kafka"
+	"mortz.dev/go/gstream/internal/runtime"
 	kgo "github.com/twmb/franz-go/pkg/kgo"
 )
 

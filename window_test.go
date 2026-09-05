@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mortezaPRK/gstream"
+	"mortz.dev/go/gstream"
 )
 
 // ---------------------------------------------------------------------------

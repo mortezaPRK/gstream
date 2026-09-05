@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"testing"
 
-	bytesserde "github.com/mortezaPRK/gstream/serdes/bytes"
+	bytesserde "mortz.dev/go/gstream/serdes/bytes"
 )
 
 func TestRoundTrip(t *testing.T) {

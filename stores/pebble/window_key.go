@@ -4,7 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	"github.com/mortezaPRK/gstream/internal/winkey"
+	"mortz.dev/go/gstream/internal/winkey"
 )
 
 // WindowCompositeKey builds the per-store byte key for a windowed entry.

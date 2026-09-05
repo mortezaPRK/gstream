@@ -1,19 +1,19 @@
-module github.com/mortezaPRK/gstream/integration/kafka
+module mortz.dev/go/gstream/integration/kafka
 
 go 1.27
 
 require (
-	github.com/mortezaPRK/gstream v0.0.0
-	github.com/mortezaPRK/gstream/stores/pebble v0.0.0
 	github.com/testcontainers/testcontainers-go v0.44.0
 	github.com/testcontainers/testcontainers-go/modules/kafka v0.44.0
 	github.com/twmb/franz-go v1.21.6
 	github.com/twmb/franz-go/pkg/kmsg v1.13.1
+	mortz.dev/go/gstream v0.0.0
+	mortz.dev/go/gstream/stores/pebble v0.0.0
 )
 
-replace github.com/mortezaPRK/gstream => ../..
+replace mortz.dev/go/gstream => ../..
 
-replace github.com/mortezaPRK/gstream/stores/pebble => ../../stores/pebble
+replace mortz.dev/go/gstream/stores/pebble => ../../stores/pebble
 
 require (
 	dario.cat/mergo v1.0.2 // indirect

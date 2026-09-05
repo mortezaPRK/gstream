@@ -8,7 +8,7 @@ import (
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/vfs"
 
-	gstream "github.com/mortezaPRK/gstream"
+	gstream "mortz.dev/go/gstream"
 )
 
 // ErrStoreWrite preserves implementation-package compatibility while the

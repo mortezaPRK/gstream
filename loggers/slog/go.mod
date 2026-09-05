@@ -1,3 +1,3 @@
-module github.com/mortezaPRK/gstream/loggers/slog
+module mortz.dev/go/gstream/loggers/slog
 
 go 1.27

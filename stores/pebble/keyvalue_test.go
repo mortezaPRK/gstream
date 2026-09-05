@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"testing"
 
-	state "github.com/mortezaPRK/gstream/stores/pebble"
+	state "mortz.dev/go/gstream/stores/pebble"
 )
 
 // --- Minimal test serdes (independent of any sibling-agent serde implementation) ---

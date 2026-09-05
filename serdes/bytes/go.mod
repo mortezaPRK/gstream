@@ -1,3 +1,3 @@
-module github.com/mortezaPRK/gstream/serdes/bytes
+module mortz.dev/go/gstream/serdes/bytes
 
 go 1.27

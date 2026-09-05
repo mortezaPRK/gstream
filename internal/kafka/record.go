@@ -3,7 +3,7 @@ package kafka
 import (
 	"time"
 
-	"github.com/mortezaPRK/gstream/xtypes"
+	"mortz.dev/go/gstream/xtypes"
 )
 
 // InRecord is the internal representation of a record consumed from Kafka.
